@@ -550,19 +550,25 @@ final class NuvioAccount {
                     contentAliases[mediaKey(imdbID, type), default: []].insert(id)
                 }
             }
+            // Playback can update an existing shelf item while its metadata is loading.
+            let currentEntries = inProgress
+            let currentShelfProgress = Dictionary(uniqueKeysWithValues: currentEntries.prefix(20).map {
+                (mediaKey($0.contentID, $0.contentType), $0)
+            })
             var seen = Set<String>()
             let candidates: [CinemaContinueWatchingItem] = results.compactMap { index, entry in
                 guard let imdbID = entry.title.imdbID else { return nil }
                 let key = mediaKey(imdbID, entry.kind.rawValue)
                 let aliases = (contentAliases[key] ?? []).union([imdbID])
                 let progress: NuvioProgress
-                if index < entries.count {
-                    progress = entries[index]
-                    guard !isCompleted(progress, aliases: aliases) else { return nil }
+                let (contentID, contentType) = ids[index]
+                if let current = currentShelfProgress[mediaKey(contentID, contentType)] {
+                    guard !isCompleted(current, aliases: aliases) else { return nil }
+                    progress = current
                 } else {
                     let seedIndex = index - entries.count
-                    guard seedIndex < nextEpisodeSeeds.count,
-                          !inProgress.contains(where: {
+                    guard nextEpisodeSeeds.indices.contains(seedIndex),
+                          !currentEntries.contains(where: {
                               $0.contentType == entry.kind.rawValue && aliases.contains($0.contentID) && !isCompleted($0, aliases: aliases)
                           }),
                           let next = nextEpisodeProgress(for: entry.title, after: nextEpisodeSeeds[seedIndex], imdbID: imdbID) else { return nil }

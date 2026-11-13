@@ -3,9 +3,9 @@ import SwiftUI
 
 struct CinemaTopShelf: ViewModifier {
     let account: NuvioAccount
+    let titles: CinemaTitleNavigation
 
-    @State private var link: ShelfLink?
-    @State private var selection: ShelfSelection?
+    @State private var shelfRouteID: UUID?
 
     func body(content: Content) -> some View {
         content
@@ -15,18 +15,11 @@ struct CinemaTopShelf: ViewModifier {
                 TopShelfFeedStore.write(entries, title: String(localized: "Continue Watching"))
             }
             .onOpenURL { url in
-                if let incoming = ShelfLink(url: url) { link = incoming }
-            }
-            .task(id: link?.id) {
-                guard let link else { return }
-                await open(link)
-                if !Task.isCancelled, self.link?.id == link.id { self.link = nil }
-            }
-            .fullScreenCover(item: $selection) { selection in
-                TitleDetailsView(title: selection.title, kind: selection.kind, initialResume: selection.resume) {
-                    self.selection = nil
+                guard let link = ShelfLink(url: url) else { return }
+                if let shelfRouteID { titles.dismiss(id: shelfRouteID) }
+                shelfRouteID = titles.show { close in
+                    ShelfDestination(link: link, onDismiss: close)
                 }
-                .environment(account)
             }
     }
 
@@ -35,13 +28,14 @@ struct CinemaTopShelf: ViewModifier {
         guard account.canShareContinueWatchingWithTopShelf else { return [] }
         return Array(account.continueWatching.lazy.compactMap { item in
             let title = item.entry.title
-            guard let imdbID = title.imdbID, let backdrop = title.background else { return nil }
+            guard let imdbID = title.imdbID, title.background != nil || title.poster != nil else { return nil }
             let progress = item.progress
             let started = NuvioAccount.hasStarted(progress)
             return TopShelfEntry(
                 contentId: imdbID, contentType: item.entry.kind.rawValue, title: title.name,
-                subtitle: Self.status(for: progress, started: started), imageURL: nil,
-                backdropURL: backdrop.absoluteString, progress: started && progress.duration > 0 ? progress.fraction : nil,
+                subtitle: Self.status(for: progress, started: started), imageURL: title.poster?.absoluteString,
+                backdropURL: title.background?.absoluteString,
+                progress: started && progress.duration > 0 ? progress.fraction : nil,
                 summary: title.description, genres: title.genres, year: title.releaseYear.flatMap(Int.init),
                 releaseDate: title.released?.formatted(.iso8601), runtimeMinutes: TopShelfEntry.runtimeMinutes(title.runtime),
                 logoURL: title.logo?.absoluteString, cast: Array(title.cast.prefix(4)),
@@ -55,24 +49,6 @@ struct CinemaTopShelf: ViewModifier {
         let layout = TopShelfConfiguration(showsEpisodeLabels: true, style: .carouselDetails, includesUpNext: false,
                                            includesToday: false, includesLibrary: false, catalogRowIDs: [], playsTrailers: false)
         if TopShelfConfigurationStore.load() != layout { TopShelfConfigurationStore.save(layout) }
-    }
-
-    private func open(_ link: ShelfLink) async {
-        if link.resume, account.isSignedIn {
-            if account.continueWatching.first(where: link.matches) == nil {
-                await account.waitForContinueWatchingSync()
-            }
-            guard !Task.isCancelled else { return }
-            if account.canShareContinueWatchingWithTopShelf,
-               let item = account.continueWatching.first(where: link.matches) {
-                selection = ShelfSelection(title: item.entry.title, kind: link.kind, resume: item)
-                return
-            }
-        }
-
-        let title = await CinemetaClient().details(imdbID: link.contentID, kind: link.kind)
-        guard !Task.isCancelled, let title else { return }
-        selection = ShelfSelection(title: title, kind: link.kind, resume: nil)
     }
 
     private static func status(for progress: NuvioProgress, started: Bool) -> String {
@@ -91,7 +67,6 @@ struct CinemaTopShelf: ViewModifier {
     }
 
     private struct ShelfLink {
-        let id = UUID()
         let contentID: String
         let kind: CinemetaKind
         let resume: Bool
@@ -116,11 +91,62 @@ struct CinemaTopShelf: ViewModifier {
         }
     }
 
-    private struct ShelfSelection: Identifiable {
-        let id = UUID()
-        let title: CinemetaTitle
-        let kind: CinemetaKind
-        let resume: CinemaContinueWatchingItem?
+    private struct ShelfDestination: View {
+        let link: ShelfLink
+        let onDismiss: () -> Void
+
+        @Environment(NuvioAccount.self) private var account
+        @State private var title: CinemetaTitle?
+        @State private var resume: CinemaContinueWatchingItem?
+        @State private var loadFailed = false
+        @State private var loadAttempt = 0
+
+        var body: some View {
+            if let title {
+                TitleDetailsView(title: title, kind: link.kind, initialResume: resume, onDismiss: onDismiss)
+            } else {
+                VStack(spacing: 24) {
+                    if loadFailed {
+                        Text("Couldn’t load this title.")
+                            .font(.title)
+                            .accessibilityAddTraits(.isHeader)
+                        Button("Try Again", systemImage: "arrow.clockwise") {
+                            loadFailed = false
+                            loadAttempt += 1
+                        }
+                        .buttonStyle(.borderedProminent)
+                    } else {
+                        ProgressView("Loading title…")
+                    }
+                    Button("Back", action: onDismiss)
+                        .buttonStyle(.bordered)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background { CinemaStyle.background.ignoresSafeArea() }
+                .onExitCommand(perform: onDismiss)
+                .task(id: loadAttempt) { await loadTitle() }
+            }
+        }
+
+        private func loadTitle() async {
+            if link.resume, account.isSignedIn {
+                if !account.continueWatching.contains(where: link.matches) {
+                    await account.waitForContinueWatchingSync()
+                }
+                guard !Task.isCancelled else { return }
+                if account.canShareContinueWatchingWithTopShelf,
+                   let item = account.continueWatching.first(where: link.matches) {
+                    resume = item
+                    title = item.entry.title
+                    return
+                }
+            }
+
+            let loaded = await CinemetaClient().details(imdbID: link.contentID, kind: link.kind)
+            guard !Task.isCancelled else { return }
+            title = loaded
+            loadFailed = loaded == nil
+        }
     }
 }
 #endif

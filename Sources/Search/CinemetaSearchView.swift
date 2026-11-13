@@ -3,10 +3,10 @@ import UIKit
 
 struct CinemetaSearchView: UIViewControllerRepresentable {
     let isActive: Bool
-    let account: NuvioAccount
+    let titles: CinemaTitleNavigation
 
     func makeUIViewController(context: Context) -> SearchViewController {
-        SearchViewController(account: account)
+        SearchViewController(titles: titles)
     }
 
     func updateUIViewController(_ controller: SearchViewController, context: Context) {
@@ -18,8 +18,8 @@ final class SearchViewController: UIViewController, UISearchResultsUpdating {
     private let results: SearchResultsController
     private var isTabActive = false
 
-    init(account: NuvioAccount) {
-        results = SearchResultsController(account: account)
+    init(titles: CinemaTitleNavigation) {
+        results = SearchResultsController(titles: titles)
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -98,20 +98,16 @@ final class SearchViewController: UIViewController, UISearchResultsUpdating {
 
 private final class SearchResultsController: UICollectionViewController, UICollectionViewDelegateFlowLayout {
     private static let posterWidth: CGFloat = 240
-    private let account: NuvioAccount
+    private let titles: CinemaTitleNavigation
     private var dataSource: UICollectionViewDiffableDataSource<Int, String>!
     private var searchTask: Task<Void, Never>?
-    private var removalTask: Task<Void, Never>?
     private var query = ""
     private var isActive = false
-    private var rankedResults: [CinemetaSearchResult] = []
     private var resultsByID: [String: CinemetaSearchResult] = [:]
     private var names: [String: String] = [:]
-    private var missingIDs = Set<String>()
     private var hasFailure = false
     private var searchFinished = false
     private var gridStatus: GridStatus?
-    private weak var detailController: SearchTitleDetailsController?
     private var restoringResultID: String?
 
     private struct GridStatus: Equatable {
@@ -120,8 +116,8 @@ private final class SearchResultsController: UICollectionViewController, UIColle
         var canRetry = false
     }
 
-    init(account: NuvioAccount) {
-        self.account = account
+    init(titles: CinemaTitleNavigation) {
+        self.titles = titles
         let layout = UICollectionViewFlowLayout()
         layout.itemSize = CGSize(width: Self.posterWidth, height: Self.posterWidth * 1.5 + 70)
         layout.sectionInset = UIEdgeInsets(top: 30, left: 28, bottom: 32, right: 28)
@@ -143,9 +139,9 @@ private final class SearchResultsController: UICollectionViewController, UIColle
                                 withReuseIdentifier: "Status")
         let registration = UICollectionView.CellRegistration<PosterCell, String> { [weak self] cell, _, id in
             guard let self, let result = resultsByID[id] else { return }
-            cell.configure(name: names[id] ?? result.title.name, url: BetterPosters.url(for: result.title.imdbID)) {
-                [weak self] in self?.markMissing(id)
-            }
+            cell.configure(name: names[id] ?? result.title.name,
+                           primaryURL: BetterPosters.url(for: result.title.imdbID),
+                           fallbackURL: result.title.poster)
         }
         dataSource = UICollectionViewDiffableDataSource(collectionView: collectionView) { view, indexPath, id in
             view.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: id)
@@ -179,12 +175,8 @@ private final class SearchResultsController: UICollectionViewController, UIColle
 
     private func startSearch() {
         searchTask?.cancel()
-        removalTask?.cancel()
-        removalTask = nil
         searchFinished = false
         hasFailure = false
-        rankedResults = []
-        missingIDs = []
         loadViewIfNeeded()
         applyResults()
         collectionView.setContentOffset(CGPoint(x: -collectionView.adjustedContentInset.left,
@@ -195,26 +187,15 @@ private final class SearchResultsController: UICollectionViewController, UIColle
             guard (try? await Task.sleep(for: .milliseconds(300))) != nil else { return }
             let catalog = await CinemetaClient().load(query: term)
             guard !Task.isCancelled, let self, isActive, query == term else { return }
-            rankedResults = catalog.rankedResults(for: term)
             hasFailure = catalog.hasFailure
             searchFinished = true
-            applyResults()
+            applyResults(catalog.rankedResults(for: term))
         }
     }
 
-    private func markMissing(_ id: String) {
-        guard resultsByID[id] != nil, missingIDs.insert(id).inserted else { return }
-        guard removalTask == nil else { return }
-        // Apply nearby artwork failures together so rows don’t shift for each response.
-        removalTask = Task { [weak self] in
-            guard (try? await Task.sleep(for: .milliseconds(100))) != nil, let self else { return }
-            removalTask = nil
-            applyResults()
-        }
-    }
-
-    private func applyResults() {
-        let results = rankedResults.filter { $0.title.imdbID != nil && !missingIDs.contains($0.id) }
+    private func applyResults(_ rankedResults: [CinemetaSearchResult] = []) {
+        var seen = Set<String>()
+        let results = rankedResults.filter { seen.insert($0.id).inserted }
         let newNames = CinemetaSearchResult.disambiguatedNames(for: results)
         let previousIDs = Set(dataSource.snapshot().itemIdentifiers)
         resultsByID = Dictionary(uniqueKeysWithValues: results.map { ($0.id, $0) })
@@ -250,10 +231,7 @@ private final class SearchResultsController: UICollectionViewController, UIColle
             return GridStatus(message: message, canRetry: true)
         }
         guard !hasResults else { return nil }
-        let message = rankedResults.isEmpty
-            ? String(localized: "No results for “\(query)”.")
-            : String(localized: "No results with posters for “\(query)”.")
-        return GridStatus(message: message)
+        return GridStatus(message: String(localized: "No results for “\(query)”."))
     }
 
     private func configureStatus(_ footer: SearchGridStatus) {
@@ -282,48 +260,37 @@ private final class SearchResultsController: UICollectionViewController, UIColle
 
     override func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: false)
-        guard detailController == nil,
+        guard isActive, titles.screens.isEmpty,
               let id = dataSource.itemIdentifier(for: indexPath), let result = resultsByID[id] else { return }
         let offset = collectionView.contentOffset.y + collectionView.adjustedContentInset.top
         let resultIDs = dataSource.snapshot().itemIdentifiers
-        let controller = SearchTitleDetailsController(title: result.title, kind: result.kind, account: account)
-        controller.onBack = { [weak self, weak controller] in
-            guard let controller else { return }
-            self?.dismissDetails(controller, for: id, offset: offset, resultIDs: resultIDs)
+        titles.show(onDismiss: { [weak self] in
+            self?.restoreResultFocus(for: id, offset: offset, resultIDs: resultIDs)
+        }) { close in
+            TitleDetailsView(title: result.title, kind: result.kind, onDismiss: close)
         }
-        controller.modalPresentationStyle = .fullScreen
-        detailController = controller
-        present(controller, animated: true)
     }
 
-    private func dismissDetails(_ controller: SearchTitleDetailsController, for id: String, offset: CGFloat, resultIDs: [String]) {
-        guard detailController === controller, controller.presentingViewController != nil,
-              !controller.isBeingDismissed else { return }
-        controller.onBack = nil
+    private func restoreResultFocus(for id: String, offset: CGFloat, resultIDs: [String]) {
+        guard isActive, titles.screens.isEmpty, viewIfLoaded?.window != nil,
+              let indexPath = dataSource.indexPath(for: id) else { return }
         restoringResultID = id
-        controller.dismiss(animated: true) { [weak self] in
-            guard let self else { return }
-            detailController = nil
-            defer { restoringResultID = nil }
-            guard isActive, viewIfLoaded?.window != nil, let indexPath = dataSource.indexPath(for: id) else { return }
-
-            // Keep UIKit's normal transition restoration when it already returned to this card.
-            if dataSource.snapshot().itemIdentifiers == resultIDs {
-                let y = offset - collectionView.adjustedContentInset.top
-                if abs(collectionView.contentOffset.y - y) > 1 {
-                    collectionView.setContentOffset(CGPoint(x: collectionView.contentOffset.x, y: y), animated: false)
-                }
+        defer { restoringResultID = nil }
+        if dataSource.snapshot().itemIdentifiers == resultIDs {
+            let y = offset - collectionView.adjustedContentInset.top
+            if abs(collectionView.contentOffset.y - y) > 1 {
+                collectionView.setContentOffset(CGPoint(x: collectionView.contentOffset.x, y: y), animated: false)
             }
-            collectionView.layoutIfNeeded()
-            if !collectionView.indexPathsForVisibleItems.contains(indexPath) {
-                collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
-                collectionView.layoutIfNeeded()
-            }
-            guard let cell = collectionView.cellForItem(at: indexPath), !cell.isFocused else { return }
-            let focusSystem = UIFocusSystem.focusSystem(for: self)
-            focusSystem?.requestFocusUpdate(to: collectionView)
-            focusSystem?.updateFocusIfNeeded()
         }
+        collectionView.layoutIfNeeded()
+        if !collectionView.indexPathsForVisibleItems.contains(indexPath) {
+            collectionView.scrollToItem(at: indexPath, at: .centeredVertically, animated: false)
+            collectionView.layoutIfNeeded()
+        }
+        guard let cell = collectionView.cellForItem(at: indexPath), !cell.isFocused else { return }
+        let focusSystem = UIFocusSystem.focusSystem(for: self)
+        focusSystem?.requestFocusUpdate(to: collectionView)
+        focusSystem?.updateFocusIfNeeded()
     }
 }
 

@@ -1,0 +1,240 @@
+--- a/tvosApp/NuvioTV/Sources/UI/Player/SidePanels.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/SidePanels.swift
+@@ -342,34 +342,64 @@
+ 
+ struct PlayerSourcesPanel: View {
+     @ObservedObject var viewModel: PlayerViewModel
+-    @FocusState private var focusedID: String?
+-    @State private var visibleSourceLimit: Int = 20
+-    @State private var didSeedSourceFocus = false
++
++    var body: some View {
++        SourcesSidePanel(
++            sources: viewModel.availableSources,
++            isLoading: viewModel.isLoadingSources,
++            preferredID: viewModel.availableSources.first(where: viewModel.isCurrentSource)?.id,
++            presentation: { $0 },
++            isSelected: viewModel.isCurrentSource,
++            onSelect: viewModel.selectSource,
++            onLoad: { viewModel.loadSourcesIfNeeded() },
++            onExit: viewModel.closeSidePanel
++        )
++    }
++}
++
++struct SourcesSidePanel<Source: Identifiable>: View {
++    let sources: [Source]
++    let isLoading: Bool
++    var preferredID: Source.ID?
++    let presentation: (Source) -> NuvioStream
++    var isSelected: (Source) -> Bool = { _ in false }
++    let onSelect: (Source) -> Void
++    var onLoad: () -> Void = {}
++    var emptyMessage: String?
++    var onRetry: (() -> Void)?
++    let onExit: () -> Void
++
++    private enum FocusTarget: Hashable {
++        case loading, empty, retry, source(Source.ID)
++    }
++
++    @FocusState private var focus: FocusTarget?
++    @State private var visibleSourceLimit = 20
+     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+ 
+     private var rowCornerRadius: CGFloat {
+         AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 18)
+     }
+ 
+-    private var targetSourceId: String? {
+-        if let current = viewModel.availableSources.first(where: { viewModel.isCurrentSource($0) }) {
+-            return current.id
++    private var targetSourceID: Source.ID? {
++        if let preferredID, sources.contains(where: { $0.id == preferredID }) {
++            return preferredID
+         }
+-        return viewModel.availableSources.first?.id
++        return sources.first?.id
+     }
+ 
+-    private var sourcesToShow: [NuvioStream] {
+-        Array(viewModel.availableSources.prefix(visibleSourceLimit))
++    private var sourcesToShow: [Source] {
++        Array(sources.prefix(visibleSourceLimit))
+     }
+ 
+     private func loadMoreSources() {
+-        guard visibleSourceLimit < viewModel.availableSources.count else { return }
+-        visibleSourceLimit = min(visibleSourceLimit + 20, viewModel.availableSources.count)
++        guard visibleSourceLimit < sources.count else { return }
++        visibleSourceLimit = min(visibleSourceLimit + 20, sources.count)
+     }
+ 
+     private func ensureTargetSourceVisible() {
+-        if let target = targetSourceId,
+-           let index = viewModel.availableSources.firstIndex(where: { $0.id == target }) {
++        if let target = targetSourceID,
++           let index = sources.firstIndex(where: { $0.id == target }) {
+             if index >= visibleSourceLimit {
+                 visibleSourceLimit = max(visibleSourceLimit, index + 10)
+             }
+@@ -377,68 +407,75 @@
+     }
+ 
+     var body: some View {
+-        let totalCount = viewModel.availableSources.count
++        let totalCount = sources.count
+         let displayedCount = sourcesToShow.count
+         let hasMore = totalCount > displayedCount
+ 
+-        PlayerSidePanelChrome(title: "Sources", onExit: { viewModel.closeSidePanel() }) {
++        PlayerSidePanelChrome(title: "Sources", onExit: onExit) {
+             ScrollViewReader { proxy in
+                 ScrollView {
+                     LazyVStack(spacing: 12) {
+-                        if viewModel.isLoadingSources && sourcesToShow.isEmpty {
++                        if isLoading && sourcesToShow.isEmpty {
+                             Button {} label: {
+                                 HStack(spacing: 14) {
+                                     ProgressView()
+                                         .progressViewStyle(.circular)
+-                                        .tint(focusedID == "loading" ? .black : .white)
++                                        .tint(focus == .loading ? .black : .white)
+                                     Text(L10n.string("player_searching_sources", fallback: "Searching sources…"))
+                                         .font(.system(size: 22, weight: .medium))
+-                                        .foregroundStyle(focusedID == "loading" ? .black : .white.opacity(0.8))
++                                        .foregroundStyle(focus == .loading ? .black : .white.opacity(0.8))
+                                 }
+                                 .padding(.horizontal, 22)
+                                 .padding(.vertical, 16)
+                                 .frame(maxWidth: .infinity, alignment: .leading)
+                                 .background(
+                                     RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
+-                                        .fill(focusedID == "loading" ? Color.white : Color.white.opacity(0.07))
++                                        .fill(focus == .loading ? Color.white : Color.white.opacity(0.07))
+                                 )
+                             }
+                             .buttonStyle(PosterCardButtonStyle())
+                             .focusEffectDisabledIfAvailable()
+-                            .focused($focusedID, equals: "loading")
+-                            .id("loading")
+-                        } else if viewModel.availableSources.isEmpty {
++                            .focused($focus, equals: .loading)
++                        } else if sources.isEmpty {
+                             Button {} label: {
+                                 PlayerPanelRow(
+                                     title: L10n.string("player_no_sources_found", fallback: "No sources found"),
+-                                    subtitle: L10n.string("player_no_sources_found_subtitle", fallback: "None of your stream add-ons returned a link."),
+-                                    isFocused: focusedID == "empty"
++                                    subtitle: emptyMessage ?? L10n.string("player_no_sources_found_subtitle", fallback: "None of your stream add-ons returned a link."),
++                                    isFocused: focus == .empty
+                                 )
+                             }
+                             .buttonStyle(PosterCardButtonStyle())
+                             .focusEffectDisabledIfAvailable()
+-                            .focused($focusedID, equals: "empty")
+-                            .id("empty")
++                            .focused($focus, equals: .empty)
++
++                            if let onRetry {
++                                Button(action: onRetry) {
++                                    PlayerPanelRow(title: String(localized: "Try Again"), isFocused: focus == .retry)
++                                }
++                                .buttonStyle(PosterCardButtonStyle())
++                                .focusEffectDisabledIfAvailable()
++                                .focused($focus, equals: .retry)
++                            }
+                         } else {
+-                            ForEach(sourcesToShow, id: \.id) { stream in
+-                                let selected = viewModel.isCurrentSource(stream)
++                            ForEach(sourcesToShow) { source in
++                                let stream = presentation(source)
+                                 Button {
+-                                    viewModel.selectSource(stream)
++                                    onSelect(source)
+                                 } label: {
+                                     PlayerPanelRow(
+                                         title: stream.panelTitle,
+                                         subtitle: stream.panelSubtitle,
+                                         trailing: stream.panelResolutionLabel,
+-                                        selected: selected,
+-                                        isFocused: focusedID == stream.id
++                                        selected: isSelected(source),
++                                        isFocused: focus == .source(source.id)
+                                     )
+                                 }
+                                 .buttonStyle(PosterCardButtonStyle())
+                                 .focusEffectDisabledIfAvailable()
+-                                .focused($focusedID, equals: stream.id)
+-                                .id(stream.id)
++                                .focused($focus, equals: .source(source.id))
++                                .id(source.id)
+                                 .onAppear {
+-                                    if let index = sourcesToShow.firstIndex(where: { $0.id == stream.id }),
++                                    if let index = sourcesToShow.firstIndex(where: { $0.id == source.id }),
+                                        index >= sourcesToShow.count - 4,
+                                        hasMore {
+                                         loadMoreSources()
+@@ -460,7 +497,7 @@
+                                 .onAppear {
+                                     loadMoreSources()
+                                 }
+-                            } else if viewModel.isLoadingSources {
++                            } else if isLoading {
+                                 HStack(spacing: 14) {
+                                     ProgressView()
+                                         .progressViewStyle(.circular)
+@@ -479,37 +516,39 @@
+                 }
+                 .focusSection()
+                 .onAppear {
+-                    didSeedSourceFocus = false
+-                    viewModel.loadSourcesIfNeeded()
+-                    if sourcesToShow.isEmpty && viewModel.isLoadingSources {
+-                        focusedID = "loading"
+-                    }
++                    onLoad()
+                     seedSourceFocus(proxy: proxy)
+                 }
+-                .onChange(of: viewModel.availableSources.map(\.id)) { _, sourceIDs in
+-                    guard !sourceIDs.isEmpty else { return }
++                .onChange(of: sources.map(\.id)) { _, _ in
+                     seedSourceFocus(proxy: proxy)
+                 }
++                .onChange(of: isLoading) { _, _ in
++                    if sources.isEmpty { seedSourceFocus(proxy: proxy) }
++                }
+             }
+         }
+     }
+ 
+     private func seedSourceFocus(proxy: ScrollViewProxy) {
+         ensureTargetSourceVisible()
+-        guard targetSourceId != nil else { return }
+-        didSeedSourceFocus = true
+-        scrollToTarget(proxy: proxy)
++        if targetSourceID != nil {
++            scrollToTarget(proxy: proxy)
++        } else if isLoading {
++            focus = .loading
++        } else {
++            focus = onRetry == nil ? .empty : .retry
++        }
+     }
+ 
+     private func scrollToTarget(proxy: ScrollViewProxy) {
+-        guard let target = targetSourceId else { return }
++        guard let target = targetSourceID else { return }
+         DispatchQueue.main.async {
+-            focusedID = target
++            focus = .source(target)
+             proxy.scrollTo(target, anchor: .center)
+         }
+         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+-            guard let target = targetSourceId else { return }
+-            focusedID = target
++            guard let target = targetSourceID else { return }
++            focus = .source(target)
+             withAnimation(.easeInOut(duration: 0.15)) {
+                 proxy.scrollTo(target, anchor: .center)
+             }

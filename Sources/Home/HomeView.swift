@@ -12,6 +12,7 @@ private enum HomeFocusTarget: Hashable {
 struct HomeHeroScrollPosition: Equatable {
     var distance: CGFloat = 0
     var shelfOffset: CGFloat = 0
+    var artworkBottom: CGFloat?
 
     var shelfProgress: CGFloat { min(1, distance / max(1, shelfOffset)) }
 }
@@ -19,12 +20,27 @@ struct HomeHeroScrollPosition: Equatable {
 @Observable
 final class HomeHeroScroll {
     var position = HomeHeroScrollPosition()
-    var artworkBottom: CGFloat?
 
     func update(_ changes: () -> Void) {
         var transaction = Transaction(animation: nil)
         transaction.disablesAnimations = true
         withTransaction(transaction, changes)
+    }
+}
+
+private struct HomeHeroScrollBehavior: ScrollTargetBehavior {
+    let shelfOffset: CGFloat
+    let isBelowHero: Bool
+
+    func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
+        guard shelfOffset > 0 else { return }
+        let offset = target.rect.minY
+        if isBelowHero {
+            guard offset <= shelfOffset else { return }
+            target.rect.origin.y = offset < shelfOffset * 0.7 ? 0 : shelfOffset
+        } else if offset >= shelfOffset * 0.3 {
+            target.rect.origin.y = shelfOffset
+        }
     }
 }
 
@@ -103,18 +119,17 @@ struct HomeView: View {
     @Binding var carousel: HeroCarousel
     let heroScroll: HomeHeroScroll
 
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
     @Environment(NuvioAccount.self) private var account
+    @Environment(CinemaTitleNavigation.self) private var titles
     @State private var catalog: HomeCatalog?
     @State private var pendingCatalog: HomeCatalog?
     @State private var continueWatching: [CinemaContinueWatchingItem] = []
     @State private var lastRefresh: ContinuousClock.Instant?
     @State private var retryCount = 0
     @State private var completedRequest: Int?
-    @State private var selection: CinemetaSearchResult?
     @State private var detailOrigin: HomeFocusTarget?
-    @State private var verticalPosition = ScrollPosition()
+    @State private var isBelowHero = false
     @FocusState private var focusedItem: HomeFocusTarget?
 
     private struct LoadRequest: Equatable {
@@ -128,7 +143,7 @@ struct HomeView: View {
     private let clock = ContinuousClock()
 
     private var isAvailable: Bool {
-        isActive && scenePhase == .active && selection == nil
+        isActive && scenePhase == .active && titles.screens.isEmpty
     }
 
     private var canApplyCatalog: Bool {
@@ -167,11 +182,6 @@ struct HomeView: View {
                 continueWatching = items
             }
         }
-        .fullScreenCover(item: $selection, onDismiss: restoreFocus) { entry in
-            TitleDetailsView(title: entry.title, kind: entry.kind) {
-                selection = nil
-            }
-        }
     }
 
     private func homeContent(in viewport: GeometryProxy, leadingInset: CGFloat) -> some View {
@@ -182,6 +192,7 @@ struct HomeView: View {
         let firstCardHeight = continueWatching.isEmpty ? posterLayout.cardHeight : landscapeLayout.cardHeight
         let heroHeight = hasHero ? max(0, height - heroGap - HomeShelfLayout.headingHeight - firstCardHeight / 4) : 0
         let shelfOffset = max(0, heroHeight - heroControlsHeight)
+        let artworkBottom = hasHero ? viewport.frame(in: .global).minY + heroHeight + heroGap / 2 : nil
 
         return ScrollView {
             VStack(alignment: .leading, spacing: heroGap) {
@@ -189,19 +200,12 @@ struct HomeView: View {
                     if hasHero {
                         FeaturedHero(
                             height: heroHeight,
-                            isActive: isActive && selection == nil,
+                            isActive: isAvailable,
                             carousel: $carousel,
                             focus: $focusedItem,
-                            onSelect: { showDetails($0, from: .hero) },
-                            onFocus: { scrollHome(to: 0) }
+                            onSelect: { showDetails($0, from: .hero) }
                         )
                         .padding(.leading, leadingInset)
-                        .onGeometryChange(for: CGFloat.self) { geometry in
-                            geometry.frame(in: .global).maxY
-                        } action: { bottom in
-                            // Keep the fade inside the space between the controls and first heading.
-                            heroScroll.update { heroScroll.artworkBottom = bottom + heroGap / 2 }
-                        }
                     }
 
                     VStack(alignment: .leading, spacing: 22) {
@@ -228,33 +232,30 @@ struct HomeView: View {
                 }
             }
         }
-        .scrollPosition($verticalPosition)
+        .scrollTargetBehavior(HomeHeroScrollBehavior(shelfOffset: shelfOffset, isBelowHero: isBelowHero))
         .scrollIndicators(.hidden)
         .onScrollGeometryChange(for: HomeHeroScrollPosition.self) { geometry in
             HomeHeroScrollPosition(
                 distance: max(0, geometry.contentOffset.y + geometry.contentInsets.top),
-                shelfOffset: shelfOffset
+                shelfOffset: shelfOffset,
+                artworkBottom: artworkBottom
             )
         } action: { _, position in
             heroScroll.update { heroScroll.position = position }
         }
-        .onChange(of: focusedItem) { old, new in
-            guard hasHero, case .poster? = new else { return }
-            if old == .hero || old == .nextFeatured || (old == nil && heroScroll.position.distance < shelfOffset / 2) {
-                scrollHome(to: shelfOffset)
-            }
-        }
-    }
-
-    private func scrollHome(to offset: CGFloat) {
-        withAnimation(reduceMotion ? nil : .smooth(duration: 0.48)) {
-            verticalPosition.scrollTo(y: offset)
+        .onScrollGeometryChange(for: Bool.self) { geometry in
+            shelfOffset > 0 && geometry.contentOffset.y + geometry.contentInsets.top >= shelfOffset / 2
+        } action: { _, belowHero in
+            isBelowHero = belowHero
         }
     }
 
     private func showDetails(_ entry: CinemetaSearchResult, from origin: HomeFocusTarget) {
+        guard titles.screens.isEmpty else { return }
         detailOrigin = origin
-        selection = entry
+        titles.show(onDismiss: restoreFocus) { close in
+            TitleDetailsView(title: entry.title, kind: entry.kind, onDismiss: close)
+        }
     }
 
     private func restoreFocus() {
@@ -292,7 +293,7 @@ struct HomeView: View {
     }
 
     private func applyCatalog(_ updated: HomeCatalog) {
-        let next = preservingAvailableCollections(in: updated)
+        let next = updated.preservingAvailableCollections(from: catalog)
         catalog = next
 
         let entries = next.featuredEntries
@@ -309,17 +310,6 @@ struct HomeView: View {
             artwork: carousel.artwork.filter { artworkURLs.contains($0.key) }
         )
     }
-
-    private func preservingAvailableCollections(in updated: HomeCatalog) -> HomeCatalog {
-        guard updated.hasFailure, let catalog, !catalog.isEmpty else { return updated }
-        let mainIDs: [HomeCollection.ID] = [.watching, .today, .newReleases]
-        let main = mainIDs.compactMap { id in
-            updated.collections.first { $0.id == id } ?? catalog.collections.first { $0.id == id }
-        }
-        let others = (updated.isEmpty ? catalog.collections : updated.collections).filter { !mainIDs.contains($0.id) }
-        let featured = updated.featuredEntries.isEmpty ? catalog.featuredEntries : updated.featuredEntries
-        return HomeCatalog(collections: main + others, featuredEntries: featured, hasFailure: true)
-    }
 }
 
 private struct FeaturedHero: View {
@@ -328,7 +318,6 @@ private struct FeaturedHero: View {
     @Binding var carousel: HeroCarousel
     let focus: FocusState<HomeFocusTarget?>.Binding
     let onSelect: (CinemetaSearchResult) -> Void
-    let onFocus: () -> Void
 
     @Environment(\.scenePhase) private var scenePhase
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -367,16 +356,12 @@ private struct FeaturedHero: View {
                         .padding(.bottom, 20)
                 }
             }
-            .overlay(alignment: .bottomLeading) {
-                featuredActions(index: index)
-                    .visualEffect { content, _ in content.opacity(opacity) }
-            }
+        }
+        .overlay(alignment: .bottomLeading) {
+            featuredActions(index: carousel.index)
         }
         .focusSection()
         .onScrollVisibilityChange(threshold: 0.45) { isVisible = $0 }
-        .onChange(of: isFocused) { _, focused in
-            if focused { onFocus() }
-        }
         .onChange(of: isActive) { _, active in
             if !active { pendingStep = nil }
         }
@@ -626,7 +611,7 @@ struct HomeHeroBackdrop: View {
             let screen = geometry.frame(in: .global)
             let position = heroScroll.position
             let artworkHeight = max(0, screen.height - position.distance)
-            let gapHeight = min(artworkHeight, max(0, (heroScroll.artworkBottom ?? screen.maxY) - screen.minY))
+            let gapHeight = min(artworkHeight, max(0, (position.artworkBottom ?? screen.maxY) - screen.minY - position.distance))
             let visibleHeight = artworkHeight - (artworkHeight - gapHeight) * position.shelfProgress
 
             TimelineView(.animation(paused: carousel.slide == nil)) { _ in
@@ -752,7 +737,7 @@ private struct CatalogShelves: View {
                 CatalogShelf(shelf: .continueWatching, items: continueWatching.map { HomeShelfItem(entry: $0.entry, watching: $0) },
                              layout: landscapeLayout, focus: focus, onSelect: onSelect)
             }
-            ForEach(collections.filter { !$0.entries.isEmpty }) { collection in
+            ForEach(collections) { collection in
                 CatalogShelf(shelf: collection.id, items: collection.entries.map { HomeShelfItem(entry: $0) },
                              layout: posterLayout, focus: focus, onSelect: onSelect)
             }
@@ -883,7 +868,8 @@ private struct TitleCard: View {
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: 14)
 
-        CatalogArtwork(url: BetterPosters.url(for: title.imdbID, showTrendTags: rank == nil), isPoster: true)
+        CatalogArtwork(url: BetterPosters.url(for: title.imdbID, showTrendTags: rank == nil),
+                       fallbackURL: title.poster, isPoster: true)
             .frame(width: layout.cardWidth, height: layout.cardHeight)
             .clipShape(shape)
             .overlay {
@@ -1028,32 +1014,42 @@ enum BetterPosters {
 
 struct CatalogArtwork: View {
     let url: URL?
+    var fallbackURL: URL? = nil
     var isPoster = false
     var alignment: Alignment = .center
 
     var body: some View {
         GeometryReader { geometry in
             CachedArtwork(url: url) { phase in
-                if let image = phase.image {
-                    image.resizable()
-                        .scaledToFill()
-                        .frame(width: geometry.size.width, height: geometry.size.height, alignment: alignment)
-                        .clipped()
-                } else if isPoster {
-                    Color(white: 0.09)
-                        .overlay {
-                            if case .empty = phase, url != nil {
-                                ProgressView()
-                                    .progressViewStyle(.circular)
-                            } else {
-                                Image(systemName: "film")
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
+                if let fallbackURL, fallbackURL != url, url == nil || phase.error != nil {
+                    CachedArtwork(url: fallbackURL) { fallbackPhase in
+                        artwork(fallbackPhase, isRequesting: true, size: geometry.size)
+                    }
                 } else {
-                    CinemaStyle.background
+                    artwork(phase, isRequesting: url != nil, size: geometry.size)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func artwork(_ phase: AsyncImagePhase, isRequesting: Bool, size: CGSize) -> some View {
+        if let image = phase.image {
+            image.resizable()
+                .scaledToFill()
+                .frame(width: size.width, height: size.height, alignment: alignment)
+                .clipped()
+        } else if isPoster {
+            Color(white: 0.09)
+                .overlay {
+                    if case .empty = phase, isRequesting {
+                        ProgressView().progressViewStyle(.circular)
+                    } else {
+                        Image(systemName: "film").foregroundStyle(.secondary)
+                    }
+                }
+        } else {
+            CinemaStyle.background
         }
     }
 }

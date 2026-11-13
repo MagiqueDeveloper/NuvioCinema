@@ -12,6 +12,7 @@ struct CinemetaTitle: Decodable, Identifiable, Sendable {
     let description: String?
     let releaseInfo: String?
     let imdbID: String?
+    let poster: URL?
     let background: URL?
     let logo: URL?
     let genres: [String]?
@@ -30,7 +31,7 @@ struct CinemetaTitle: Decodable, Identifiable, Sendable {
     let trailers: [CinemaTrailer]
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, description, releaseInfo, background, logo, genres, runtime
+        case id, name, description, releaseInfo, poster, background, logo, genres, runtime
         case imdbID = "imdb_id"
         case imdbRating
         case released, contentRating, certification, ratings, country, countries, language, languages, status, awards
@@ -42,11 +43,12 @@ struct CinemetaTitle: Decodable, Identifiable, Sendable {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
         id = try fields.decode(String.self, forKey: .id)
         name = try fields.decode(String.self, forKey: .name)
-        description = try fields.decodeIfPresent(String.self, forKey: .description)
-        releaseInfo = try fields.decodeIfPresent(String.self, forKey: .releaseInfo)
+        description = Self.text(in: fields, key: .description)
+        releaseInfo = Self.text(in: fields, key: .releaseInfo)
         let providedIMDbID = try? fields.decode(String.self, forKey: .imdbID)
         let links = (try? fields.decode([CreditLink].self, forKey: .links)) ?? []
         imdbID = Self.validIMDbID(providedIMDbID) ?? Self.validIMDbID(id) ?? links.compactMap(\.imdbID).first
+        poster = Self.artworkURL(try? fields.decode(String.self, forKey: .poster))
         background = Self.artworkURL(try? fields.decode(String.self, forKey: .background))
         logo = Self.artworkURL(try? fields.decode(String.self, forKey: .logo))
         genres = try? fields.decode([String].self, forKey: .genres)
@@ -107,7 +109,8 @@ struct CinemetaTitle: Decodable, Identifiable, Sendable {
 
     fileprivate static func artworkURL(_ value: String?) -> URL? {
         guard let value, let url = URL(string: value),
-              url.scheme?.lowercased() == "https", url.host() != nil else { return nil }
+              url.scheme?.lowercased() == "https", url.host() != nil,
+              url.user() == nil, url.password() == nil else { return nil }
         return url
     }
 
@@ -340,11 +343,24 @@ struct CinemetaSearchResult: Identifiable, Sendable {
 }
 
 struct HomeCatalog: Sendable {
-    let collections: [HomeCollection]
+    let rows: [HomeCollection]
     let featuredEntries: [CinemetaSearchResult]
-    let hasFailure: Bool
 
+    var collections: [HomeCollection] { rows.filter { !$0.entries.isEmpty } }
+    var hasFailure: Bool { rows.contains(where: \.hasFailure) }
     var isEmpty: Bool { collections.isEmpty }
+
+    func preservingAvailableCollections(from previous: Self?) -> Self {
+        guard hasFailure, let previous else { return self }
+        let previousCollections = previous.collections
+        let rows = rows.map { row in
+            guard row.hasFailure,
+                  let cached = previousCollections.first(where: { $0.id == row.id }) else { return row }
+            return HomeCollection(id: row.id, entries: cached.entries, hasFailure: true)
+        }
+        let featured = featuredEntries.isEmpty ? previous.featuredEntries : featuredEntries
+        return HomeCatalog(rows: rows, featuredEntries: featured)
+    }
 }
 
 struct HomeCollection: Identifiable, Sendable {
@@ -354,6 +370,7 @@ struct HomeCollection: Identifiable, Sendable {
 
     let id: ID
     let entries: [CinemetaSearchResult]
+    let hasFailure: Bool
 
     var isRanked: Bool { id == .today }
 }
@@ -426,23 +443,27 @@ struct CinemetaClient: Sendable {
             .sorted { $0.1 > $1.1 }
             .map(\.0)
 
-        var collections = [
-            HomeCollection(id: .watching, entries: recentTrends),
-            HomeCollection(id: .today, entries: dailyChartComplete ? dailyChart : []),
-            HomeCollection(id: .newReleases, entries: newReleases),
-            HomeCollection(id: .topRated, entries: Self.uniqueEntries(rated, limit: 24)),
+        var rows = [
+            HomeCollection(id: .watching, entries: recentTrends,
+                           hasFailure: watchingCatalog.hasFailure || recentTrends.isEmpty),
+            HomeCollection(id: .today, entries: dailyChartComplete ? dailyChart : [],
+                           hasFailure: !dailyChartComplete),
+            HomeCollection(id: .newReleases, entries: newReleases, hasFailure: releaseCatalog.hasFailure),
+            HomeCollection(id: .topRated, entries: Self.uniqueEntries(rated, limit: 24),
+                           hasFailure: popularCatalog.hasFailure || genreRows.contains(where: \.hasFailure)),
         ]
-        collections += genreRows
+        rows += genreRows
         if needsPopularFallback {
-            collections.append(HomeCollection(id: .popularMovies, entries: Array(popularMovies.prefix(24))))
-            collections.append(HomeCollection(id: .popularSeries, entries: Array(popularSeries.prefix(24))))
+            rows.append(HomeCollection(id: .popularMovies, entries: Array(popularMovies.prefix(24)),
+                                       hasFailure: popularCatalog.movies == nil))
+            rows.append(HomeCollection(id: .popularSeries, entries: Array(popularSeries.prefix(24)),
+                                       hasFailure: popularCatalog.series == nil))
         }
 
         return HomeCatalog(
-            collections: collections.filter { !$0.entries.isEmpty },
+            rows: rows,
             featuredEntries: Self.featuredEntries(from: [watchingCatalog, todayCatalog, releaseCatalog, popularCatalog],
-                                                  on: date),
-            hasFailure: needsPopularFallback || todayCatalog.hasFailure || releaseCatalog.hasFailure
+                                                  on: date)
         )
     }
 
@@ -454,7 +475,8 @@ struct CinemetaClient: Sendable {
                     async let movies = catalog(kind: .movie, filter: ("genre", genre.rawValue))
                     async let series = catalog(kind: .series, filter: ("genre", genre.rawValue))
                     let titles = await CinemetaCatalog(movies: movies, series: series)
-                    return HomeCollection(id: .genre(genre), entries: Self.mixedEntries(titles, limit: 24))
+                    return HomeCollection(id: .genre(genre), entries: Self.mixedEntries(titles, limit: 24),
+                                          hasFailure: titles.hasFailure)
                 }
             }
             var rows: [HomeCollection.ID: HomeCollection] = [:]
@@ -523,8 +545,7 @@ struct CinemetaClient: Sendable {
     }
 
     func details(for title: CinemetaTitle, kind: CinemetaKind) async -> CinemetaTitle? {
-        guard let id = title.imdbID else { return nil }
-        return await details(imdbID: id, kind: kind)
+        await details(contentID: title.imdbID ?? title.id, kind: kind)
     }
 
     func details(imdbID id: String, kind: CinemetaKind) async -> CinemetaTitle? {

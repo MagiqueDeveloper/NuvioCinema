@@ -6,8 +6,7 @@ struct UpstreamPlaybackBridge: View {
     let request: TitlePlaybackRequest
     let stream: AddonStream
     let account: NuvioAccount
-    let onBack: () -> Void
-    let onFailure: (String) -> Void
+    let onClose: (TitlePlaybackRequest, String?) -> Void
     var onRestorePlayer: ((AddonStream, TitlePlaybackRequest) -> Bool)? = nil
 
     @Environment(\.scenePhase) private var scenePhase
@@ -27,6 +26,17 @@ struct UpstreamPlaybackBridge: View {
 
     private var episodes: [NuvioVideo] {
         [currentEpisode].compactMap { $0 } + request.followingEpisodes.map(Self.video)
+    }
+
+    private var activeEpisodeID: String? {
+        viewModel.panelCurrentEpisodeId ?? currentEpisode?.id
+    }
+
+    private var canRecordProgress: Bool {
+        viewModel.hasRenderedFirstFrame && !viewModel.isAwaitingStreamStart && !viewModel.isScrubbing
+            && !viewModel.isHoldingSeek && !viewModel.isSwitchingSource && !viewModel.isReloadingStream
+            && !viewModel.didDetectReplacementStream && !viewModel.isLiveStream
+            && !viewModel.sessionCoordinator.isProgressSaveSuspended
     }
 
     private var meta: NuvioMeta {
@@ -65,17 +75,14 @@ struct UpstreamPlaybackBridge: View {
         )
         .onAppear { isMounted = true }
         .onReceive(viewModel.clock.$position) { position in
-            guard viewModel.status == .playing, viewModel.hasRenderedFirstFrame, !viewModel.isAwaitingStreamStart,
-                  !viewModel.isScrubbing, !viewModel.didDetectReplacementStream, !viewModel.isLiveStream,
-                  !viewModel.sessionCoordinator.isProgressSaveSuspended else { return }
+            guard viewModel.status == .playing, canRecordProgress else { return }
             sample(position, duration: viewModel.clock.duration, checkpoint: .periodic)
         }
         .onReceive(viewModel.$status) { status in
-            if status == .ended, viewModel.hasRenderedFirstFrame, !viewModel.isLiveStream {
+            guard canRecordProgress else { return }
+            if status == .ended {
                 sample(viewModel.clock.position, duration: viewModel.clock.duration, checkpoint: .ended)
-            } else if status == .paused, viewModel.hasRenderedFirstFrame, !viewModel.isAwaitingStreamStart,
-                      !viewModel.isScrubbing, !viewModel.didDetectReplacementStream, !viewModel.isLiveStream,
-                      !viewModel.sessionCoordinator.isProgressSaveSuspended {
+            } else if status == .paused {
                 sample(viewModel.clock.position, duration: viewModel.clock.duration, checkpoint: .flush)
             }
         }
@@ -94,7 +101,7 @@ struct UpstreamPlaybackBridge: View {
     }
 
     private func sample(_ position: Double, duration: Double, checkpoint: PlaybackCheckpoint) {
-        let activeEpisode = episodes.first { $0.id == viewModel.panelCurrentEpisodeId } ?? currentEpisode
+        let activeEpisode = episodes.first { $0.id == activeEpisodeID } ?? currentEpisode
         if activeEpisode?.id != recordingEpisode?.id {
             flushProgress()
             recordingEpisode = activeEpisode
@@ -127,16 +134,29 @@ struct UpstreamPlaybackBridge: View {
             UpstreamPiPRestore.install(owner: restoreID, manager: manager, request: request, stream: stream,
                                        restore: onRestorePlayer)
         }
-        onBack()
+        onClose(sourceRequest(), nil)
     }
 
     private func returnToSources() {
         flushProgress()
         if case .error = viewModel.status {
-            onFailure(String(localized: "This source couldn’t play on Apple TV. Try another source or refresh the links."))
+            onClose(sourceRequest(), String(localized: "This source couldn’t play on Apple TV. Try another source or refresh the links."))
         } else {
-            onBack()
+            onClose(sourceRequest(), nil)
         }
+    }
+
+    private func sourceRequest() -> TitlePlaybackRequest {
+        // During a switch the recorder still belongs to the previous episode until
+        // the replacement stream produces a valid time sample.
+        let position = recordingEpisode?.id == activeEpisodeID ? recorder.resumePosition : nil
+        if let episode = request.followingEpisodes.first(where: { $0.id == activeEpisodeID }),
+           let advanced = request.advancing(to: episode, position: position ?? 0) {
+            return advanced
+        }
+        var updated = request
+        updated.position = position ?? request.position
+        return updated
     }
 
     private func mergeInitialSubtitles() async {
@@ -214,10 +234,10 @@ struct UpstreamPlaybackBridge: View {
     }
 
     private func videoIDs(for contentID: String) -> [String] {
-        guard let episode = episodes.first(where: { $0.id == contentID }) else { return request.videoIDs }
-        if episode.id == currentEpisode?.id { return request.videoIDs }
-        let canonical = "\(request.contentID):\(episode.season):\(episode.episode)"
-        return canonical == episode.id ? [canonical] : [canonical, episode.id]
+        guard let episode = request.followingEpisodes.first(where: { $0.id == contentID }) else {
+            return request.videoIDs
+        }
+        return request.videoIDs(for: episode)
     }
 
     private func prepare(_ stream: AddonStream, videoIDs: [String], subtitle: String) async -> PreparedNextStream? {
@@ -308,29 +328,14 @@ private enum UpstreamPiPRestore {
     ) -> (stream: AddonStream, request: TitlePlaybackRequest)? {
         guard context.meta.id == request.contentID, UpstreamPlaybackBridge.isHTTPS(context.url) else { return nil }
         let position = max(0, manager.activeCoordinator?.activeEngine.positionMs ?? request.position)
-        let season = context.currentEpisode?.season ?? request.season
-        let episodeNumber = context.currentEpisode?.episode ?? request.episodeNumber
-        let sameEpisode = season == request.season && episodeNumber == request.episodeNumber
-        let follow = request.followingEpisodes
-        let currentIndex = follow.firstIndex { $0.season == season && $0.episode == episodeNumber }
-        let selectedEpisode = sameEpisode ? request.selectedEpisode : currentIndex.map { follow[$0] }
-        let videoIDs: [String]
-        if sameEpisode {
-            videoIDs = request.videoIDs
-        } else if let season, let episodeNumber, let activeID = context.currentEpisode?.id {
-            let canonical = "\(request.contentID):\(season):\(episodeNumber)"
-            videoIDs = activeID == canonical ? [canonical] : [canonical, activeID]
-        } else {
-            return nil
+        var restoredRequest = request
+        if let current = context.currentEpisode,
+           current.season != request.season || current.episode != request.episodeNumber {
+            guard let episode = request.followingEpisodes.first(where: { $0.id == current.id }),
+                  let advanced = request.advancing(to: episode, position: position) else { return nil }
+            restoredRequest = advanced
         }
-        let restoredRequest = TitlePlaybackRequest(
-            title: request.title, episode: context.subtitle.isEmpty ? nil : context.subtitle,
-            kind: request.kind, videoIDs: videoIDs, position: position, addons: request.addons,
-            contentID: request.contentID, season: season, episodeNumber: episodeNumber,
-            profileID: request.profileID, accountID: request.accountID,
-            followingEpisodes: currentIndex.map { Array(follow.dropFirst($0 + 1)) } ?? follow,
-            metadata: request.metadata, selectedEpisode: selectedEpisode
-        )
+        restoredRequest.position = position
         let restoredStream = AddonStream(
             id: stream.destination == .video(context.url) ? stream.id : UUID(),
             addon: stream.addon, name: stream.name, description: stream.description,

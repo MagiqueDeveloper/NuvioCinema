@@ -5,7 +5,10 @@ import SwiftUI
 struct NuvioSettingsView: View {
     let account: NuvioAccount
 
+    @Environment(CinemaTitleNavigation.self) private var titles
     @State private var path: [Page] = []
+    @State private var watchlistRouteID: UUID?
+    @FocusState private var focusedWatchlistItem: NuvioLibraryItem.ID?
     @FocusState private var linkFocus: LinkAction?
 
     private enum Page: Hashable {
@@ -67,6 +70,10 @@ struct NuvioSettingsView: View {
                 path.removeAll()
                 linkFocus = .link
             }
+        }
+        .onChange(of: account.profileID) { _, _ in
+            if let watchlistRouteID { titles.dismiss(id: watchlistRouteID) }
+            watchlistRouteID = nil
         }
     }
 
@@ -278,14 +285,38 @@ struct NuvioSettingsView: View {
             }
 
             ForEach(account.watchlist, id: \.id) { entry in
-                settingsRow("Title", symbol: "bookmark", name: entry.title) {
-                    Text(entry.addedAt, format: .dateTime.month(.abbreviated).day().year())
+                if let kind = CinemetaKind(rawValue: entry.contentType) {
+                    Button {
+                        openWatchlistTitle(entry, kind: kind)
+                    } label: {
+                        watchlistRow(entry)
+                    }
+                    .focused($focusedWatchlistItem, equals: entry.id)
+                } else {
+                    watchlistRow(entry)
+                        .focusable()
                 }
-                .accessibilityElement(children: .combine)
-                .focusable()
             }
         }
         .navigationTitle("Watchlist")
+    }
+
+    private func openWatchlistTitle(_ entry: NuvioLibraryItem, kind: CinemetaKind) {
+        guard titles.screens.isEmpty else { return }
+        let profileID = account.profileID
+        watchlistRouteID = titles.show(onDismiss: {
+            watchlistRouteID = nil
+            if account.profileID == profileID { focusedWatchlistItem = entry.id }
+        }) { close in
+            NuvioWatchlistTitle(entry: entry, kind: kind, onDismiss: close)
+        }
+    }
+
+    private func watchlistRow(_ entry: NuvioLibraryItem) -> some View {
+        settingsRow("Title", symbol: "bookmark", name: entry.title) {
+            Text(entry.addedAt, format: .dateTime.month(.abbreviated).day().year())
+        }
+        .accessibilityElement(children: .combine)
     }
 
     private var progress: some View {
@@ -364,6 +395,50 @@ struct NuvioSettingsView: View {
             Spacer(minLength: 20)
             status()
                 .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct NuvioWatchlistTitle: View {
+    let entry: NuvioLibraryItem
+    let kind: CinemetaKind
+    let onDismiss: () -> Void
+
+    @State private var title: CinemetaTitle?
+    @State private var loadFailed = false
+    @State private var loadAttempt = 0
+
+    var body: some View {
+        if let title {
+            TitleDetailsView(title: title, kind: kind, onDismiss: onDismiss)
+        } else {
+            VStack(spacing: 24) {
+                Text(entry.title)
+                    .font(.title)
+                    .accessibilityAddTraits(.isHeader)
+                if loadFailed {
+                    Text("Couldn’t load this title.")
+                        .foregroundStyle(.secondary)
+                    Button("Try Again", systemImage: "arrow.clockwise") {
+                        loadFailed = false
+                        loadAttempt += 1
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else {
+                    ProgressView("Loading title…")
+                }
+                Button("Back", action: onDismiss)
+                    .buttonStyle(.bordered)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .background { CinemaStyle.background.ignoresSafeArea() }
+            .onExitCommand(perform: onDismiss)
+            .task(id: loadAttempt) {
+                let loaded = await CinemetaClient().details(contentID: entry.contentID, kind: kind)
+                guard !Task.isCancelled else { return }
+                title = loaded
+                loadFailed = loaded == nil
+            }
         }
     }
 }

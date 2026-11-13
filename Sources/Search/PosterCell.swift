@@ -15,7 +15,7 @@ final class PosterCell: UICollectionViewCell {
         .margins(.all, 0)
         .makeContentView()
     private var loadTask: Task<Void, Never>?
-    private var url: URL?
+    private var artworkURLs: [URL]?
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -73,64 +73,56 @@ final class PosterCell: UICollectionViewCell {
         super.prepareForReuse()
         loadTask?.cancel()
         loadTask = nil
-        url = nil
+        artworkURLs = nil
         poster.image = nil
         updateFocusAppearance(false)
         spinner.isHidden = true
         placeholder.isHidden = true
     }
 
-    func configure(name: String, url: URL?, onMissing: (() -> Void)? = nil) {
+    func configure(name: String, primaryURL: URL?, fallbackURL: URL?) {
         label.text = name
         accessibilityLabel = name
         updateFocusAppearance(isFocused)
-        guard let url else {
-            loadTask?.cancel()
-            self.url = nil
-            showMissingPoster(onMissing)
+        let urls = [primaryURL, fallbackURL == primaryURL ? nil : fallbackURL].compactMap { $0 }
+        guard artworkURLs != urls else { return }
+        artworkURLs = urls
+        loadTask?.cancel()
+        loadTask = nil
+
+        guard let first = urls.first else {
+            showPlaceholder()
             return
         }
-        guard self.url != url else { return }
-        self.url = url
-        loadTask?.cancel()
 
         placeholder.isHidden = true
-        if let image = CinemaImageCache.cached(url) {
-            poster.image = UIImage(cgImage: image)
-            spinner.isHidden = true
+        if let image = CinemaImageCache.cached(first) {
+            showPoster(image)
             return
         }
         poster.image = nil
         spinner.isHidden = false
         loadTask = Task { [weak self] in
-            var delay = 2
-            while !Task.isCancelled {
-                do {
-                    let image = try await CinemaImageCache.shared.image(for: url)
-                    guard !Task.isCancelled else { return }
-                    self?.poster.image = UIImage(cgImage: image)
-                    self?.spinner.isHidden = true
-                    return
-                } catch CinemaImageError.missing {
-                    guard !Task.isCancelled else { return }
-                    self?.showMissingPoster(onMissing)
-                    return
-                } catch {
-                    guard self != nil, !Task.isCancelled,
-                          (try? await Task.sleep(for: .seconds(delay))) != nil else { return }
-                    delay = min(delay * 2, 30)
-                }
+            for url in urls {
+                guard self != nil, !Task.isCancelled else { return }
+                guard let image = try? await CinemaImageCache.shared.image(for: url) else { continue }
+                guard !Task.isCancelled else { return }
+                self?.showPoster(image)
+                return
             }
+            guard !Task.isCancelled else { return }
+            self?.showPlaceholder()
         }
     }
 
-    private func showMissingPoster(_ onMissing: (() -> Void)?) {
-        if let onMissing {
-            onMissing()
-        } else {
-            poster.image = nil
-            spinner.isHidden = true
-            placeholder.isHidden = false
-        }
+    private func showPoster(_ image: CGImage) {
+        poster.image = UIImage(cgImage: image)
+        spinner.isHidden = true
+    }
+
+    private func showPlaceholder() {
+        poster.image = nil
+        spinner.isHidden = true
+        placeholder.isHidden = false
     }
 }

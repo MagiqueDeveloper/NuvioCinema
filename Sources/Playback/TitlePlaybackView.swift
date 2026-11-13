@@ -8,7 +8,7 @@ struct TitlePlaybackRequest: Identifiable, Sendable {
     let episode: String?
     let kind: CinemetaKind
     let videoIDs: [String]
-    let position: Int64
+    var position: Int64
     let addons: [NuvioAddon]
     let contentID: String
     let season: Int?
@@ -19,15 +19,22 @@ struct TitlePlaybackRequest: Identifiable, Sendable {
     var metadata: CinemetaTitle? = nil
     var selectedEpisode: CinemetaEpisode? = nil
 
-    func next(position: Int64) -> TitlePlaybackRequest? {
-        guard let next = followingEpisodes.first else { return nil }
-        let label = String(localized: "S\(next.season), E\(next.episode) · \(next.name)")
-        let standardID = "\(contentID):\(next.season):\(next.episode)"
+    func videoIDs(for episode: CinemetaEpisode) -> [String] {
+        let suffix = ":\(episode.season):\(episode.episode)"
+        let catalogIDs = [metadata?.imdbID, metadata?.id].compactMap { $0 }.map { $0 + suffix }
+        var seen = Set<String>()
+        return ([contentID + suffix, episode.id] + catalogIDs).filter { seen.insert($0).inserted }
+    }
+
+    func advancing(to episode: CinemetaEpisode, position: Int64) -> TitlePlaybackRequest? {
+        guard let index = followingEpisodes.firstIndex(where: { $0.id == episode.id }) else { return nil }
+        let label = String(localized: "S\(episode.season), E\(episode.episode) · \(episode.name)")
         return TitlePlaybackRequest(title: title, episode: label, kind: kind,
-                                    videoIDs: standardID == next.id ? [standardID] : [standardID, next.id],
-                                    position: position, addons: addons, contentID: contentID, season: next.season,
-                                    episodeNumber: next.episode, profileID: profileID, accountID: accountID,
-                                    followingEpisodes: Array(followingEpisodes.dropFirst()), metadata: metadata, selectedEpisode: next)
+                                    videoIDs: videoIDs(for: episode), position: position, addons: addons,
+                                    contentID: contentID, season: episode.season, episodeNumber: episode.episode,
+                                    profileID: profileID, accountID: accountID,
+                                    followingEpisodes: Array(followingEpisodes.dropFirst(index + 1)),
+                                    metadata: metadata, selectedEpisode: episode)
     }
 }
 
@@ -39,7 +46,9 @@ struct TitlePlaybackView: View {
     @State private var request: TitlePlaybackRequest
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    #if !NUVIO_UPSTREAM_PLAYER
     @FocusState private var focusedItem: FocusTarget?
+    #endif
     @State private var results: AddonStreamResults?
     @State private var selected: AddonStream?
     @State private var loadAttempt = 0
@@ -58,6 +67,7 @@ struct TitlePlaybackView: View {
         self.onDismiss = onDismiss
     }
 
+    #if !NUVIO_UPSTREAM_PLAYER
     private enum FocusTarget: Hashable {
         case status, retry, source(AddonStream.ID)
     }
@@ -67,8 +77,77 @@ struct TitlePlaybackView: View {
         if let first = results?.streams.first { return .source(first.id) }
         return results.map { $0.failedAddons > 0 } == true ? .retry : .status
     }
+    #endif
 
     var body: some View {
+        playbackContent
+        .task {
+            await Task.yield()
+            guard !Task.isCancelled, !isClosing else { return }
+            withAnimation(sheetAnimation(opening: true), completionCriteria: .removed) {
+                isOpen = true
+            } completion: {
+                #if !NUVIO_UPSTREAM_PLAYER
+                if !isClosing && focusedItem == nil { focusedItem = preferredFocus }
+                #endif
+            }
+        }
+        .task(id: loadAttempt) {
+            let loaded = await AddonStreams().load(addons: request.addons, kind: request.kind, videoIDs: request.videoIDs)
+            guard !Task.isCancelled, !isClosing else { return }
+            results = loaded
+            #if !NUVIO_UPSTREAM_PLAYER
+            focusedItem = preferredFocus
+            #endif
+        }
+        #if !NUVIO_UPSTREAM_PLAYER
+        .fullScreenCover(item: $selected, onDismiss: restoreSourceFocus, content: player)
+        #endif
+        .alert("Source Unavailable", isPresented: Binding(
+            get: { playbackError != nil }, set: { if !$0 { playbackError = nil } }
+        )) {
+            Button("Refresh Sources", action: resultsReset)
+            Button("OK", role: .cancel) { playbackError = nil }
+        } message: {
+            Text(playbackError ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private var playbackContent: some View {
+        #if NUVIO_UPSTREAM_PLAYER
+        // Keep the player in the same presentation so Back is routed to its focused menu.
+        if let selected {
+            player(selected)
+                .id(selected.id)
+        } else {
+            sourcePicker
+        }
+        #else
+        sourcePicker
+        #endif
+    }
+
+    @ViewBuilder
+    private var sourcePicker: some View {
+        #if NUVIO_UPSTREAM_PLAYER
+        ZStack {
+            if isOpen {
+                SourcesSidePanel(
+                    sources: results?.streams ?? [],
+                    isLoading: results == nil,
+                    preferredID: lastSourceID,
+                    presentation: { $0.panelStream },
+                    onSelect: open,
+                    emptyMessage: results.map(emptyMessage),
+                    onRetry: (results?.failedAddons ?? 0) > 0 ? resultsReset : nil,
+                    onExit: close
+                )
+                .focusSection()
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        #else
         GeometryReader { geometry in
             let panelWidth = min(740, geometry.size.width * 0.48)
             ZStack(alignment: .trailing) {
@@ -84,30 +163,15 @@ struct TitlePlaybackView: View {
         .ignoresSafeArea()
         .defaultFocus($focusedItem, preferredFocus)
         .onExitCommand(perform: close)
-        .task {
-            await Task.yield()
-            guard !Task.isCancelled, !isClosing else { return }
-            withAnimation(reduceMotion ? .easeOut(duration: 0.15) : .smooth(duration: 0.4), completionCriteria: .removed) {
-                isOpen = true
-            } completion: {
-                if !isClosing && focusedItem == nil { focusedItem = preferredFocus }
-            }
-        }
-        .task(id: loadAttempt) {
-            let loaded = await AddonStreams().load(addons: request.addons, kind: request.kind, videoIDs: request.videoIDs)
-            guard !Task.isCancelled, !isClosing else { return }
-            results = loaded
-            focusedItem = preferredFocus
-        }
-        .fullScreenCover(item: $selected, onDismiss: restoreSourceFocus, content: player)
-        .alert("Source Unavailable", isPresented: Binding(
-            get: { playbackError != nil }, set: { if !$0 { playbackError = nil } }
-        )) {
-            Button("Refresh Sources", action: resultsReset)
-            Button("OK", role: .cancel) { playbackError = nil }
-        } message: {
-            Text(playbackError ?? "")
-        }
+        #endif
+    }
+
+    private func sheetAnimation(opening: Bool) -> Animation? {
+        #if NUVIO_UPSTREAM_PLAYER
+        reduceMotion ? nil : .easeOut(duration: 0.22)
+        #else
+        reduceMotion ? .easeOut(duration: opening ? 0.15 : 0.12) : .smooth(duration: opening ? 0.4 : 0.3)
+        #endif
     }
 
     @ViewBuilder
@@ -115,8 +179,7 @@ struct TitlePlaybackView: View {
         if case let .video(url) = stream.destination {
             #if NUVIO_UPSTREAM_PLAYER
             UpstreamPlaybackBridge(url: url, request: request, stream: stream, account: account,
-                                   onBack: { selected = nil }, onFailure: playbackFailed,
-                                   onRestorePlayer: restoreUpstreamPlayer)
+                                   onClose: returnFromUpstreamPlayer, onRestorePlayer: restoreUpstreamPlayer)
             #else
             StreamPlaybackScreen(url: url, request: request, stream: stream, account: account,
                                  onNext: nextEpisodeAction, onFailure: playbackFailed)
@@ -125,6 +188,16 @@ struct TitlePlaybackView: View {
     }
 
     #if NUVIO_UPSTREAM_PLAYER
+    private func returnFromUpstreamPlayer(_ updatedRequest: TitlePlaybackRequest, _ failure: String?) {
+        guard selected != nil else { return }
+        let episodeChanged = request.id != updatedRequest.id
+        request = updatedRequest
+        playerFailure = failure
+        selected = nil
+        if episodeChanged { resultsReset() }
+        restoreSourceFocus()
+    }
+
     private func restoreUpstreamPlayer(_ stream: AddonStream, _ restoredRequest: TitlePlaybackRequest) -> Bool {
         guard isPresented(), !isClosing, selected == nil else { return false }
         let needsSources = request.videoIDs != restoredRequest.videoIDs
@@ -145,6 +218,7 @@ struct TitlePlaybackView: View {
         return { advanceEpisode() }
     }
 
+    #if !NUVIO_UPSTREAM_PLAYER
     private var panel: some View {
         VStack(alignment: .leading, spacing: 20) {
             header
@@ -240,19 +314,6 @@ struct TitlePlaybackView: View {
         .padding(.vertical, 10)
     }
 
-    private func emptyMessage(_ results: AddonStreamResults) -> String {
-        if !request.addons.contains(where: \.enabled) {
-            return String(localized: "Link your Nuvio account and sync a profile with an enabled streaming add-on in Settings.")
-        }
-        if results.unsupportedStreams > 0 {
-            return String(localized: "The sources returned for this title aren’t supported by the Apple TV player.")
-        }
-        if results.failedAddons > 0 {
-            return String(localized: "Some add-ons couldn’t be reached. Try again to check for sources.")
-        }
-        return String(localized: "Your enabled add-ons didn’t return a source for this title.")
-    }
-
     private func sourceLabel(_ stream: AddonStream) -> some View {
         HStack(alignment: .top, spacing: 20) {
             Image(systemName: stream.destination.isExternal ? "arrow.up.right" : "play.fill")
@@ -280,6 +341,20 @@ struct TitlePlaybackView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 18)
     }
+    #endif
+
+    private func emptyMessage(_ results: AddonStreamResults) -> String {
+        if !request.addons.contains(where: \.enabled) {
+            return String(localized: "Link your Nuvio account and sync a profile with an enabled streaming add-on in Settings.")
+        }
+        if results.unsupportedStreams > 0 {
+            return String(localized: "The sources returned for this title aren’t supported by the Apple TV player.")
+        }
+        if results.failedAddons > 0 {
+            return String(localized: "Some add-ons couldn’t be reached. Try again to check for sources.")
+        }
+        return String(localized: "Your enabled add-ons didn’t return a source for this title.")
+    }
 
     private func open(_ stream: AddonStream) {
         guard !isClosing else { return }
@@ -302,13 +377,15 @@ struct TitlePlaybackView: View {
             let saved = account.progress(for: request.contentID, kind: request.kind,
                                          season: episode.season, episode: episode.episode)
             let position = saved.flatMap { $0.fraction < 0.95 && NuvioAccount.hasStarted($0) ? $0.position : nil } ?? 0
-            if let next = request.next(position: position) {
+            if let next = request.advancing(to: episode, position: position) {
                 request = next
                 resultsReset()
                 return
             }
         }
+        #if !NUVIO_UPSTREAM_PLAYER
         focusedItem = preferredFocus
+        #endif
         if let playerFailure {
             self.playerFailure = nil
             playbackError = playerFailure
@@ -324,14 +401,16 @@ struct TitlePlaybackView: View {
         guard !isClosing else { return }
         lastSourceID = nil
         results = nil
+        #if !NUVIO_UPSTREAM_PLAYER
         focusedItem = .status
+        #endif
         loadAttempt += 1
     }
 
     private func close() {
         guard !isClosing, selected == nil else { return }
         isClosing = true
-        withAnimation(reduceMotion ? .easeOut(duration: 0.12) : .smooth(duration: 0.3), completionCriteria: .removed) {
+        withAnimation(sheetAnimation(opening: false), completionCriteria: .removed) {
             isOpen = false
         } completion: {
             onDismiss()
@@ -339,12 +418,20 @@ struct TitlePlaybackView: View {
     }
 }
 
+#if NUVIO_UPSTREAM_PLAYER
+private extension AddonStream {
+    var panelStream: NuvioStream {
+        NuvioStream(url: nil, name: name, description: description, addonName: addon, filename: filename)
+    }
+}
+#else
 private extension AddonStream.Destination {
     var isExternal: Bool {
         if case .external = self { return true }
         return false
     }
 }
+#endif
 
 #if !NUVIO_UPSTREAM_PLAYER
 private struct StreamPlaybackScreen: View {
@@ -557,20 +644,28 @@ final class PlaybackProgressRecorder {
     private var lastSaveTime = ContinuousClock.now
     private var completed = false
 
+    var resumePosition: Int64? {
+        if completed { return 0 }
+        return latest?.position
+    }
+
     func sample(_ position: Double, duration: Double, initialPosition: Int64, checkpoint: PlaybackCheckpoint,
                 using write: (Int64, Int64, Bool) -> Void) {
         guard !completed, position.isFinite, duration.isFinite, duration > 0, duration < 1_000_000_000 else { return }
         let length = Int64((duration * 1_000).rounded())
-        if checkpoint == .ended {
+        if checkpoint == .ended, position / duration >= 0.85 {
             completed = true
             write(length, length, true)
             return
         }
-        guard position > 0 else { return }
+        guard position > 0 else {
+            if checkpoint == .ended { flush(using: write) }
+            return
+        }
         let offset = Int64((min(position, duration) * 1_000).rounded())
         if latest == nil, abs(offset - initialPosition) < 2_000 { return }
         latest = (offset, length)
-        if checkpoint == .flush || lastSaveTime.duration(to: .now) >= .seconds(15) {
+        if checkpoint != .periodic || lastSaveTime.duration(to: .now) >= .seconds(15) {
             flush(using: write)
         }
     }
