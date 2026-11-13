@@ -1,0 +1,282 @@
+#!/bin/sh
+set -eu
+
+revision=735adf8859462b5beb47dbc96a51c75ded15c685
+repository=https://github.com/bobsupra/NuvioTVOS.git
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+checkout="$root/.upstream-player"
+seed=
+generate=false
+
+usage() {
+    cat <<'EOF'
+Usage: Scripts/prepare-upstream-player [--checkout PATH] [--generate]
+
+Prepare the pinned NuvioTVOS player with the Cinema app sources.
+--checkout PATH   Copy an existing checkout at the pinned commit.
+--generate        Generate the workspace with Tuist, without opening it.
+                  Set NUVIO_TUIST_BIN to use a specific Tuist executable.
+EOF
+}
+
+die() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --checkout)
+            [ "$#" -ge 2 ] || die 'Missing path after --checkout.'
+            seed=$(CDPATH= cd -- "$2" && pwd)
+            shift 2
+            ;;
+        --generate) generate=true; shift ;;
+        -h|--help) usage; exit 0 ;;
+        *) usage >&2; die "Unknown option: $1" ;;
+    esac
+done
+
+if [ ! -d "$checkout/.git" ]; then
+    [ ! -e "$checkout" ] || die "Expected a Git checkout at $checkout."
+    if [ -n "$seed" ]; then
+        [ "$(git -C "$seed" rev-parse HEAD)" = "$revision" ] || die "Seed must be at $revision."
+        mkdir "$checkout"
+        cp -cR "$seed/.git" "$checkout/.git"
+        git -C "$checkout" checkout-index -a --prefix="$checkout/"
+    else
+        git init -q "$checkout"
+        git -C "$checkout" remote add origin "$repository"
+    fi
+fi
+
+if ! git -C "$checkout" cat-file -e "$revision^{commit}" 2>/dev/null; then
+    git -C "$checkout" fetch --depth=1 origin "$revision"
+fi
+if [ "$(git -C "$checkout" rev-parse --verify HEAD 2>/dev/null || true)" != "$revision" ]; then
+    git -C "$checkout" checkout --quiet --detach "$revision"
+fi
+
+if git -C "$checkout" config --bool core.sparseCheckout | grep -qx true; then
+    git -C "$checkout" sparse-checkout add MPVKit ThirdParty Vendor tvosApp
+fi
+
+for path in Tuist.swift tvosApp/Project.swift tvosApp/NuvioTV/Info.plist MPVKit/Package.swift \
+            Vendor/AetherEngine/Package.swift Vendor/FFmpegBuild/Package.swift Vendor/LibTorrent/Package.swift; do
+    [ -f "$checkout/$path" ] || die "Upstream checkout is missing $path."
+done
+
+for patch in "$root"/Scripts/Patches/*.patch; do
+    if git -C "$checkout" apply --check "$patch" 2>/dev/null; then
+        git -C "$checkout" apply "$patch"
+    elif ! git -C "$checkout" apply --reverse --check "$patch"; then
+        die "Could not apply $(basename "$patch") to the pinned player."
+    fi
+done
+
+python3 - "$root" "$checkout" "$revision" <<'PY'
+import pathlib
+import plistlib
+import re
+import shutil
+import subprocess
+import sys
+
+root, checkout = map(pathlib.Path, sys.argv[1:3])
+revision = sys.argv[3]
+app = checkout / "tvosApp/NuvioTV"
+
+
+def upstream(path):
+    return subprocess.check_output(["git", "-C", checkout, "show", f"{revision}:{path}"])
+
+
+def replace_once(source, original, modified):
+    if source.count(original) != 1:
+        raise SystemExit(f"Expected exactly one occurrence of {original!r} in the pinned upstream source.")
+    return source.replace(original, modified)
+
+
+project = upstream("tvosApp/Project.swift").decode()
+project = replace_once(project, 'let bundleID = "com.pyksel.nuviotvos"', 'let bundleID = "com.nuviocinema.app"')
+project = replace_once(project, 'let marketingVersion = "3.5.1"', 'let marketingVersion = "0.1.0"')
+project = replace_once(project, 'let projectVersion = "82"', 'let projectVersion = "1"')
+project = replace_once(project, '    productName: "NuvioTV",', '    productName: "NuvioCinema",')
+project = replace_once(project, '    sources: ["NuvioTV/Sources/**/*.swift"],',
+                        '    sources: ["NuvioTV/Sources/**/*.swift", "NuvioTV/CinemaSources/**/*.swift"],')
+project = replace_once(project, '    resources: [\n        "NuvioTV/Images.xcassets",',
+                        '    resources: [\n        "NuvioTV/Images.xcassets",\n'
+                        '        .folderReference(path: "NuvioTV/CinemaResources/ThirdPartyNotices"),')
+project = replace_once(project, '            "ENABLE_BITCODE": "NO",',
+                        '            "ENABLE_BITCODE": "NO",\n'
+                        '            "EXCLUDED_ARCHS[sdk=appletvsimulator*]": "x86_64",\n'
+                        '            "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "$(inherited) NUVIO_UPSTREAM_PLAYER",')
+target_start = project.index('let unitTestsTarget: Target')
+target_end = project.index('// MARK: - Project\n', target_start)
+project = project[:target_start] + project[target_end:]
+project = replace_once(project, '    targets: [appTarget, topShelfTarget, unitTestsTarget, uiTestsTarget],',
+                        '    targets: [appTarget, topShelfTarget],')
+project = replace_once(project,
+    '            testAction: .targets(\n                ["NuvioTVTests"],\n                configuration: "Debug"\n            ),\n', '')
+project = replace_once(project,
+    '''        .scheme(
+            name: "NuvioTV-UI",
+            shared: true,
+            buildAction: .buildAction(targets: ["NuvioTV"]),
+            testAction: .targets(
+                ["NuvioTVUITests"],
+                configuration: "Debug"
+            ),
+            runAction: .runAction(configuration: "Debug")
+        ),
+''', '')
+
+entrypoint = "tvosApp/NuvioTV/Sources/NuvioTVApp.swift"
+original_entry = upstream(entrypoint).decode()
+app_source = replace_once(original_entry, '@main\nstruct NuvioTVApp: App {', 'struct NuvioTVApp: App {')
+
+player_controls_path = "tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift"
+player_controls = upstream(player_controls_path).decode()
+player_controls = replace_once(player_controls, "        if status == .playing || status == .paused {\n            TimelineView",
+                               "        if status == .playing {\n            TimelineView")
+player_controls = replace_once(player_controls, '''                        if status == .paused {
+                            return L10n.format("player_ends_if_resumed", fallback: "If resumed now, ends at %@", time)
+                        }
+''', '')
+
+info = plistlib.loads(upstream("tvosApp/NuvioTV/Info.plist"))
+for key in ("NSBonjourServices", "BGTaskSchedulerPermittedIdentifiers"):
+    info.pop(key, None)
+info["CFBundleURLTypes"] = [{"CFBundleURLName": "com.nuviocinema.app.TopShelf", "CFBundleURLSchemes": ["nuvio-cinema"]}]
+info["CFBundleDisplayName"] = "Nuvio Cinema"
+info["UIBackgroundModes"] = ["audio"]
+info["NSAppTransportSecurity"] = {"NSAllowsLocalNetworking": True}
+
+source_overlay = app / "CinemaSources"
+resource_overlay = app / "CinemaResources"
+for folder in (source_overlay, resource_overlay):
+    if folder.exists():
+        shutil.rmtree(folder)
+    folder.mkdir()
+
+source_root = root / "Sources"
+legacy_playback = source_root / "Playback/Legacy"
+for path in sorted(source_root.rglob("*.swift")):
+    if path.is_relative_to(legacy_playback):
+        continue
+    destination = source_overlay / path.relative_to(source_root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, destination)
+
+icon = app / "Images.xcassets/AppIcon.brandassets"
+for stack in (root / "Resources/AppIcon.brandassets").glob("*.imagestack"):
+    destination = icon / stack.name
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(stack, destination)
+
+top_shelf_feed_path = "tvosApp/NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift"
+top_shelf_feed = upstream(top_shelf_feed_path).decode()
+top_shelf_feed = replace_once(top_shelf_feed, 'components.scheme = "nuvio-tv"', 'components.scheme = "nuvio-cinema"')
+top_shelf_feed = replace_once(top_shelf_feed, '''        commit(section: section) {
+            TopShelfFeed(entries: entries.map(decorated), title: title)
+''', '''        if entries.isEmpty {
+            guard isAvailable, let coordinator = writeCoordinators[section] else { return }
+            let generation = coordinator.beginWrite()
+            if coordinator.commitIfCurrent(generation, commit: {
+                writeFeed(TopShelfFeed(entries: [], title: title), section: section)
+            }) {
+                notifyTopShelfContentChanged()
+                refreshArtwork()
+            }
+            return
+        }
+        commit(section: section) {
+            TopShelfFeed(entries: entries.map(decorated), title: title)
+''')
+catalog_models_path = "tvosApp/NuvioTV/Sources/Models/CatalogModels.swift"
+catalog_models = upstream(catalog_models_path).decode()
+catalog_models = replace_once(catalog_models, '''    static func writeTopShelfFeed() {
+        guard TopShelfFeedStore.isAvailable else { return }
+        topShelfSnapshotLock.lock()
+        defer { topShelfSnapshotLock.unlock() }
+        guard TraktSettingsStore.watchProgressSource == .nuvioSync else { return }
+        writeTopShelfFeedLocked(from: items())
+    }
+''', '''    static func writeTopShelfFeed() {
+        #if !NUVIO_UPSTREAM_PLAYER
+        guard TopShelfFeedStore.isAvailable else { return }
+        topShelfSnapshotLock.lock()
+        defer { topShelfSnapshotLock.unlock() }
+        guard TraktSettingsStore.watchProgressSource == .nuvioSync else { return }
+        writeTopShelfFeedLocked(from: items())
+        #endif
+    }
+''')
+for path in ("tvosApp/NuvioTV/NuvioTV.entitlements", "tvosApp/TopShelf/TopShelf.entitlements"):
+    entitlements = {"com.apple.security.application-groups": ["group.com.nuviocinema.app"]}
+    (checkout / path).write_bytes(plistlib.dumps(entitlements))
+top_shelf_info_path = checkout / "tvosApp/TopShelf/Info.plist"
+top_shelf_info = plistlib.loads(upstream("tvosApp/TopShelf/Info.plist"))
+top_shelf_info["CFBundleDisplayName"] = "Nuvio Cinema Top Shelf"
+top_shelf_info_path.write_bytes(plistlib.dumps(top_shelf_info))
+
+notices = resource_overlay / "ThirdPartyNotices"
+notices.mkdir()
+for name in ("Anime4K-MIT.txt", "LibDovi-MIT.txt", "dovi_tool-MIT.txt"):
+    shutil.copy2(root / "Resources/ThirdPartyNotices" / name, notices / name)
+(notices / "NuvioTVOS-GPL-3.0.txt").write_bytes(upstream("LICENSE"))
+(notices / "AetherEngine-LICENSE.txt").write_bytes(upstream("Vendor/AetherEngine/LICENSE"))
+(notices / "MPVKit-LICENSE.txt").write_bytes(upstream("MPVKit/LICENSE"))
+ffmpeg = checkout / "Vendor/FFmpegBuild"
+shutil.copytree(ffmpeg / "LICENSES", notices / "FFmpegBuild")
+shutil.copy2(ffmpeg / "LICENSE", notices / "FFmpegBuild" / "LICENSE.txt")
+shutil.copy2(ffmpeg / "BUILD-INFO.txt", notices / "FFmpegBuild" / "BUILD-INFO.txt")
+(notices / "NuvioTVOS-SOURCE.txt").write_text(
+    f"This build incorporates NuvioTVOS at {revision}, licensed under GNU GPL v3.\n"
+    f"Upstream source: https://github.com/bobsupra/NuvioTVOS/tree/{revision}\n"
+    "The Cinema integration and project-generation script form part of the combined source.\n"
+    "Include them and the required notices when distributing this build.\n\n"
+    "AetherEngine 7.61.0, vendored by NuvioTVOS:\n"
+    f"https://github.com/bobsupra/NuvioTVOS/tree/{revision}/Vendor/AetherEngine\n"
+    "The accompanying FFmpegBuild notice directory includes its exact build record and license texts.\n"
+    f"https://github.com/bobsupra/NuvioTVOS/tree/{revision}/Vendor/FFmpegBuild\n\n"
+    "MPVKit (LGPL product), using the 0.41.0-n8.1.2 binary release:\n"
+    f"https://github.com/bobsupra/NuvioTVOS/tree/{revision}/MPVKit\n"
+    "https://github.com/mpvkit/MPVKit/tree/0.41.0-n8.1.2\n\n"
+    "LibDovi 2.2.0 includes the dolby_vision 3.4.0 crate, under MIT.\n"
+    "https://github.com/superuser404notfound/LibDovi/tree/2.2.0\n"
+    "https://github.com/quietvoid/dovi_tool/tree/libdovi-3.4.0\n\n"
+    "Anime4K line-art scaler kernels, copyright 2019–2021 bloc97, under MIT.\n"
+    "https://github.com/bloc97/Anime4K/tree/7684e9586f8dcc738af08a1cdceb024cc184f426\n"
+)
+
+(checkout / "tvosApp/Project.swift").write_text(project)
+(checkout / entrypoint).write_text(app_source)
+(checkout / player_controls_path).write_text(player_controls)
+(checkout / top_shelf_feed_path).write_text(top_shelf_feed)
+(checkout / catalog_models_path).write_text(catalog_models)
+(app / "Info.plist").write_bytes(plistlib.dumps(info))
+PY
+
+if [ "$generate" = true ]; then
+    tuist_bin=${NUVIO_TUIST_BIN:-tuist}
+    command -v "$tuist_bin" >/dev/null || die "Install Tuist or set NUVIO_TUIST_BIN to its executable."
+    "$tuist_bin" generate --path "$checkout/tvosApp" --no-open --no-binary-cache
+fi
+
+workspace="$checkout/tvosApp/NuvioTV.xcworkspace"
+lock_dir="$workspace/xcshareddata/swiftpm"
+lock="$lock_dir/Package.resolved"
+if [ -d "$workspace" ] && [ -f "$checkout/tvosApp/.package.resolved" ]; then
+    if [ -L "$lock" ] && [ "$(readlink "$lock")" != "$checkout/tvosApp/.package.resolved" ]; then
+        # A generated lock should never point at the separate reference checkout.
+        rm "$lock"
+    fi
+    if [ ! -e "$lock" ]; then
+        mkdir -p "$lock_dir"
+        cp "$checkout/tvosApp/.package.resolved" "$lock"
+    fi
+fi
+
+printf '%s\n' "$workspace"

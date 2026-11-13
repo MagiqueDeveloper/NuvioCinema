@@ -1,0 +1,14 @@
+DerivedData/
+build/
+xcuserdata/
+.DS_Store
+.upstream-player/
+*.xcarchive/
+*.xcresult/
+*.dSYM/
+*.ipa
+*.mobileprovision
+*.p12
+.env
+.env.*
+Signing.local.xcconfig

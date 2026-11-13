@@ -1,0 +1,4 @@
+# Unified diffs use a leading space for empty context lines.
+*.patch whitespace=-blank-at-eol
+# Keep bundled license texts verbatim.
+Resources/ThirdPartyNotices/*.txt whitespace=-blank-at-eof

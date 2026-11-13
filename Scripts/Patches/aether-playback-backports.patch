@@ -1,0 +1,577 @@
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift
+index 28ee8fb..7786edf 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift
+@@ -6608,6 +6608,16 @@ public final class AetherEngine: ObservableObject {
+         return nativeHost
+     }
+ 
++    /// Called from the host's wall-clock poll, which also runs while media time is parked.
++    public func recoverBufferedVideoPlaybackIfStalled() {
++        #if os(tvOS)
++        let canRecover = !isLive && !isSeeking && !isAwaitingDisplaySwitch && !isBackgrounded
++            && !audioInterruptionActive && !pictureInPictureActive
++            && (state == .playing || state == .paused || state == .loading)
++        nativeHost?.recoverBufferedPlaybackIfStalled(eligible: canRecover)
++        #endif
++    }
++
+     public func play() {
+         recordTransportDuringRebuild(playing: true)
+         EngineLog.emit("[AetherEngine] play() state=\(state)", category: .engine)
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/SoftwareVideoDecoder.swift b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/SoftwareVideoDecoder.swift
+index 2855f95..3a3864a 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/SoftwareVideoDecoder.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/SoftwareVideoDecoder.swift
+@@ -595,6 +595,20 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+         flush(resetFilterGraph: true)
+     }
+ 
++    /// AE#1024: `flush()` discards what libavcodec still holds, which at the end of a file is the last
++    /// frames of the stream (frame threading plus B-frame reorder). A session paused in the last half
++    /// second then never got a picture at all. The empty packet puts the decoder into draining mode,
++    /// the receive loop hands those frames over, and the `flush()` the host makes next takes it out of
++    /// that mode again.
++    func drainForEndOfStream() {
++        lock.lock()
++        guard let ctx = codecContext else { lock.unlock(); return }
++        let ret = avcodec_send_packet(ctx, nil)
++        lock.unlock()
++        guard ret >= 0 else { return }
++        drainDecodedFrames()
++    }
++
+     /// `resetFilterGraph: false` keeps the deinterlace graph across still-extraction runs, avoiding
+     /// a Metal pipeline and full-resolution hwframes-pool rebuild for each scrub frame.
+     func flush(resetFilterGraph: Bool) {
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Native/NativeAVPlayerHost.swift b/Vendor/AetherEngine/Sources/AetherEngine/Native/NativeAVPlayerHost.swift
+index 7842ac5..1a69d75 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Native/NativeAVPlayerHost.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Native/NativeAVPlayerHost.swift
+@@ -321,6 +321,8 @@ final class NativeAVPlayerHost {
+     private var pendingExternalMetadata: [AVMetadataItem] = []
+     private var timeObserver: Any?
+     private var videoFrameTask: Task<Void, Never>?
++    private var bufferedPlaybackSample: (position: Double, since: ContinuousClock.Instant)?
++    private var bufferedPlaybackRecoveryPosition: Double?
+     private var diagnosticVideoOutput: AVPlayerItemVideoOutput?
+     private var videoFrameProgress = VideoFrameProgress()
+     private var videoFrameSampleAt: Double?
+@@ -979,10 +981,15 @@ final class NativeAVPlayerHost {
+                     // token expiry, persistent segment 404) surfaces .error so the host can retune / show it.
+                     self.handleItemFailed(desc, item: current)
+                 } else if Self.shouldCountEndFailureForRevive(
+-                    surfaceEndFailures: false, hasEverPlayed: self.hasEverPlayed) {
++                    surfaceEndFailures: false, hasEverPlayed: self.hasEverPlayed,
++                    hasPresentedFrame: current.presentationSize != .zero) {
+                     // #93 round 3: loopback path. Count the death for the engine's revive
+-                    // escalation; a startup death (never played) stays with the startup watchdogs.
++                    // escalation; a startup death before the first frame stays with the startup watchdogs.
+                     self.endFailureCount += 1
++                } else {
++                    EngineLog.emit(
++                        "[NativeAVPlayerHost] #\(sid) failedToPlayToEndTime before the first frame; "
++                        + "left to the startup watchdogs", category: .engine)
+                 }
+             }
+         }
+@@ -1269,10 +1276,15 @@ final class NativeAVPlayerHost {
+     /// revive escalation? The lean remote-live path (`surfaceEndFailures`) keeps its own
+     /// deferred-failure contract; a startup death before the first frame stays with the
+     /// startup watchdogs.
++    ///
++    /// AE#1043: "past startup" is the first frame, not the first `.playing`. The startup readiness
++    /// gate declares the item ready on a non-zero presentation size, so a death between that frame
++    /// and the first `.playing` (an HDMI re-handshake while the host waits for the display switch)
++    /// was owned by neither side and parked the session forever.
+     nonisolated static func shouldCountEndFailureForRevive(
+-        surfaceEndFailures: Bool, hasEverPlayed: Bool
++        surfaceEndFailures: Bool, hasEverPlayed: Bool, hasPresentedFrame: Bool
+     ) -> Bool {
+-        !surfaceEndFailures && hasEverPlayed
++        !surfaceEndFailures && (hasEverPlayed || hasPresentedFrame)
+     }
+ 
+     /// Pure decision for the rate-change mirror: an explicit rate write (`setRateCalled`, e.g. AVKit's
+@@ -2113,6 +2125,37 @@ final class NativeAVPlayerHost {
+             + "the nearest \(where_) (playhead \(head))" + status
+     }
+ 
++    func recoverBufferedPlaybackIfStalled(eligible: Bool) {
++        #if os(tvOS)
++        let position = renderedTime
++        guard eligible, UIApplication.shared.applicationState == .active, playIntent, isReady,
++              hasPresentedVideo, failure == nil, !didReachEnd, !seekInFlight, !mountSeekPending,
++              !prematureEndRecoveryInFlight, !avPlayer.isExternalPlaybackActive,
++              playerLayer.superlayer != nil, position.isFinite,
++              Self.contiguousBufferedEnd(ranges: loadedVideoRanges, now: position) - position >= 2 else {
++            bufferedPlaybackSample = nil
++            return
++        }
++        if let recoveredAt = bufferedPlaybackRecoveryPosition {
++            guard abs(position - recoveredAt) >= 0.5 else { return }
++            bufferedPlaybackRecoveryPosition = nil
++        }
++        let now = ContinuousClock.now
++        guard let sample = bufferedPlaybackSample, abs(position - sample.position) < 0.05 else {
++            bufferedPlaybackSample = (position, now)
++            return
++        }
++        guard sample.since.duration(to: now) >= .seconds(2) else { return }
++        bufferedPlaybackRecoveryPosition = position
++        bufferedPlaybackSample = nil
++        EngineLog.emit("[NativeAVPlayerHost] Buffered playback clock stalled; restarting transport", category: .engine)
++        // Preserve the configured speed and reassert the host's play intent. There is no suspension
++        // point between the two calls where a viewer pause could be overridden.
++        avPlayer.pause()
++        play()
++        #endif
++    }
++
+     func play() {
+         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
+         playIntent = true
+@@ -2123,6 +2166,8 @@ final class NativeAVPlayerHost {
+ 
+     func pause() {
+         playIntent = false
++        bufferedPlaybackSample = nil
++        bufferedPlaybackRecoveryPosition = nil
+         liveHLSStarvationPolicy.resetObservation()
+         EngineLog.emit("[NativeAVPlayerHost] #\(sessionID) pause() transportIntentIsPlaying=false", category: .engine)
+         avPlayer.pause()
+@@ -2307,6 +2352,8 @@ final class NativeAVPlayerHost {
+     /// engine reconcile a clock that would otherwise stay latched at an unreachable optimistic target.
+     @discardableResult
+     func seek(to seconds: Double, deadlineSeconds: Double?) async -> Bool {
++        bufferedPlaybackSample = nil
++        bufferedPlaybackRecoveryPosition = nil
+         let target = CMTime(seconds: seconds, preferredTimescale: 600)
+         seekGeneration &+= 1
+         let gen = seekGeneration
+@@ -2740,6 +2787,8 @@ final class NativeAVPlayerHost {
+         loadedVideoObservation?.invalidate()
+         loadedVideoObservation = nil
+         loadedVideoRanges = []
++        bufferedPlaybackSample = nil
++        bufferedPlaybackRecoveryPosition = nil
+         videoHealthSummaryAt = nil
+         if !inPlaceSwap { videoPresentation = VideoPresentationProgress(); hasPresentedVideo = false }
+         layerReadyObservation?.invalidate()
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Native/PausedFirstFrame.swift b/Vendor/AetherEngine/Sources/AetherEngine/Native/PausedFirstFrame.swift
+index 9e4de3d..de59660 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Native/PausedFirstFrame.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Native/PausedFirstFrame.swift
+@@ -25,6 +25,24 @@ enum PausedFirstFrame {
+         loaded && !loopsStarted
+     }
+ 
++    /// AE#1023: whether a seek that lands paused runs the loops under this same hold until the frame at
++    /// the landing is in. The flush keeps the pre-seek frame on screen (#90) and the loops park under a
++    /// pause, so a host that had already shown a frame showed that one until `play()`, while the native
++    /// route presents the landed frame. Loops that never started are `pause()`'s case (AE#973), and a
++    /// host without a picture (audio only, or video discarded in the background) has nothing to wait for.
++    static func holdsAfterPausedLanding(loopsStarted: Bool, hasVideo: Bool) -> Bool {
++        loopsStarted && hasVideo
++    }
++
++    /// AE#1024: whether an end of file the loops just reached waits for `play()` instead of ending the
++    /// session. Under a host pause the loops only read for the picture, and a paused rebuild in the last
++    /// half second reads to the end before that picture is in. `.ended` is terminal and means a running
++    /// clock got there (#164 settles a seek landing on the end to `.paused` for the same reason), so the
++    /// end is owed to the next `play()`.
++    static func endOfMediaWaitsForPlay(transportPlaying: Bool, pausedByHost: Bool) -> Bool {
++        pausedByHost && !transportPlaying
++    }
++
+     /// Whether the loops may read and decode.
+     static func loopsMayRun(isPlaying: Bool, pausedBeforeFirstFrame: Bool) -> Bool {
+         isPlaying || pausedBeforeFirstFrame
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift b/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
+index 92f54f3..cac449d 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
+@@ -438,7 +438,8 @@ final class SoftwarePlaybackHost {
+     nonisolated(unsafe) private var _stopRequested: Bool = false
+ 
+     /// Sodalite#104 round 4: a pause arrived before the first frame, so the loops keep reading until one
+-    /// is in (`PausedFirstFrame`). Set by `pause()`, cleared by `play()`, `stop()` and that frame.
++    /// is in (`PausedFirstFrame`). Set by `pause()` and by a seek that lands paused (AE#1023), cleared by
++    /// `play()`, `stop()`, a seek that lands playing, and the next frame the renderer takes.
+     nonisolated private var pausedBeforeFirstFrame: Bool {
+         get { flagsLock.lock(); defer { flagsLock.unlock() }; return _pausedBeforeFirstFrame }
+         set { flagsLock.lock(); _pausedBeforeFirstFrame = newValue; flagsLock.unlock() }
+@@ -890,6 +891,10 @@ final class SoftwarePlaybackHost {
+     /// park is deferred by the queued audio tail, so the guard covers a second arrival mid-defer.
+     private var didParkClockAtEnd = false
+ 
++    /// AE#1024: the seek generation whose end of file arrived under a host pause, or nil. `play()` finishes
++    /// it; a seek drops it, and the generation check keeps a queued end from landing on a later position.
++    private var endOfMediaOwedOnPlay: UInt64?
++
+     /// Invoked on the main-actor time-update cadence with the current
+     /// session-relative live edge (seconds since first frame) while live.
+     /// Wired by the engine to `publishLiveWindow(edgeSessionTime:)`.
+@@ -1571,12 +1576,6 @@ final class SoftwarePlaybackHost {
+             // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
+             if self.bumpFramesEnqueued() == 0 {
+                 self.noteFirstFrameEnqueuedForDisplayFallback()
+-                if self.takePausedBeforeFirstFrame() {
+-                    // The reorder buffer holds frames before it hands one to the layer, and the
+-                    // loops park again from here: without the drain the frame never leaves it.
+-                    self.renderer.drainReorderBuffer()
+-                    self.presentFirstFrameUnderPause(pts: pts.seconds, generation: self.decodeGeneration)
+-                }
+                 let pfType = CVPixelBufferGetPixelFormatType(pixelBuffer)
+                 EngineLog.emit(
+                     "[SWHost] first video frame enqueued: "
+@@ -1588,6 +1587,17 @@ final class SoftwarePlaybackHost {
+             }
+         }
+ 
++        // The hold ends at the first frame the renderer hands over, not the first one decoded: a
++        // decoder that answers in coding order (VideoToolbox) delivers a later P-frame before the
++        // B-frames at the target, and draining the reorder buffer on it moved the stopped clock
++        // past them and lost them (AE#1023, measured `27.042s arrived after 27.125s was handed
++        // over` on a landing at 27.02). The skip threshold already kept everything before the target
++        // out, and the end-of-stream drains reach this hook too.
++        renderer.setHandoverHook { [weak self] ptsSeconds in
++            guard let self, self.takePausedBeforeFirstFrame() else { return }
++            self.presentFirstFrameUnderPause(pts: ptsSeconds, generation: self.decodeGeneration)
++        }
++
+         let onFrame = upscaledFrameHandler(
+             baseOnFrame, decoder: videoDecoder, frameRate: AetherEngine.detectFrameRate(stream: vStream))
+ 
+@@ -1929,6 +1939,10 @@ final class SoftwarePlaybackHost {
+         rate = lastRate
+         isPlaying = true
+         inFlightSeekResumeIntent = true
++        if let owed = endOfMediaOwedOnPlay {
++            endOfMediaOwedOnPlay = nil
++            if owed == seekGeneration { finishAtEndOfMedia() }
++        }
+         publishSpatialAudioOutputStateIfChanged()
+     }
+ 
+@@ -1990,6 +2004,8 @@ final class SoftwarePlaybackHost {
+         clockArmed = armed
+     }
+ 
++    var endOfMediaOwedOnPlayForTesting: Bool { endOfMediaOwedOnPlay != nil }
++
+     func finishClockOutputForTesting() {
+         didReachEnd = true
+         isPlaying = false
+@@ -2095,6 +2111,13 @@ final class SoftwarePlaybackHost {
+         }
+     }
+ 
++    private func finishAtEndOfMedia() {
++        endOfMediaOwedOnPlay = nil
++        parkClockAtEndOfMedia()
++        didReachEnd = true
++        isPlaying = false
++    }
++
+     /// AE#374: stop the master clock on the last sample instead of letting it free-run past the end.
+     ///
+     /// `.ended` is terminal, so nothing will consume the clock again, but the synchronizer used to keep
+@@ -2584,6 +2607,7 @@ final class SoftwarePlaybackHost {
+         let generation = seekGeneration
+         residentRangePublication.invalidate()
+         didReachEnd = false
++        endOfMediaOwedOnPlay = nil
+         didParkClockAtEnd = false
+         didEmitParkedDiag = false
+         let packetSource = vodPacketReadAhead
+@@ -2623,7 +2647,8 @@ final class SoftwarePlaybackHost {
+         renderer.flush(removingDisplayedImage: false)
+         audioOutput?.flush()
+         // AE#479: the flush just emptied the queue the diag marker describes, and the pump learns of
+-        // this seek only at its next iteration, which a paused landing never reaches until play().
++        // this seek only at its next iteration, which a paused landing reaches only for the landed
++        // frame (AE#1023) and otherwise not until play().
+         demuxDiag.audioFlushed(generation: generation)
+         keyframeLedger.reset()
+ 
+@@ -2737,6 +2762,7 @@ final class SoftwarePlaybackHost {
+             audioOutput?.seekClock(to: targetTime, rate: 0)
+             pausedByHost = true
+         }
++        holdForLandedFrame(paused: !inFlightSeekResumeIntent)
+         // Arm now so the demux loop doesn't re-arm at stale initialClockTime (a pre-first-audio seek snapped back to session start without this).
+         clockArmed = true
+         publishSpatialAudioOutputStateIfChanged()
+@@ -2748,6 +2774,25 @@ final class SoftwarePlaybackHost {
+         return outcome
+     }
+ 
++    /// AE#1023: a landing at a stopped clock runs the loops until the frame at the target is in, then
++    /// they park again; a landing that plays drops a hold an earlier paused landing left standing, or
++    /// the clock would arm at rate 0 under a running transport. Set before the seek window closes,
++    /// whose broadcast is what wakes the parked loops.
++    private func holdForLandedFrame(paused: Bool) {
++        guard paused else {
++            _ = takePausedBeforeFirstFrame()
++            return
++        }
++        guard !stopRequested, PausedFirstFrame.holdsAfterPausedLanding(
++            loopsStarted: demuxLoopStarted,
++            hasVideo: videoStreamIndex >= 0 && !backgroundAudioOnly) else { return }
++        pausedBeforeFirstFrame = true
++        EngineLog.emit(
++            "[SWHost] AE#1023 paused landing: the loops read at a stopped clock until the landed frame presents",
++            category: .swPlayback
++        )
++    }
++
+     /// AE#595: the extractor, built on the first ask and kept for the rest of the session.
+     ///
+     /// The stream pointer is re-read from the demuxer rather than held from session start: the
+@@ -2909,6 +2954,7 @@ final class SoftwarePlaybackHost {
+             audioOutput?.seekClock(to: targetTime, rate: 0)
+             pausedByHost = true
+         }
++        holdForLandedFrame(paused: !wasPlaying)
+         clockArmed = true
+ 
+         // Reposition cursor to the newest keyframe at or before target. If the target precedes every
+@@ -3155,9 +3201,14 @@ final class SoftwarePlaybackHost {
+                 // Only current EOF may mark the diagnostic source exhausted or stop playback.
+                 // A queued pre-seek EOF task must not end a freshly positioned generation.
+                 self.demuxDiag.markSourceExhausted()
+-                self.parkClockAtEndOfMedia()
+-                self.didReachEnd = true
+-                self.isPlaying = false
++                if PausedFirstFrame.endOfMediaWaitsForPlay(transportPlaying: self.isPlaying,
++                                                           pausedByHost: self.pausedByHost) {
++                    self.endOfMediaOwedOnPlay = generation
++                    EngineLog.emit("[SWHost] AE#1024 end of file under a pause: the session ends once play() runs the clock there",
++                                   category: .swPlayback)
++                    return
++                }
++                self.finishAtEndOfMedia()
+                 self.publishSpatialAudioOutputStateIfChanged()
+             }
+         }
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Renderer/SampleBufferRenderer.swift b/Vendor/AetherEngine/Sources/AetherEngine/Renderer/SampleBufferRenderer.swift
+index 9bc29d8..55baf10 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Renderer/SampleBufferRenderer.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Renderer/SampleBufferRenderer.swift
+@@ -208,7 +208,14 @@ final class SampleBufferRenderer: @unchecked Sendable {
+     /// clock run from the audio there. On the arrival-order path only the frontier counts, the newest
+     /// timestamp with every earlier slot handed over, so a frame that came early past a gap does not
+     /// open the gate.
++    ///
++    /// A full layer opens it too: nothing more can be handed over until the clock drains the layer,
++    /// so waiting only runs out `AudioOutput.prerollTimeout`. That is the resume after a rebuffer, whose
++    /// frames sit at or behind the stopped clock (AE#1025 follow-up: 2 s of standstill after every
++    /// rebuffer). A start or a seek begins with a flushed layer, which is not full.
+     func prerollSatisfied(clock: Double, live: Bool) -> Bool? {
++        // Read outside `reorderLock`: the queue target answers it under its own locks.
++        let layerFull = !isReadyForMoreMediaData
+         reorderLock.lock()
+         defer { reorderLock.unlock() }
+         guard clock.isFinite else { return nil }
+@@ -216,6 +223,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
+         if rate == nil, live { return nil }
+         let handed = arrivalFloor != nil ? arrivalFloor?.frontier : _lastReleasedPtsSeconds
+         guard let handed else { return false }
++        if layerFull { return true }
+         guard let rate else { return handed - clock >= Self.videoPrerollSeconds }
+         return handed + 1 / rate - clock >= Self.felPrerollSeconds(frameRate: rate)
+     }
+@@ -272,6 +280,16 @@ final class SampleBufferRenderer: @unchecked Sendable {
+         reorderLock.unlock()
+     }
+ 
++    /// The host's own hook on the same moment, kept apart from the public #311 observer: the source
++    /// timestamp of every frame the queue target accepted, whether it left the reorder buffer on its own
++    /// or in a drain. Same locking as the observer.
++    private var _handoverHook: (@Sendable (Double) -> Void)?
++    func setHandoverHook(_ hook: (@Sendable (Double) -> Void)?) {
++        reorderLock.lock()
++        _handoverHook = hook
++        reorderLock.unlock()
++    }
++
+     /// AE#395: the session's renderer axis, shared with the `AudioOutput` whose synchronizer this
+     /// renderer runs on. Only the stamp on the sample buffer moves onto it; the reorder buffer, the
+     /// frontier and the frame-time reports stay on the source axis. Guarded by `reorderLock`.
+@@ -1066,8 +1084,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
+         reorderLock.lock()
+         let observer = _frameEnqueuedObserver
+         let generation = _flushGeneration
++        let handoverHook = accepted ? _handoverHook : nil
+         reorderLock.unlock()
+         observer?(SoftwareVideoFrameTime(presentation: pts, generation: generation))
++        if let handoverHook, pts.isNumeric { handoverHook(CMTimeGetSeconds(pts)) }
+ 
+         reorderLock.lock()
+         enqueueCount += 1
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/DualLayerDeadlineBypassTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/DualLayerDeadlineBypassTests.swift
+index e40630f..48bbb7e 100644
+--- a/Vendor/AetherEngine/Tests/AetherEngineTests/DualLayerDeadlineBypassTests.swift
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/DualLayerDeadlineBypassTests.swift
+@@ -285,6 +285,7 @@ struct DualLayerDeadlineBypassTests {
+         r.clocks.prerolling = true
+         defer { r.decoder.close() }
+         let renderer = SampleBufferRenderer()
++        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
+         renderer.setFELLookahead(enabled: true, frameRate: 24)
+         renderer.setArrivalOrderHandover(frameRate: 24)
+         // The seek lands at 20.0 s with the clock held at rate 0. Frame 1's enhancement layer is lost;
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/Issue93ItemDeathReviveTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/Issue93ItemDeathReviveTests.swift
+index 3a49a62..1fc0990 100644
+--- a/Vendor/AetherEngine/Tests/AetherEngineTests/Issue93ItemDeathReviveTests.swift
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/Issue93ItemDeathReviveTests.swift
+@@ -83,19 +83,27 @@ struct Issue93ItemDeathReviveTests {
+     @Test("loopback path counts an end failure after playback was established")
+     func countsLoopbackDeath() {
+         #expect(NativeAVPlayerHost.shouldCountEndFailureForRevive(
+-            surfaceEndFailures: false, hasEverPlayed: true))
++            surfaceEndFailures: false, hasEverPlayed: true, hasPresentedFrame: true))
++    }
++
++    @Test("AE#1043: a death after the first frame but before the first .playing is counted")
++    func countsDeathBetweenFirstFrameAndFirstPlaying() {
++        #expect(NativeAVPlayerHost.shouldCountEndFailureForRevive(
++            surfaceEndFailures: false, hasEverPlayed: false, hasPresentedFrame: true))
+     }
+ 
+     @Test("lean remote-live path keeps its own deferred-failure contract")
+     func leanLivePathDoesNotDoubleHandle() {
+         #expect(!NativeAVPlayerHost.shouldCountEndFailureForRevive(
+-            surfaceEndFailures: true, hasEverPlayed: true))
++            surfaceEndFailures: true, hasEverPlayed: true, hasPresentedFrame: true))
++        #expect(!NativeAVPlayerHost.shouldCountEndFailureForRevive(
++            surfaceEndFailures: true, hasEverPlayed: false, hasPresentedFrame: true))
+     }
+ 
+     @Test("startup death before the first frame stays with the startup watchdogs")
+     func startupDeathNotCounted() {
+         #expect(!NativeAVPlayerHost.shouldCountEndFailureForRevive(
+-            surfaceEndFailures: false, hasEverPlayed: false))
++            surfaceEndFailures: false, hasEverPlayed: false, hasPresentedFrame: false))
+     }
+ }
+ 
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/VideoPrerollTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/VideoPrerollTests.swift
+index 1132106..01b8058 100644
+--- a/Vendor/AetherEngine/Tests/AetherEngineTests/VideoPrerollTests.swift
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/VideoPrerollTests.swift
+@@ -29,6 +29,7 @@ struct VideoPrerollTests {
+     @MainActor
+     func singleLayerGate() {
+         let renderer = SampleBufferRenderer()
++        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
+         renderer.setReorderDepth(SampleBufferRenderer.presentationOrderReorderDepth)
+         let pixels = Self.makePixelBuffer()
+         #expect(renderer.prerollSatisfied(clock: 0, live: false) == false, "nothing handed over yet")
+@@ -40,10 +41,30 @@ struct VideoPrerollTests {
+         #expect(renderer.prerollSatisfied(clock: Self.time(2).seconds, live: false) == false)
+     }
+ 
++    @Test("A full renderer opens the gate: nothing more can arrive until the clock runs")
++    @MainActor
++    func fullRendererOpensGate() {
++        // A rebuffer resume: the clock stopped with the layer full and the frames handed over sitting
++        // at or behind it. The decoder may not hand over more until the clock drains the layer, so a
++        // closed gate held the clock for the whole prerollTimeout after every rebuffer.
++        let renderer = SampleBufferRenderer()
++        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
++        renderer.setReorderDepth(SampleBufferRenderer.presentationOrderReorderDepth)
++        let pixels = Self.makePixelBuffer()
++        for i in 0...4 { renderer.enqueue(pixelBuffer: pixels, pts: Self.time(i)) }
++        let clock = Self.time(3).seconds
++        #expect(renderer.prerollSatisfied(clock: clock, live: false) == false, "room left: wait for more")
++        renderer.readyForMoreMediaDataForTesting = { false }
++        #expect(renderer.prerollSatisfied(clock: clock, live: false) == true)
++        renderer.setFELLookahead(enabled: true, frameRate: 24)
++        #expect(renderer.prerollSatisfied(clock: clock, live: false) == true, "the FEL route too")
++    }
++
+     @Test("Off the FEL path a live stream does not preroll")
+     @MainActor
+     func singleLayerLiveHasNoGate() {
+         let renderer = SampleBufferRenderer()
++        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
+         #expect(renderer.prerollSatisfied(clock: 0, live: true) == nil)
+         renderer.setFELLookahead(enabled: true, frameRate: 24)
+         #expect(renderer.prerollSatisfied(clock: 0, live: true) == false, "the FEL route still does")
+@@ -53,6 +74,7 @@ struct VideoPrerollTests {
+     @MainActor
+     func singleLayerGateAfterAResume() {
+         let renderer = SampleBufferRenderer()
++        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
+         renderer.setReorderDepth(SampleBufferRenderer.presentationOrderReorderDepth)
+         let pixels = Self.makePixelBuffer()
+         // #800: the keyframe sits 3 s before the target; everything up to it is decoded and skipped.
+@@ -68,6 +90,7 @@ struct VideoPrerollTests {
+     @MainActor
+     func gateCountsContiguousFrames() {
+         let renderer = SampleBufferRenderer()
++        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
+         renderer.setFELLookahead(enabled: true, frameRate: 24)
+         renderer.setArrivalOrderHandover(frameRate: 24)
+         let pixels = Self.makePixelBuffer()
+@@ -88,6 +111,7 @@ struct VideoPrerollTests {
+     @MainActor
+     func gateRestartsAtTheSeekTarget() {
+         let renderer = SampleBufferRenderer()
++        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
+         renderer.setFELLookahead(enabled: true, frameRate: 24)
+         renderer.setArrivalOrderHandover(frameRate: 24)
+         let pixels = Self.makePixelBuffer()
+@@ -105,6 +129,7 @@ struct VideoPrerollTests {
+     @MainActor
+     func gateOpensAfterAnOffGridSeek(phase: Double) {
+         let renderer = SampleBufferRenderer()
++        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
+         renderer.setFELLookahead(enabled: true, frameRate: 24)
+         renderer.setArrivalOrderHandover(frameRate: 24)
+         let pixels = Self.makePixelBuffer()
+@@ -122,6 +147,7 @@ struct VideoPrerollTests {
+     @MainActor
+     func prerollFitsTheLookaheadAt60() {
+         let renderer = SampleBufferRenderer()
++        renderer.readyForMoreMediaDataForTesting = { true }  // a layer with room, as on a device
+         renderer.setFELLookahead(enabled: true, frameRate: 60)
+         renderer.setArrivalOrderHandover(frameRate: 60)
+         let pixels = Self.makePixelBuffer()
+diff --git a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
+index b8b9edc..ec6411a 100644
+--- a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
+@@ -5206,6 +5206,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
+         durationMs = 0
+         bufferedMs = 0
+         sourceTimeSeconds = 0
++        let previousSpeed = currentSpeed
+         currentSpeed = 1
+         audioTracks = []
+         subtitleTracks = []
+@@ -5336,7 +5337,11 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
+                 self.engineLoadInitialPhase = nil
+                 self.sourceProbe = probe
+                 self.isPlayerLoading = false
+-                self.setSpeed(request.playbackRate)
++                // Aether already seeds 1× before autoplay. A redundant rate write can
++                // disrupt the initial transport or a resume seek still settling.
++                if request.playbackRate != 1 || previousSpeed != 1 {
++                    self.setSpeed(request.playbackRate)
++                }
+                 #if os(tvOS) || os(iOS)
+                 self.configureRemoteCommandsIfNeeded()
+                 #endif
+@@ -5642,6 +5647,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
+         mapAudioTracks(engine.audioTracks)
+         mapSubtitleTracks(engine.subtitleTracks)
+         applyPhase(engine.playbackPhase, engineIsBuffering: engine.isBuffering)
++        if !isWatchPartyControlled, foregroundReloadTask == nil, aiSubtitleStartupHoldCueID == nil {
++            engine.recoverBufferedVideoPlaybackIfStalled()
++        }
+         appendDiagnosticStateSampleIfDue()
+         #if os(tvOS) || os(iOS)
+         configureRemoteCommandsIfNeeded()

@@ -1,0 +1,53 @@
+name: Build tvOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: xcode-27
+    timeout-minutes: 45
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_27.2.app/Contents/Developer
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Tuist
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/tuist/tuist/releases/download/4.207.0/tuist.zip \
+            --output "$RUNNER_TEMP/tuist.zip"
+          printf '%s  %s\n' \
+            583fec75cc187bb84a30509ba5afe7455607547be0917fdcf5899a7ef338305e \
+            "$RUNNER_TEMP/tuist.zip" | shasum -a 256 --check
+          ditto -x -k "$RUNNER_TEMP/tuist.zip" "$RUNNER_TEMP/tuist"
+          "$RUNNER_TEMP/tuist/tuist" version
+          printf 'NUVIO_TUIST_BIN=%s/tuist/tuist\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
+
+      - name: Generate Xcode workspace
+        run: |
+          xcodebuild -version
+          xcrun --sdk appletvos --show-sdk-version
+          sh -n Scripts/prepare-upstream-player
+          plutil -lint NuvioCinema.xcodeproj/project.pbxproj
+          Scripts/prepare-upstream-player --generate
+          git -C .upstream-player show HEAD:tvosApp/.package.resolved | cmp - \
+            .upstream-player/tvosApp/NuvioTV.xcworkspace/xcshareddata/swiftpm/Package.resolved
+
+      - name: Build unsigned tvOS Release
+        run: |
+          xcodebuild -workspace .upstream-player/tvosApp/NuvioTV.xcworkspace \
+            -scheme NuvioTV -configuration Release -destination 'generic/platform=tvOS' \
+            -onlyUsePackageVersionsFromResolvedFile \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build

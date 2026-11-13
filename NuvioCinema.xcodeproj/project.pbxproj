@@ -1,0 +1,503 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		D095F497201B4423AF76FF /* PlaybackTrackPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = 097BF8CE0F5A4CE9A13E68 /* PlaybackTrackPreferences.swift */; };
+		6A191510382A447BB1466F /* SubtitleAudioAlignment.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0423274282464CDAA1A87B /* SubtitleAudioAlignment.swift */; };
+		128027C8CE714E18A3AC0E3 /* SubtitleCueAlignment.swift in Sources */ = {isa = PBXBuildFile; fileRef = F28E3E343CF74F29B2A77FA /* SubtitleCueAlignment.swift */; };
+		4E3A728E912B4442B19E606 /* AetherPlaybackSubtitles.swift in Sources */ = {isa = PBXBuildFile; fileRef = A3703794A8594C598B22ED8 /* AetherPlaybackSubtitles.swift */; };
+		233B2FDDBE8C4F09BCA3857 /* AetherPlaybackScrubber.swift in Sources */ = {isa = PBXBuildFile; fileRef = C1584EB4549C43F9ACF12E3 /* AetherPlaybackScrubber.swift */; };
+		4251984B0143453991FB89C /* AetherPlaybackOptions.swift in Sources */ = {isa = PBXBuildFile; fileRef = B9A53469B99748D7BBBFCA6 /* AetherPlaybackOptions.swift */; };
+		74EE381C950C49A491344472 /* AetherEngine in Frameworks */ = {isa = PBXBuildFile; productRef = C83C1CE32C484EA2B273965F /* AetherEngine */; };
+		E71BDAAA269541D79465F1AA /* AetherPlaybackView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A54E296ED4174115977EDE6B /* AetherPlaybackView.swift */; };
+		4980284FF5AB4613ACCB058B /* ThirdPartyNotices in Resources */ = {isa = PBXBuildFile; fileRef = 3DB2EAC6E90F4434B326F0BA /* ThirdPartyNotices */; };
+		9E8DBA39896E4DFD9A063A34 /* CinemaImageCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F1FEC3837E94D56BE011A7E /* CinemaImageCache.swift */; };
+		887A1486E34A4798B046FB71 /* AddonStreams.swift in Sources */ = {isa = PBXBuildFile; fileRef = C67B6C9B9F454201BD7F022A /* AddonStreams.swift */; };
+		E4E725C472524E69869153C1 /* TitlePlaybackView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B5902E8C6BC46BFA3B92BE3 /* TitlePlaybackView.swift */; };
+		95EB7D8EFA614E5B990A308A /* NuvioAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15E26D6DC1684AE1B64D1636 /* NuvioAccount.swift */; };
+		493E22B5FD4948BDB97D411E /* NuvioCloud.swift in Sources */ = {isa = PBXBuildFile; fileRef = D86F96CFAD2F41A88F6239AC /* NuvioCloud.swift */; };
+		AC4CC65FC43A4A918F7B1934 /* NuvioSettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6036FB8E39424AFD8EC0CD5C /* NuvioSettingsView.swift */; };
+		6B220F5D0B9340CAB32E6EAB /* CastPortraits.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C04A0669CA847E5B11AB51D /* CastPortraits.swift */; };
+		7BBE8846E59946D896681180 /* TitleDetailsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 101DD66D63834F9486901601 /* TitleDetailsView.swift */; };
+		CC0E6013E5E849F9AE548D91 /* PosterCell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00BBD232B19547799C7D5C10 /* PosterCell.swift */; };
+		7B40221C68A84F1384E7D4DF /* CinemetaSearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43A8A6AF4F63468D885B3E25 /* CinemetaSearchView.swift */; };
+		BE0D99FE015A485AAB735173 /* Cinemeta.swift in Sources */ = {isa = PBXBuildFile; fileRef = F330C43CC5AF4EB98FF63249 /* Cinemeta.swift */; };
+		40923516DE6E5731672B4DA2 /* NuvioCinemaApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B391C3D48E7300E9B277E364 /* NuvioCinemaApp.swift */; };
+		F8CB4BA29CDF7C3FAD4426EF /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22B25C2E3630D43B7DAE9E31 /* HomeView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		097BF8CE0F5A4CE9A13E68 /* PlaybackTrackPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackTrackPreferences.swift; sourceTree = "<group>"; };
+		0423274282464CDAA1A87B /* SubtitleAudioAlignment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitleAudioAlignment.swift; sourceTree = "<group>"; };
+		F28E3E343CF74F29B2A77FA /* SubtitleCueAlignment.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitleCueAlignment.swift; sourceTree = "<group>"; };
+		A3703794A8594C598B22ED8 /* AetherPlaybackSubtitles.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AetherPlaybackSubtitles.swift; sourceTree = "<group>"; };
+		C1584EB4549C43F9ACF12E3 /* AetherPlaybackScrubber.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AetherPlaybackScrubber.swift; sourceTree = "<group>"; };
+		B9A53469B99748D7BBBFCA6 /* AetherPlaybackOptions.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AetherPlaybackOptions.swift; sourceTree = "<group>"; };
+		A54E296ED4174115977EDE6B /* AetherPlaybackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AetherPlaybackView.swift; sourceTree = "<group>"; };
+		3DB2EAC6E90F4434B326F0BA /* ThirdPartyNotices */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ThirdPartyNotices; path = Resources/ThirdPartyNotices; sourceTree = "<group>"; };
+		3F1FEC3837E94D56BE011A7E /* CinemaImageCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaImageCache.swift; sourceTree = "<group>"; };
+		C67B6C9B9F454201BD7F022A /* AddonStreams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddonStreams.swift; sourceTree = "<group>"; };
+		8B5902E8C6BC46BFA3B92BE3 /* TitlePlaybackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TitlePlaybackView.swift; sourceTree = "<group>"; };
+		15E26D6DC1684AE1B64D1636 /* NuvioAccount.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioAccount.swift; sourceTree = "<group>"; };
+		D86F96CFAD2F41A88F6239AC /* NuvioCloud.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioCloud.swift; sourceTree = "<group>"; };
+		6036FB8E39424AFD8EC0CD5C /* NuvioSettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioSettingsView.swift; sourceTree = "<group>"; };
+		8C04A0669CA847E5B11AB51D /* CastPortraits.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CastPortraits.swift; sourceTree = "<group>"; };
+		101DD66D63834F9486901601 /* TitleDetailsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TitleDetailsView.swift; sourceTree = "<group>"; };
+		00BBD232B19547799C7D5C10 /* PosterCell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosterCell.swift; sourceTree = "<group>"; };
+		43A8A6AF4F63468D885B3E25 /* CinemetaSearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemetaSearchView.swift; sourceTree = "<group>"; };
+		F330C43CC5AF4EB98FF63249 /* Cinemeta.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cinemeta.swift; sourceTree = "<group>"; };
+		22B25C2E3630D43B7DAE9E31 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		8B57D9B47222C7963F96FD1F /* NuvioCinema.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = NuvioCinema.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B391C3D48E7300E9B277E364 /* NuvioCinemaApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioCinemaApp.swift; sourceTree = "<group>"; };
+		0870B134C8C92F6B1612279F /* CinemaTopShelf.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaTopShelf.swift; sourceTree = "<group>"; };
+		142E24E39EC5EEBE4DE1B41C /* UpstreamPlaybackBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UpstreamPlaybackBridge.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		89C1B8911D6E4640A8364B92 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				74EE381C950C49A491344472 /* AetherEngine in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		442B96EF9514F6DC3B1B3195 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				8B57D9B47222C7963F96FD1F /* NuvioCinema.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		D3A0855B1F47005F8EF29D63 /* App */ = {
+			isa = PBXGroup;
+			children = (
+				B391C3D48E7300E9B277E364 /* NuvioCinemaApp.swift */,
+			);
+			path = App;
+			sourceTree = "<group>";
+		};
+		23CCBE6822A08232F8DE2F55 /* Account */ = {
+			isa = PBXGroup;
+			children = (
+				15E26D6DC1684AE1B64D1636 /* NuvioAccount.swift */,
+				D86F96CFAD2F41A88F6239AC /* NuvioCloud.swift */,
+			);
+			path = Account;
+			sourceTree = "<group>";
+		};
+		8D5E7B53CB87379AFDB7D06B /* Artwork */ = {
+			isa = PBXGroup;
+			children = (
+				8C04A0669CA847E5B11AB51D /* CastPortraits.swift */,
+				3F1FEC3837E94D56BE011A7E /* CinemaImageCache.swift */,
+			);
+			path = Artwork;
+			sourceTree = "<group>";
+		};
+		A1DD9317677E4863EC2C10E0 /* Catalog */ = {
+			isa = PBXGroup;
+			children = (
+				F330C43CC5AF4EB98FF63249 /* Cinemeta.swift */,
+			);
+			path = Catalog;
+			sourceTree = "<group>";
+		};
+		1E5633A7FC9498330542DEBA /* Details */ = {
+			isa = PBXGroup;
+			children = (
+				101DD66D63834F9486901601 /* TitleDetailsView.swift */,
+			);
+			path = Details;
+			sourceTree = "<group>";
+		};
+		376CFF6B737D1B4A51D6647D /* Home */ = {
+			isa = PBXGroup;
+			children = (
+				22B25C2E3630D43B7DAE9E31 /* HomeView.swift */,
+			);
+			path = Home;
+			sourceTree = "<group>";
+		};
+		3B5E2162F1506373D00ABEC8 /* Playback */ = {
+			isa = PBXGroup;
+			children = (
+				5FAF79C52B7ABF905116D357 /* Legacy */,
+				C67B6C9B9F454201BD7F022A /* AddonStreams.swift */,
+				8B5902E8C6BC46BFA3B92BE3 /* TitlePlaybackView.swift */,
+				142E24E39EC5EEBE4DE1B41C /* UpstreamPlaybackBridge.swift */,
+			);
+			path = Playback;
+			sourceTree = "<group>";
+		};
+		5FAF79C52B7ABF905116D357 /* Legacy */ = {
+			isa = PBXGroup;
+			children = (
+				B9A53469B99748D7BBBFCA6 /* AetherPlaybackOptions.swift */,
+				C1584EB4549C43F9ACF12E3 /* AetherPlaybackScrubber.swift */,
+				A3703794A8594C598B22ED8 /* AetherPlaybackSubtitles.swift */,
+				A54E296ED4174115977EDE6B /* AetherPlaybackView.swift */,
+				097BF8CE0F5A4CE9A13E68 /* PlaybackTrackPreferences.swift */,
+				0423274282464CDAA1A87B /* SubtitleAudioAlignment.swift */,
+				F28E3E343CF74F29B2A77FA /* SubtitleCueAlignment.swift */,
+			);
+			path = Legacy;
+			sourceTree = "<group>";
+		};
+		0ABD8D66E1DDE2D014C8F1B8 /* Search */ = {
+			isa = PBXGroup;
+			children = (
+				43A8A6AF4F63468D885B3E25 /* CinemetaSearchView.swift */,
+				00BBD232B19547799C7D5C10 /* PosterCell.swift */,
+			);
+			path = Search;
+			sourceTree = "<group>";
+		};
+		58892422AC995302283FFAED /* Settings */ = {
+			isa = PBXGroup;
+			children = (
+				6036FB8E39424AFD8EC0CD5C /* NuvioSettingsView.swift */,
+			);
+			path = Settings;
+			sourceTree = "<group>";
+		};
+		6E54ABC2180D973CE7543476 /* TopShelf */ = {
+			isa = PBXGroup;
+			children = (
+				0870B134C8C92F6B1612279F /* CinemaTopShelf.swift */,
+			);
+			path = TopShelf;
+			sourceTree = "<group>";
+		};
+		B276C7580591437F2346D62D /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				D3A0855B1F47005F8EF29D63 /* App */,
+				23CCBE6822A08232F8DE2F55 /* Account */,
+				8D5E7B53CB87379AFDB7D06B /* Artwork */,
+				A1DD9317677E4863EC2C10E0 /* Catalog */,
+				1E5633A7FC9498330542DEBA /* Details */,
+				376CFF6B737D1B4A51D6647D /* Home */,
+				3B5E2162F1506373D00ABEC8 /* Playback */,
+				0ABD8D66E1DDE2D014C8F1B8 /* Search */,
+				58892422AC995302283FFAED /* Settings */,
+				6E54ABC2180D973CE7543476 /* TopShelf */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		F2D55815EF8536699FFB2500 = {
+			isa = PBXGroup;
+			children = (
+				B276C7580591437F2346D62D /* Sources */,
+				3DB2EAC6E90F4434B326F0BA /* ThirdPartyNotices */,
+				442B96EF9514F6DC3B1B3195 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		C16696197640FBD21C66FD8C /* NuvioCinema */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = CD4DD62F53C8BC4B61D23F6C /* Build configuration list for PBXNativeTarget "NuvioCinema" */;
+			buildPhases = (
+				2BCD7ADC538B8B602BD2E985 /* Sources */,
+				89C1B8911D6E4640A8364B92 /* Frameworks */,
+				9D1825CBC77644C4BDA97D00 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = NuvioCinema;
+			packageProductDependencies = (
+				C83C1CE32C484EA2B273965F /* AetherEngine */,
+			);
+			productName = NuvioCinema;
+			productReference = 8B57D9B47222C7963F96FD1F /* NuvioCinema.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A066B9D9AAD3EFC9E9734188 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = 9C29CCC3CB7DE3A3718CDF4C /* Build configuration list for PBXProject "NuvioCinema" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = F2D55815EF8536699FFB2500;
+			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				E1CD5524F1324191AB2C1512 /* XCRemoteSwiftPackageReference "AetherEngine" */,
+			);
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 442B96EF9514F6DC3B1B3195 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				C16696197640FBD21C66FD8C /* NuvioCinema */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		9D1825CBC77644C4BDA97D00 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				4980284FF5AB4613ACCB058B /* ThirdPartyNotices in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		2BCD7ADC538B8B602BD2E985 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				6B220F5D0B9340CAB32E6EAB /* CastPortraits.swift in Sources */,
+				9E8DBA39896E4DFD9A063A34 /* CinemaImageCache.swift in Sources */,
+				887A1486E34A4798B046FB71 /* AddonStreams.swift in Sources */,
+				E4E725C472524E69869153C1 /* TitlePlaybackView.swift in Sources */,
+				4251984B0143453991FB89C /* AetherPlaybackOptions.swift in Sources */,
+				233B2FDDBE8C4F09BCA3857 /* AetherPlaybackScrubber.swift in Sources */,
+				4E3A728E912B4442B19E606 /* AetherPlaybackSubtitles.swift in Sources */,
+				128027C8CE714E18A3AC0E3 /* SubtitleCueAlignment.swift in Sources */,
+				6A191510382A447BB1466F /* SubtitleAudioAlignment.swift in Sources */,
+				D095F497201B4423AF76FF /* PlaybackTrackPreferences.swift in Sources */,
+				E71BDAAA269541D79465F1AA /* AetherPlaybackView.swift in Sources */,
+				BE0D99FE015A485AAB735173 /* Cinemeta.swift in Sources */,
+				7B40221C68A84F1384E7D4DF /* CinemetaSearchView.swift in Sources */,
+				CC0E6013E5E849F9AE548D91 /* PosterCell.swift in Sources */,
+				7BBE8846E59946D896681180 /* TitleDetailsView.swift in Sources */,
+				F8CB4BA29CDF7C3FAD4426EF /* HomeView.swift in Sources */,
+				40923516DE6E5731672B4DA2 /* NuvioCinemaApp.swift in Sources */,
+				95EB7D8EFA614E5B990A308A /* NuvioAccount.swift in Sources */,
+				493E22B5FD4948BDB97D411E /* NuvioCloud.swift in Sources */,
+				AC4CC65FC43A4A918F7B1934 /* NuvioSettingsView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		E1CD5524F1324191AB2C1512 /* XCRemoteSwiftPackageReference "AetherEngine" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/superuser404notfound/AetherEngine";
+			requirement = {
+				kind = exactVersion;
+				version = 7.65.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		C83C1CE32C484EA2B273965F /* AetherEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = E1CD5524F1324191AB2C1512 /* XCRemoteSwiftPackageReference "AetherEngine" */;
+			productName = AetherEngine;
+		};
+/* End XCSwiftPackageProductDependency section */
+
+/* Begin XCBuildConfiguration section */
+		2324D3B431255A7EDF46C844 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 6.0;
+				TVOS_DEPLOYMENT_TARGET = 18.0;
+			};
+			name = Debug;
+		};
+		25C40F016AC83771F36AA1E3 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Nuvio Cinema";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.nuviocinema.app;
+				"EXCLUDED_ARCHS[sdk=appletvsimulator*]" = x86_64;
+				SDKROOT = appletvos;
+				TARGETED_DEVICE_FAMILY = 3;
+			};
+			name = Debug;
+		};
+		788701A086DEE7CBB450214E /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = "Nuvio Cinema";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.nuviocinema.app;
+				"EXCLUDED_ARCHS[sdk=appletvsimulator*]" = x86_64;
+				SDKROOT = appletvos;
+				TARGETED_DEVICE_FAMILY = 3;
+			};
+			name = Release;
+		};
+		CC50AB2145287082C4D575F8 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = appletvos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 6.0;
+				TVOS_DEPLOYMENT_TARGET = 18.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		9C29CCC3CB7DE3A3718CDF4C /* Build configuration list for PBXProject "NuvioCinema" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				2324D3B431255A7EDF46C844 /* Debug */,
+				CC50AB2145287082C4D575F8 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		CD4DD62F53C8BC4B61D23F6C /* Build configuration list for PBXNativeTarget "NuvioCinema" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				25C40F016AC83771F36AA1E3 /* Debug */,
+				788701A086DEE7CBB450214E /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A066B9D9AAD3EFC9E9734188 /* Project object */;
+}
