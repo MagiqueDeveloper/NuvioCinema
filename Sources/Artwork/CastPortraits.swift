@@ -58,7 +58,10 @@ actor CastPortraits {
         ]
         guard let response: WikipediaResponse = await fetch(endpoint.appending(queryItems: query)) else { return [:] }
 
-        let creditOccupations: Set<String> = ["actor", "actress", "director", "screenwriter", "filmmaker", "playwright"]
+        let creditOccupations: Set<String> = [
+            "actor", "actress", "director", "screenwriter", "filmmaker", "playwright",
+            "producer", "composer", "cinematographer", "editor", "writer",
+        ]
         let people = response.query.pages.filter { page in
             let occupations = (page.terms?.description ?? []).joined(separator: " ").lowercased().split { !$0.isLetter }
             return occupations.contains { creditOccupations.contains(String($0)) }

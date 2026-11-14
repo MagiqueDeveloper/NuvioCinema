@@ -173,22 +173,90 @@ for stack in (root / "Resources/AppIcon.brandassets").glob("*.imagestack"):
 
 top_shelf_feed_path = "tvosApp/NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift"
 top_shelf_feed = upstream(top_shelf_feed_path).decode()
+top_shelf_feed = replace_once(top_shelf_feed, "import Foundation\n", "import Foundation\nimport OSLog\n")
 top_shelf_feed = replace_once(top_shelf_feed, 'components.scheme = "nuvio-tv"', 'components.scheme = "nuvio-cinema"')
-top_shelf_feed = replace_once(top_shelf_feed, '''        commit(section: section) {
-            TopShelfFeed(entries: entries.map(decorated), title: title)
-''', '''        if entries.isEmpty {
-            guard isAvailable, let coordinator = writeCoordinators[section] else { return }
-            let generation = coordinator.beginWrite()
-            if coordinator.commitIfCurrent(generation, commit: {
-                writeFeed(TopShelfFeed(entries: [], title: title), section: section)
-            }) {
-                notifyTopShelfContentChanged()
-                refreshArtwork()
-            }
+top_shelf_feed = replace_once(top_shelf_feed, '''    /// Mirrors every Home catalog row; Settings chooses which the shelf shows.
+''', '''    static let homeFeaturedRowID = "home-featured"
+
+    static var hasHomeFeaturedFeed: Bool {
+        read(.catalog)?.catalogRows.contains { $0.id == homeFeaturedRowID && !$0.entries.isEmpty } == true
+    }
+
+    static func writeHomeFeatured(_ entries: [TopShelfEntry], title: String) {
+        guard !entries.isEmpty else { return }
+        guard isAvailable else {
+            Logger(subsystem: "com.nuviocinema.app", category: "TopShelf")
+                .error("Cannot publish Top Shelf. App group \\(topShelfAppGroupID, privacy: .public) is unavailable.")
             return
         }
-        commit(section: section) {
-            TopShelfFeed(entries: entries.map(decorated), title: title)
+        guard let coordinator = writeCoordinators[.catalog] else { return }
+        let generation = coordinator.beginWrite()
+        let row = TopShelfFeedRow(id: homeFeaturedRowID, title: title, entries: entries.map(decorated))
+        let feed = TopShelfFeed(entries: [], rows: [row])
+        var saved = false
+        guard coordinator.commitIfCurrent(generation, commit: {
+            saved = writeFeed(feed, section: .catalog)
+        }), saved else { return }
+        notifyTopShelfContentChanged()
+        refreshArtwork()
+    }
+
+    /// Mirrors every Home catalog row; Settings chooses which the shelf shows.
+''')
+top_shelf_feed = replace_once(top_shelf_feed, '''    private static func writeFeed(_ feed: TopShelfFeed, section: TopShelfSection) {
+        guard let url = feedFileURL(for: section),
+              let data = try? JSONEncoder().encode(feed) else { return }
+        TopShelfArtworkPruner.withFeedLock {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+''', '''    @discardableResult
+    private static func writeFeed(_ feed: TopShelfFeed, section: TopShelfSection) -> Bool {
+        guard let url = feedFileURL(for: section) else { return false }
+        var saved = false
+        TopShelfArtworkPruner.withFeedLock {
+            do {
+                let data = try JSONEncoder().encode(feed)
+                try data.write(to: url, options: .atomic)
+                saved = true
+            } catch {
+                Logger(subsystem: "com.nuviocinema.app", category: "TopShelf")
+                    .error("Cannot write Top Shelf feed: \\(error.localizedDescription, privacy: .private)")
+            }
+        }
+        return saved
+    }
+''')
+top_shelf_layout_path = "tvosApp/NuvioTV/Sources/Core/TopShelf/TopShelfLayout.swift"
+top_shelf_layout = upstream(top_shelf_layout_path).decode()
+top_shelf_layout = replace_once(top_shelf_layout, '''    public static let `default` = TopShelfConfiguration(style: .featuredCards)
+''', '''    public static let `default` = TopShelfConfiguration(style: .featuredCards)
+
+    static let homeFeatured = TopShelfConfiguration(
+        style: .carouselDetails, includesContinueWatching: false, includesUpNext: false,
+        includesToday: false, includesLibrary: false, catalogRowIDs: [TopShelfFeedStore.homeFeaturedRowID],
+        playsTrailers: false
+    )
+''')
+top_shelf_provider_path = "tvosApp/TopShelf/TopShelfContentProvider.swift"
+top_shelf_provider = upstream(top_shelf_provider_path).decode()
+top_shelf_provider = replace_once(top_shelf_provider, '''        let configuration = TopShelfConfigurationStore.load()
+        let rows = TopShelfComposer.rows(configuration: configuration) { TopShelfFeedStore.read($0) }
+''', '''        let configuration = TopShelfConfiguration.homeFeatured
+        let featuredRowID = "catalog:\\(TopShelfFeedStore.homeFeaturedRowID)"
+        let rows = TopShelfComposer.rows(configuration: configuration) { TopShelfFeedStore.read($0) }
+            .filter { $0.id == featuredRowID }
+''')
+top_shelf_provider = replace_once(top_shelf_provider, '''        // One button, Play: it resumes what can be resumed (Continue Watching,
+        // Up Next) and opens the details page of everything else. A second
+        // button (More Info) appears only with a display action.
+        if let play = entry.deepLinkURL {
+            item.playAction = TVTopShelfAction(url: play)
+        }
+''', '''        // The featured titles link to their detail pages.
+        if let details = entry.detailsURL {
+            item.displayAction = TVTopShelfAction(url: details)
+        }
 ''')
 catalog_models_path = "tvosApp/NuvioTV/Sources/Models/CatalogModels.swift"
 catalog_models = upstream(catalog_models_path).decode()
@@ -250,6 +318,8 @@ shutil.copy2(ffmpeg / "BUILD-INFO.txt", notices / "FFmpegBuild" / "BUILD-INFO.tx
 (checkout / "tvosApp/Project.swift").write_text(project)
 (checkout / entrypoint).write_text(app_source)
 (checkout / top_shelf_feed_path).write_text(top_shelf_feed)
+(checkout / top_shelf_layout_path).write_text(top_shelf_layout)
+(checkout / top_shelf_provider_path).write_text(top_shelf_provider)
 (checkout / catalog_models_path).write_text(catalog_models)
 (app / "Info.plist").write_bytes(plistlib.dumps(info))
 PY

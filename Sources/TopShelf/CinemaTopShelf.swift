@@ -2,74 +2,66 @@
 import SwiftUI
 
 struct CinemaTopShelf: ViewModifier {
-    let account: NuvioAccount
+    let featuredEntries: [CinemetaSearchResult]
     let titles: CinemaTitleNavigation
 
+    @Environment(\.scenePhase) private var scenePhase
     @State private var shelfRouteID: UUID?
 
     func body(content: Content) -> some View {
         content
-            .onAppear(perform: configureLayout)
+            .onChange(of: scenePhase, initial: true) { _, phase in
+                guard phase == .active else { return }
+                configureLayout()
+                if !entries.isEmpty, TopShelfFeedStore.isAvailable, !TopShelfFeedStore.hasHomeFeaturedFeed {
+                    publish(entries)
+                }
+            }
             .onChange(of: entries, initial: true) { _, entries in
-                guard let entries else { return }
-                TopShelfFeedStore.write(entries, title: String(localized: "Continue Watching"))
+                guard !entries.isEmpty else { return }
+                publish(entries)
             }
             .onOpenURL { url in
                 guard let link = ShelfLink(url: url) else { return }
                 if let shelfRouteID { titles.dismiss(id: shelfRouteID) }
+                let preview = featuredEntries.first(where: link.matches)?.title
                 shelfRouteID = titles.show { close in
-                    ShelfDestination(link: link, onDismiss: close)
+                    ShelfDestination(link: link, preview: preview, onDismiss: close)
                 }
             }
     }
 
-    private var entries: [TopShelfEntry]? {
-        if account.isRestoringTopShelfProfile { return nil }
-        guard account.canShareContinueWatchingWithTopShelf else { return [] }
-        return Array(account.continueWatching.lazy.compactMap { item in
-            let title = item.entry.title
+    private var entries: [TopShelfEntry] {
+        featuredEntries.compactMap { entry in
+            let title = entry.title
             guard let imdbID = title.imdbID, title.background != nil || title.poster != nil else { return nil }
-            let progress = item.progress
-            let started = NuvioAccount.hasStarted(progress)
             return TopShelfEntry(
-                contentId: imdbID, contentType: item.entry.kind.rawValue, title: title.name,
-                subtitle: Self.status(for: progress, started: started), imageURL: title.poster?.absoluteString,
-                backdropURL: title.background?.absoluteString,
-                progress: started && progress.duration > 0 ? progress.fraction : nil,
+                contentId: imdbID, contentType: entry.kind.rawValue, title: title.name,
+                subtitle: nil, imageURL: title.poster?.absoluteString, backdropURL: title.background?.absoluteString,
+                progress: nil, action: .details,
                 summary: title.description, genres: title.genres, year: title.releaseYear.flatMap(Int.init),
                 releaseDate: title.released?.formatted(.iso8601), runtimeMinutes: TopShelfEntry.runtimeMinutes(title.runtime),
                 logoURL: title.logo?.absoluteString, cast: Array(title.cast.prefix(4)),
-                directors: Array(title.directors.prefix(2)), imdbId: imdbID
+                directors: Array(title.directors.prefix(2)), imdbId: imdbID, imdbRating: title.imdbRating
             )
-        }.prefix(10))
+        }
     }
 
     private func configureLayout() {
-        guard TopShelfFeedStore.isAvailable else { return }
-        let layout = TopShelfConfiguration(showsEpisodeLabels: true, style: .carouselDetails, includesUpNext: false,
-                                           includesToday: false, includesLibrary: false, catalogRowIDs: [], playsTrailers: false)
-        if TopShelfConfigurationStore.load() != layout { TopShelfConfigurationStore.save(layout) }
+        guard let directory = TopShelfFeedStore.containerURL else { return }
+        let layout = TopShelfConfiguration.homeFeatured
+        if TopShelfConfigurationStore.read(in: directory) != layout {
+            TopShelfConfigurationStore.save(layout)
+        }
     }
 
-    private static func status(for progress: NuvioProgress, started: Bool) -> String {
-        let episodeLabel: String?
-        if let season = progress.season, let episode = progress.episode {
-            episodeLabel = started ? String(localized: "S\(season), E\(episode)") : String(localized: "Play S\(season), E\(episode)")
-        } else {
-            episodeLabel = nil
-        }
-        guard started else { return episodeLabel ?? String(localized: "Play") }
-        guard progress.duration > 0 else { return episodeLabel ?? String(localized: "In Progress") }
-        let remaining = progress.duration - min(progress.position, progress.duration)
-        let minutes = max(1, Int(ceil(Double(remaining) / 60_000)))
-        let time = Duration.seconds(minutes * 60).formatted(.units(allowed: [.hours, .minutes], width: .narrow))
-        return [episodeLabel, String(localized: "\(time) left")].compactMap { $0 }.joined(separator: " · ")
+    private func publish(_ entries: [TopShelfEntry]) {
+        TopShelfFeedStore.writeHomeFeatured(entries, title: String(localized: "Featured on Nuvio Cinema"))
     }
 
     private struct ShelfLink {
         let contentID: String
         let kind: CinemetaKind
-        let resume: Bool
 
         init?(url: URL) {
             guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
@@ -83,27 +75,25 @@ struct CinemaTopShelf: ViewModifier {
                   let kind = CinemetaKind(rawValue: type) else { return nil }
             self.contentID = contentID
             self.kind = kind
-            self.resume = host == "continue-watching"
         }
 
-        func matches(_ item: CinemaContinueWatchingItem) -> Bool {
-            item.entry.kind == kind && item.entry.title.imdbID == contentID
+        func matches(_ entry: CinemetaSearchResult) -> Bool {
+            entry.kind == kind && entry.title.imdbID == contentID
         }
     }
 
     private struct ShelfDestination: View {
         let link: ShelfLink
+        let preview: CinemetaTitle?
         let onDismiss: () -> Void
 
-        @Environment(NuvioAccount.self) private var account
         @State private var title: CinemetaTitle?
-        @State private var resume: CinemaContinueWatchingItem?
         @State private var loadFailed = false
         @State private var loadAttempt = 0
 
         var body: some View {
-            if let title {
-                TitleDetailsView(title: title, kind: link.kind, initialResume: resume, onDismiss: onDismiss)
+            if let title = preview ?? title {
+                TitleDetailsView(title: title, kind: link.kind, onDismiss: onDismiss)
             } else {
                 VStack(spacing: 24) {
                     if loadFailed {
@@ -116,7 +106,7 @@ struct CinemaTopShelf: ViewModifier {
                         }
                         .buttonStyle(.borderedProminent)
                     } else {
-                        ProgressView("Loading title…")
+                        TitleLoadingSkeleton()
                     }
                     Button("Back", action: onDismiss)
                         .buttonStyle(.bordered)
@@ -129,19 +119,6 @@ struct CinemaTopShelf: ViewModifier {
         }
 
         private func loadTitle() async {
-            if link.resume, account.isSignedIn {
-                if !account.continueWatching.contains(where: link.matches) {
-                    await account.waitForContinueWatchingSync()
-                }
-                guard !Task.isCancelled else { return }
-                if account.canShareContinueWatchingWithTopShelf,
-                   let item = account.continueWatching.first(where: link.matches) {
-                    resume = item
-                    title = item.entry.title
-                    return
-                }
-            }
-
             let loaded = await CinemetaClient().details(imdbID: link.contentID, kind: link.kind)
             guard !Task.isCancelled else { return }
             title = loaded

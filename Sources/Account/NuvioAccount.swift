@@ -13,10 +13,16 @@ struct CinemaContinueWatchingItem: Equatable, Identifiable {
         return entry.title.episodes.first { $0.season == season && $0.episode == number }
     }
 
+    func upcomingEpisode(at date: Date = .now) -> CinemetaEpisode? {
+        guard let episode, episode.isUpcoming(at: date) else { return nil }
+        return episode
+    }
+
     static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.id == rhs.id && lhs.progress == rhs.progress && lhs.entry.title.name == rhs.entry.title.name
             && lhs.entry.title.background == rhs.entry.title.background
             && lhs.entry.title.logo == rhs.entry.title.logo && lhs.episode?.name == rhs.episode?.name
+            && lhs.episode?.releasedAt == rhs.episode?.releasedAt
     }
 }
 
@@ -39,9 +45,9 @@ final class NuvioAccount {
     private(set) var continueWatching: [CinemaContinueWatchingItem] = []
 
     private var session: NuvioSession?
-    private var restoringShelfProfileID: Int?
     private var progressTitles: [String: String] = [:]
     private var contentAliases: [String: Set<String>] = [:]
+    private var continueWatchingDismissals: [String: Date] = [:]
     @ObservationIgnored private let cloud: NuvioCloud
     @ObservationIgnored private let catalog: CinemetaClient
     @ObservationIgnored private var linkTask: Task<Void, Never>?
@@ -66,7 +72,8 @@ final class NuvioAccount {
         return progress.filter { entry in
             guard (entry.position > 0 || (entry.contentType == "series" && entry.episode != nil)),
                   entry.fraction < 0.95 else { return false }
-            return !isCompleted(entry) && seen.insert(mediaKey(entry.contentID, entry.contentType)).inserted
+            return entry.updatedAt > dismissalDate(for: entry.contentID, type: entry.contentType)
+                && !isCompleted(entry) && seen.insert(mediaKey(entry.contentID, entry.contentType)).inserted
         }
     }
 
@@ -144,19 +151,6 @@ final class NuvioAccount {
         sync()
     }
 
-    var canShareContinueWatchingWithTopShelf: Bool {
-        isSignedIn && profiles.contains { $0.id == profileID && !$0.isLocked }
-    }
-
-    var isRestoringTopShelfProfile: Bool { restoringShelfProfileID != nil }
-
-    func waitForContinueWatchingSync() async {
-        syncIfNeeded()
-        await syncTask?.value
-        guard !Task.isCancelled else { return }
-        await artworkTask?.value
-    }
-
     func sync() {
         guard isSignedIn, syncTask == nil else { return }
         runSync()
@@ -231,9 +225,6 @@ final class NuvioAccount {
         let profiles = try await cloud.profiles(session: session).sorted { $0.id < $1.id }
         try Task.checkCancellation()
         self.profiles = profiles
-        if let saved = restoringShelfProfileID, !profiles.contains(where: { $0.id == saved && !$0.isLocked }) {
-            restoringShelfProfileID = nil
-        }
         if let unlocking, profiles.contains(where: { $0.id == unlocking.id }) {
             let result = try await cloud.verifyPIN(unlocking.pin, profile: unlocking.id, session: session)
             try Task.checkCancellation()
@@ -262,6 +253,8 @@ final class NuvioAccount {
         let snapshot = try await (addons, progress, history, watchlist)
         try Task.checkCancellation()
         guard profileID == profile.id else { return }
+        advancePlaybackClock(past: snapshot.1.lazy.map(\.updatedAt).max())
+        advancePlaybackClock(past: snapshot.2.lazy.map(\.watchedAt).max())
         self.addons = snapshot.0
         self.progress = snapshot.1
         self.history = snapshot.2
@@ -279,12 +272,17 @@ final class NuvioAccount {
     }
 
     private func setProfile(_ id: Int) {
-        if restoringShelfProfileID != id { restoringShelfProfileID = nil }
         clearProfile()
         unlockedProfiles = unlockedProfiles.intersection([id])
         profileID = id
         preferredProfileID = id
         saveSession()
+        if let key = continueWatchingDismissalsKey,
+           let data = UserDefaults.standard.data(forKey: key),
+           let saved = try? JSONDecoder().decode([String: Date].self, from: data) {
+            continueWatchingDismissals = saved
+            advancePlaybackClock(past: saved.values.max())
+        }
         applyPendingPlayback(id)
         loadContinueWatching()
     }
@@ -298,6 +296,7 @@ final class NuvioAccount {
         watchlist = []
         progressTitles = [:]
         contentAliases = [:]
+        continueWatchingDismissals = [:]
         continueWatching = []
         recentPlayback = [:]
         lastSync = nil
@@ -321,17 +320,19 @@ final class NuvioAccount {
         let resolvedID = previousProgress?.contentID ?? knownHistory?.contentID ?? contentID
         let duration = max(0, duration)
         let position = completed && duration > 0 ? duration : max(0, duration > 0 ? min(position, duration) : position)
-        let timestamp = max(Int64(Date.now.timeIntervalSince1970 * 1_000), lastPlaybackTimestamp + 1)
-        lastPlaybackTimestamp = timestamp
+        let timestamp = nextPlaybackTimestamp()
         let update = NuvioProgressUpdate(contentID: resolvedID, contentType: kind.rawValue, season: season,
                                          episode: episode, position: position, duration: duration, timestamp: timestamp)
         let existing = pendingPlayback[profileID]?[update.key]
+        let local = recentPlayback[update.key]?.update
         let watched = completed ? NuvioWatchedUpdate(contentID: resolvedID, contentType: kind.rawValue, title: title,
                                                       season: season, episode: episode, timestamp: timestamp) : existing?.watched
-        let pending = PendingPlayback(progress: update, title: title, watched: watched)
+        let pending = PendingPlayback(progress: update, title: title, watched: watched,
+                                      deletesWatched: completed ? nil : existing?.deletesWatched)
         pendingPlayback[profileID, default: [:]][update.key] = pending
         let visible = PendingPlayback(progress: update, title: title,
-                                      watched: watched ?? recentPlayback[update.key]?.update.watched)
+                                      watched: watched ?? local?.watched,
+                                      deletesWatched: completed ? nil : (existing?.deletesWatched ?? local?.deletesWatched))
         recentPlayback[update.key] = RecentPlayback(update: visible, recordedAt: .now)
         persistPlaybackUpdates()
         apply(update.row(id: previousProgress?.id, title: title))
@@ -340,11 +341,152 @@ final class NuvioAccount {
         flushPlaybackUpdates()
     }
 
+    func setContinueWatchingItemWatched(_ item: CinemaContinueWatchingItem) {
+        guard let profileID, let current = continueWatching.first(where: {
+            $0.id == item.id && $0.progress == item.progress
+        }), current.upcomingEpisode() == nil else { return }
+        let row = item.progress
+        setWatched(true, contentID: row.contentID, kind: item.entry.kind, title: item.entry.title.name,
+                   season: row.season, episode: row.episode, profile: profileID)
+        finishWatchStateEdit(for: item.entry)
+    }
+
+    func setEpisodesWatched(_ episodes: [CinemetaEpisode], title: CinemetaTitle, contentID: String, watched: Bool) {
+        guard session != nil, let profileID, !contentID.isEmpty else { return }
+        for episode in episodes.sorted(by: { ($0.season, $0.episode) < ($1.season, $1.episode) }) {
+            guard !episode.isUpcoming(),
+                  hasWatched(contentID, kind: .series, season: episode.season, episode: episode.episode) != watched else { continue }
+            let type = CinemetaKind.series.rawValue
+            let aliases = (contentAliases[mediaKey(contentID, type)] ?? []).union([contentID])
+            let progressIDs = progress.filter {
+                $0.contentType == type && aliases.contains($0.contentID)
+                    && $0.season == episode.season && $0.episode == episode.episode
+            }.map(\.contentID)
+            let historyIDs = history.filter {
+                $0.contentType == type && aliases.contains($0.contentID)
+                    && $0.season == episode.season && $0.episode == episode.episode
+            }.map(\.contentID)
+            let primaryID = progressIDs.first ?? historyIDs.first ?? contentID
+            let targets = watched ? [primaryID] : Set(progressIDs + historyIDs + [primaryID]).sorted()
+            for id in targets {
+                setWatched(watched, contentID: id, kind: .series, title: title.name, season: episode.season,
+                           episode: episode.episode, profile: profileID)
+            }
+        }
+        finishWatchStateEdit(for: CinemetaSearchResult(title: title, kind: .series))
+    }
+
+    func removeContinueWatchingItem(_ item: CinemaContinueWatchingItem) {
+        guard let profileID, continueWatching.contains(where: { $0.id == item.id && $0.progress == item.progress }) else { return }
+        let type = item.entry.kind.rawValue
+        let canonical = item.entry.title.imdbID ?? item.entry.title.id
+        let aliases = (contentAliases[mediaKey(canonical, type)] ?? []).union([canonical, item.progress.contentID])
+        let timestamp = nextPlaybackTimestamp()
+        let dismissedAt = Date(timeIntervalSince1970: Double(timestamp) / 1_000)
+        for id in aliases {
+            continueWatchingDismissals[mediaKey(id, type)] = dismissedAt
+        }
+        if let key = continueWatchingDismissalsKey,
+           let data = try? JSONEncoder().encode(continueWatchingDismissals) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+        let unfinished = progress.filter {
+            aliases.contains($0.contentID) && $0.contentType == type && $0.fraction < 0.95
+                && !isCompleted($0, aliases: aliases)
+        }
+        for row in unfinished {
+            let update = NuvioProgressUpdate(contentID: row.contentID, contentType: type, season: row.season,
+                                             episode: row.episode, position: 0, duration: 0, timestamp: timestamp)
+            var edit = pendingPlayback[profileID]?[update.key] ?? PendingPlayback(progress: update, title: item.entry.title.name)
+            edit.progress = update
+            edit.needsProgressUpload = false
+            edit.progressDeletionKey = row.progressKey ?? update.progressKey
+            queueWatchState(edit, profile: profileID)
+        }
+        continueWatching.removeAll { $0.id == item.id }
+        finishWatchStateEdit(for: item.entry)
+    }
+
+    private func setWatched(_ watched: Bool, contentID: String, kind: CinemetaKind, title: String,
+                            season: Int?, episode: Int?, profile: Int) {
+        let update = NuvioProgressUpdate(contentID: contentID, contentType: kind.rawValue, season: season, episode: episode,
+                                         position: 0, duration: 0, timestamp: nextPlaybackTimestamp())
+        let previous = pendingPlayback[profile]?[update.key]
+        var edit = previous ?? PendingPlayback(progress: update, title: title, needsProgressUpload: false, historyOnly: true)
+        edit.watched = watched ? NuvioWatchedUpdate(contentID: contentID, contentType: kind.rawValue, title: title,
+                                                     season: season, episode: episode, timestamp: update.timestamp) : nil
+        edit.deletesWatched = watched ? nil : update.timestamp
+        let completedProgress = progress.first { update.matches($0) && $0.fraction >= 0.95 }
+        if !watched, let completedProgress {
+            edit.progress = update
+            edit.needsProgressUpload = false
+            edit.progressDeletionKey = completedProgress.progressKey ?? update.progressKey
+        }
+        queueWatchState(edit, profile: profile)
+    }
+
+    private func queueWatchState(_ edit: PendingPlayback, profile: Int) {
+        let key = edit.progress.key
+        pendingPlayback[profile, default: [:]][key] = edit
+        recentPlayback[key] = RecentPlayback(update: edit, recordedAt: .now)
+        apply(edit)
+    }
+
+    private func finishWatchStateEdit(for entry: CinemetaSearchResult) {
+        persistPlaybackUpdates()
+        let canonical = entry.title.imdbID ?? entry.title.id
+        let key = mediaKey(canonical, entry.kind.rawValue)
+        continueWatching.removeAll { $0.id == key }
+        let aliases = (contentAliases[key] ?? []).union([canonical])
+        let dismissedAt = dismissalDate(for: canonical, type: entry.kind.rawValue)
+        let progress = inProgress.first {
+            $0.contentType == entry.kind.rawValue && aliases.contains($0.contentID)
+                && $0.updatedAt > dismissedAt && !isCompleted($0, aliases: aliases)
+        }
+        if let next = progress ?? suggestedEpisode(for: entry) {
+            let index = continueWatching.firstIndex { $0.progress.updatedAt < next.updatedAt } ?? continueWatching.endIndex
+            continueWatching.insert(CinemaContinueWatchingItem(entry: entry, progress: next), at: index)
+        }
+        loadContinueWatching()
+        flushPlaybackUpdates()
+    }
+
+    private func nextPlaybackTimestamp() -> Int64 {
+        let timestamp = max(Int64(Date.now.timeIntervalSince1970 * 1_000), lastPlaybackTimestamp + 1)
+        lastPlaybackTimestamp = timestamp
+        return timestamp
+    }
+
+    private func advancePlaybackClock(past date: Date?) {
+        guard let date, let timestamp = Int64(exactly: (date.timeIntervalSince1970 * 1_000).rounded()) else { return }
+        advancePlaybackClock(to: timestamp)
+    }
+
+    private func advancePlaybackClock(to timestamp: Int64) {
+        let clockSkewLimit = Int64(Date.now.addingTimeInterval(86_400).timeIntervalSince1970 * 1_000)
+        guard timestamp < clockSkewLimit else { return }
+        lastPlaybackTimestamp = max(lastPlaybackTimestamp, timestamp)
+    }
+
+    private var continueWatchingDismissalsKey: String? {
+        guard let userID = session?.userId, let profileID else { return nil }
+        return "nuvio.continueWatching.dismissed.\(userID).\(profileID)"
+    }
+
+    private func dismissalDate(for id: String, type: String) -> Date {
+        continueWatchingDismissals[mediaKey(id, type)] ?? .distantPast
+    }
+
     private struct PendingPlayback: Codable {
         var progress: NuvioProgressUpdate
         var title: String
         var needsProgressUpload = true
         var watched: NuvioWatchedUpdate?
+        var historyOnly: Bool?
+        var progressDeletionKey: String?
+        var deletesWatched: Int64?
+
+        var timestamp: Int64 { max(progress.timestamp, watched?.timestamp ?? 0, deletesWatched ?? 0) }
     }
 
     private struct RecentPlayback {
@@ -358,11 +500,24 @@ final class NuvioAccount {
     }
 
     private func apply(_ pending: PendingPlayback) {
-        let progressID = progress.first(where: pending.progress.matches)?.id
-        apply(pending.progress.row(id: progressID, title: pending.title))
+        if pending.progressDeletionKey != nil {
+            let cutoff = Date(timeIntervalSince1970: Double(pending.progress.timestamp) / 1_000)
+            progress.removeAll { pending.progress.matches($0) && $0.updatedAt <= cutoff }
+        } else if pending.historyOnly != true {
+            let progressID = progress.first(where: pending.progress.matches)?.id
+            apply(pending.progress.row(id: progressID, title: pending.title))
+        }
         if let watched = pending.watched {
             let historyID = history.first(where: watched.matches)?.id
             apply(watched.row(key: pending.progress.key, id: historyID))
+        }
+        if let timestamp = pending.deletesWatched {
+            let cutoff = Date(timeIntervalSince1970: Double(timestamp) / 1_000)
+            let target = pending.progress
+            history.removeAll {
+                $0.contentID == target.contentID && $0.contentType == target.contentType
+                    && $0.season == target.season && $0.episode == target.episode && $0.watchedAt <= cutoff
+            }
         }
     }
 
@@ -392,14 +547,16 @@ final class NuvioAccount {
         if let index = continueWatching.firstIndex(where: {
             $0.progress.contentID == update.contentID && $0.progress.contentType == update.contentType
         }) {
-            let previous = continueWatching.remove(at: index)
-            if let matching {
-                let updated = CinemaContinueWatchingItem(entry: previous.entry, progress: matching)
-                let index = continueWatching.firstIndex { $0.progress.updatedAt < matching.updatedAt } ?? continueWatching.endIndex
-                continueWatching.insert(updated, at: index)
-            } else {
-                loadContinueWatching()
+            let previous = continueWatching[index]
+            let current = matching ?? suggestedEpisode(for: previous.entry)
+            var shelf = continueWatching
+            shelf.remove(at: index)
+            if let current {
+                let index = shelf.firstIndex { $0.progress.updatedAt < current.updatedAt } ?? shelf.endIndex
+                shelf.insert(CinemaContinueWatchingItem(entry: previous.entry, progress: current), at: index)
             }
+            continueWatching = shelf
+            if matching == nil { loadContinueWatching() }
         } else if matching != nil || update.contentType == CinemetaKind.series.rawValue {
             loadContinueWatching()
         }
@@ -416,8 +573,39 @@ final class NuvioAccount {
             }
             var retries = 0
             while !Task.isCancelled, profileID == profile,
-                  let queued = pendingPlayback[profile], !queued.isEmpty {
+                  let pending = pendingPlayback[profile], !pending.isEmpty {
+                let queued = Dictionary(uniqueKeysWithValues: pending.sorted { $0.key < $1.key }.prefix(100).map { ($0.key, $0.value) })
                 do {
+                    let watchedDeletions = queued.filter { $0.value.deletesWatched != nil }
+                    if !watchedDeletions.isEmpty {
+                        let keys = watchedDeletions.values.map {
+                            NuvioWatchedKey(contentID: $0.progress.contentID, season: $0.progress.season, episode: $0.progress.episode)
+                        }
+                        try await sendPlaybackUpdate(profile: profile) { session in
+                            try await self.cloud.deleteWatched(keys, profile: profile, session: session)
+                        }
+                        try Task.checkCancellation()
+                        for (key, row) in watchedDeletions where pendingPlayback[profile]?[key]?.deletesWatched == row.deletesWatched {
+                            pendingPlayback[profile]?[key]?.deletesWatched = nil
+                        }
+                        finishPlaybackUpdates(profile)
+                    }
+
+                    let progressDeletions = queued.filter { $0.value.progressDeletionKey != nil }
+                    if !progressDeletions.isEmpty {
+                        let keys = progressDeletions.values.compactMap(\.progressDeletionKey)
+                        try await sendPlaybackUpdate(profile: profile) { session in
+                            try await self.cloud.deleteProgress(keys, profile: profile, session: session)
+                        }
+                        try Task.checkCancellation()
+                        for (key, row) in progressDeletions where pendingPlayback[profile]?[key]?.progress.timestamp == row.progress.timestamp {
+                            guard let current = pendingPlayback[profile]?[key], current.progressDeletionKey == row.progressDeletionKey else { continue }
+                            pendingPlayback[profile]?[key]?.progressDeletionKey = nil
+                            pendingPlayback[profile]?[key]?.historyOnly = true
+                        }
+                        finishPlaybackUpdates(profile)
+                    }
+
                     let watched = queued.values.compactMap(\.watched)
                     if !watched.isEmpty {
                         try await sendPlaybackUpdate(profile: profile) { session in
@@ -474,7 +662,9 @@ final class NuvioAccount {
     }
 
     private func finishPlaybackUpdates(_ profile: Int) {
-        pendingPlayback[profile] = pendingPlayback[profile]?.filter { $0.value.needsProgressUpload || $0.value.watched != nil }
+        pendingPlayback[profile] = pendingPlayback[profile]?.filter {
+            $0.value.needsProgressUpload || $0.value.watched != nil || $0.value.progressDeletionKey != nil || $0.value.deletesWatched != nil
+        }
         if pendingPlayback[profile]?.isEmpty == true { pendingPlayback.removeValue(forKey: profile) }
         persistPlaybackUpdates()
     }
@@ -493,8 +683,9 @@ final class NuvioAccount {
         if let data = UserDefaults.standard.data(forKey: "nuvio.playback.pending.\(owner)"),
            let saved = try? JSONDecoder().decode([Int: [String: PendingPlayback]].self, from: data) {
             for (profile, rows) in saved {
+                if let latest = rows.values.lazy.map(\.timestamp).max() { advancePlaybackClock(to: latest) }
                 pendingPlayback[profile, default: [:]].merge(rows) {
-                    $0.progress.timestamp >= $1.progress.timestamp ? $0 : $1
+                    $0.timestamp >= $1.timestamp ? $0 : $1
                 }
             }
         }
@@ -517,6 +708,7 @@ final class NuvioAccount {
         var seenIDs = Set(entries.map { mediaKey($0.contentID, $0.contentType) })
         let nextEpisodeSeeds = history.filter {
             $0.contentType == CinemetaKind.series.rawValue && ($0.season ?? 0) > 0 && $0.episode != nil
+                && $0.watchedAt > dismissalDate(for: $0.contentID, type: $0.contentType)
         }.prefix(50).compactMap { row -> NuvioHistory? in
             guard seenIDs.insert(mediaKey(row.contentID, row.contentType)).inserted else { return nil }
             return row
@@ -528,7 +720,7 @@ final class NuvioAccount {
         let ids = entries.map { ($0.contentID, $0.contentType) }
             + nextEpisodeSeeds.map { ($0.contentID, $0.contentType) } + aliasHistory
         artworkTask = Task {
-            let results = await withTaskGroup(of: (Int, CinemetaSearchResult?).self) { group in
+            let fetched = await withTaskGroup(of: (Int, CinemetaSearchResult?).self) { group in
                 for (index, id) in ids.enumerated() {
                     guard let kind = CinemetaKind(rawValue: id.1) else { continue }
                     group.addTask {
@@ -543,6 +735,13 @@ final class NuvioAccount {
                 return results.sorted { $0.0 < $1.0 }
             }
             guard !Task.isCancelled else { return }
+            let fetchedByIndex = Dictionary(uniqueKeysWithValues: fetched)
+            let cachedEntries = Dictionary(continueWatching.map {
+                (mediaKey($0.progress.contentID, $0.progress.contentType), $0.entry)
+            }, uniquingKeysWith: { first, _ in first })
+            let results = ids.enumerated().compactMap { index, id in
+                (fetchedByIndex[index] ?? cachedEntries[mediaKey(id.0, id.1)]).map { (index, $0) }
+            }
             for (index, result) in results {
                 let (id, type) = ids[index]
                 progressTitles[mediaKey(id, type)] = result.title.name
@@ -574,20 +773,34 @@ final class NuvioAccount {
                           let next = nextEpisodeProgress(for: entry.title, after: nextEpisodeSeeds[seedIndex], imdbID: imdbID) else { return nil }
                     progress = next
                 }
+                guard progress.updatedAt > dismissalDate(for: imdbID, type: contentType) else { return nil }
                 guard seen.insert(key).inserted else { return nil }
                 return CinemaContinueWatchingItem(entry: entry, progress: progress)
             }
             continueWatching = Array(candidates.sorted { $0.progress.updatedAt > $1.progress.updatedAt }.prefix(20))
-            if lastSync != nil, restoringShelfProfileID == profileID { restoringShelfProfileID = nil }
         }
     }
 
     private func nextEpisodeProgress(for title: CinemetaTitle, after watched: NuvioHistory, imdbID: String) -> NuvioProgress? {
         guard let season = watched.season, season > 0, let episode = watched.episode,
-              let next = nextUnwatchedEpisode(in: title.episodes, after: (season, episode), contentID: imdbID) else { return nil }
+              let next = nextUnwatchedEpisode(in: title.episodes, after: (season, episode), contentID: imdbID, includesUpcoming: true),
+              let timestamp = Int64(exactly: (watched.watchedAt.timeIntervalSince1970 * 1_000).rounded()) else { return nil }
         return NuvioProgressUpdate(contentID: watched.contentID, contentType: watched.contentType, season: next.season,
                                    episode: next.episode, position: 0, duration: 0,
-                                   timestamp: Int64((watched.watchedAt.timeIntervalSince1970 * 1_000).rounded())).row(title: title.name)
+                                   timestamp: timestamp).row(title: title.name)
+    }
+
+    private func suggestedEpisode(for entry: CinemetaSearchResult) -> NuvioProgress? {
+        guard entry.kind == .series, let imdbID = entry.title.imdbID else { return nil }
+        let type = entry.kind.rawValue
+        let aliases = (contentAliases[mediaKey(imdbID, type)] ?? []).union([imdbID])
+        let dismissedAt = dismissalDate(for: imdbID, type: type)
+        guard let latest = history.first(where: {
+            $0.contentType == type && aliases.contains($0.contentID)
+                && $0.watchedAt > max(dismissedAt, dismissalDate(for: $0.contentID, type: type))
+                && ($0.season ?? 0) > 0 && $0.episode != nil
+        }) else { return nil }
+        return nextEpisodeProgress(for: entry.title, after: latest, imdbID: imdbID)
     }
 
     func currentSeriesEpisode(in episodes: [CinemetaEpisode], contentID: String) -> CinemetaEpisode? {
@@ -606,7 +819,9 @@ final class NuvioAccount {
             guard let season = row.season, let number = row.episode,
                   watched.map({ row.updatedAt >= $0.watchedAt }) ?? true,
                   !hasWatched(contentID, kind: .series, season: season, episode: number) else { continue }
-            if let match = episodes.first(where: { $0.season == season && $0.episode == number }) { return match }
+            if let match = episodes.first(where: { $0.season == season && $0.episode == number && !$0.isUpcoming() }) {
+                return match
+            }
         }
 
         guard let season = watched?.season, let number = watched?.episode else { return nil }
@@ -615,12 +830,12 @@ final class NuvioAccount {
     }
 
     private func nextUnwatchedEpisode(in episodes: [CinemetaEpisode], after watched: (Int, Int),
-                                     contentID: String) -> CinemetaEpisode? {
+                                     contentID: String, includesUpcoming: Bool = false) -> CinemetaEpisode? {
         let next = episodes.sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }.first {
             ($0.season, $0.episode) > watched && (watched.0 > 0 || $0.season == 0)
                 && !hasWatched(contentID, kind: .series, season: $0.season, episode: $0.episode)
         }
-        guard let next, let release = next.releasedAt, release <= .now else { return nil }
+        guard let next, next.releasedAt != nil, includesUpcoming || !next.isUpcoming() else { return nil }
         return next
     }
 
@@ -683,7 +898,6 @@ final class NuvioAccount {
         isUnlocking = false
         session = nil
         profiles = []
-        restoringShelfProfileID = nil
         unlockedProfiles = []
         preferredProfileID = nil
         clearProfile()
@@ -701,7 +915,6 @@ final class NuvioAccount {
             if let saved = try SessionKeychain.load() {
                 session = saved.session
                 preferredProfileID = saved.profileID
-                restoringShelfProfileID = saved.profileID
                 restorePlaybackUpdates(owner: saved.session.userId)
             }
             needsSessionRestore = false

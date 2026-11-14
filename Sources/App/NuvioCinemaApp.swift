@@ -63,6 +63,7 @@ struct CinemaTabs: View {
     @State private var account = NuvioAccount()
     @State private var titles = CinemaTitleNavigation()
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         let activeTitleID = titles.screens.last?.id
@@ -70,20 +71,28 @@ struct CinemaTabs: View {
             tabs
                 .disabled(activeTitleID != nil)
                 .accessibilityHidden(activeTitleID != nil)
-                .opacity(activeTitleID == nil ? 1 : 0)
+                .allowsHitTesting(activeTitleID == nil)
 
-            ForEach(titles.screens) { screen in
-                let isActive = screen.id == activeTitleID
-                screen.content
-                    .disabled(!isActive)
-                    .accessibilityHidden(!isActive)
-                    .opacity(isActive ? 1 : 0)
+            ZStack {
+                ForEach(Array(titles.screens.enumerated()), id: \.element.id) { index, screen in
+                    let isActive = screen.id == activeTitleID
+                    screen.content
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .background { CinemaStyle.background.ignoresSafeArea() }
+                        .disabled(!isActive)
+                        .accessibilityHidden(!isActive)
+                        .allowsHitTesting(isActive)
+                        .transition(TitleScreenFade())
+                        .zIndex(Double(index))
+                }
             }
+            .animation(.easeInOut(duration: reduceMotion ? 0.16 : 0.28), value: activeTitleID)
+            .zIndex(1)
         }
         // Back can arrive between focus updates. Focused screens handle their own Back.
         .onExitCommand(perform: activeTitleID == nil ? nil : {})
         #if NUVIO_UPSTREAM_PLAYER
-        .modifier(CinemaTopShelf(account: account, titles: titles))
+        .modifier(CinemaTopShelf(featuredEntries: heroCarousel.entries, titles: titles))
         #endif
         .environment(account)
         .environment(titles)
@@ -131,6 +140,13 @@ struct CinemaTabs: View {
                 }
             }
         }
+    }
+}
+
+private struct TitleScreenFade: Transition {
+    func body(content: Content, phase: TransitionPhase) -> some View {
+        // Keep the incoming screen eligible for focus from the first frame.
+        content.opacity(phase.isIdentity ? 1 : 0.06)
     }
 }
 

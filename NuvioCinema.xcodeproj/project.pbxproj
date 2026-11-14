@@ -28,8 +28,11 @@
 		CC0E6013E5E849F9AE548D91 /* PosterCell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00BBD232B19547799C7D5C10 /* PosterCell.swift */; };
 		7B40221C68A84F1384E7D4DF /* CinemetaSearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 43A8A6AF4F63468D885B3E25 /* CinemetaSearchView.swift */; };
 		BE0D99FE015A485AAB735173 /* Cinemeta.swift in Sources */ = {isa = PBXBuildFile; fileRef = F330C43CC5AF4EB98FF63249 /* Cinemeta.swift */; };
+		A43EF727C1674EA286FD693C /* CinemaCredits.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9F0298DA749C407ABC33DFD4 /* CinemaCredits.swift */; };
 		40923516DE6E5731672B4DA2 /* NuvioCinemaApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = B391C3D48E7300E9B277E364 /* NuvioCinemaApp.swift */; };
 		F8CB4BA29CDF7C3FAD4426EF /* HomeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 22B25C2E3630D43B7DAE9E31 /* HomeView.swift */; };
+		FB82AAE75523435B8792A858 /* GenreCollectionView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51C6018AC34D40E3A9FD6992 /* GenreCollectionView.swift */; };
+		ACD89F1BB1EC4671A4268E66 /* HomeShelves.swift in Sources */ = {isa = PBXBuildFile; fileRef = 309AEBAAEDF54EA6A80B16DB /* HomeShelves.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -53,7 +56,10 @@
 		00BBD232B19547799C7D5C10 /* PosterCell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosterCell.swift; sourceTree = "<group>"; };
 		43A8A6AF4F63468D885B3E25 /* CinemetaSearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemetaSearchView.swift; sourceTree = "<group>"; };
 		F330C43CC5AF4EB98FF63249 /* Cinemeta.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Cinemeta.swift; sourceTree = "<group>"; };
+		9F0298DA749C407ABC33DFD4 /* CinemaCredits.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaCredits.swift; sourceTree = "<group>"; };
 		22B25C2E3630D43B7DAE9E31 /* HomeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeView.swift; sourceTree = "<group>"; };
+		51C6018AC34D40E3A9FD6992 /* GenreCollectionView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GenreCollectionView.swift; sourceTree = "<group>"; };
+		309AEBAAEDF54EA6A80B16DB /* HomeShelves.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HomeShelves.swift; sourceTree = "<group>"; };
 		8B57D9B47222C7963F96FD1F /* NuvioCinema.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = NuvioCinema.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		B391C3D48E7300E9B277E364 /* NuvioCinemaApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioCinemaApp.swift; sourceTree = "<group>"; };
 		0870B134C8C92F6B1612279F /* CinemaTopShelf.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaTopShelf.swift; sourceTree = "<group>"; };
@@ -110,6 +116,7 @@
 			isa = PBXGroup;
 			children = (
 				F330C43CC5AF4EB98FF63249 /* Cinemeta.swift */,
+				9F0298DA749C407ABC33DFD4 /* CinemaCredits.swift */,
 			);
 			path = Catalog;
 			sourceTree = "<group>";
@@ -126,6 +133,8 @@
 			isa = PBXGroup;
 			children = (
 				22B25C2E3630D43B7DAE9E31 /* HomeView.swift */,
+				51C6018AC34D40E3A9FD6992 /* GenreCollectionView.swift */,
+				309AEBAAEDF54EA6A80B16DB /* HomeShelves.swift */,
 			);
 			path = Home;
 			sourceTree = "<group>";
@@ -292,10 +301,13 @@
 				D095F497201B4423AF76FF /* PlaybackTrackPreferences.swift in Sources */,
 				E71BDAAA269541D79465F1AA /* AetherPlaybackView.swift in Sources */,
 				BE0D99FE015A485AAB735173 /* Cinemeta.swift in Sources */,
+				A43EF727C1674EA286FD693C /* CinemaCredits.swift in Sources */,
 				7B40221C68A84F1384E7D4DF /* CinemetaSearchView.swift in Sources */,
 				CC0E6013E5E849F9AE548D91 /* PosterCell.swift in Sources */,
 				7BBE8846E59946D896681180 /* TitleDetailsView.swift in Sources */,
 				F8CB4BA29CDF7C3FAD4426EF /* HomeView.swift in Sources */,
+				FB82AAE75523435B8792A858 /* GenreCollectionView.swift in Sources */,
+				ACD89F1BB1EC4671A4268E66 /* HomeShelves.swift in Sources */,
 				40923516DE6E5731672B4DA2 /* NuvioCinemaApp.swift in Sources */,
 				95EB7D8EFA614E5B990A308A /* NuvioAccount.swift in Sources */,
 				493E22B5FD4948BDB97D411E /* NuvioCloud.swift in Sources */,

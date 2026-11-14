@@ -59,6 +59,7 @@ struct NuvioProgress: Decodable, Equatable, Identifiable, Sendable {
     let position: Int64
     let duration: Int64
     fileprivate let lastWatched: Int64
+    let progressKey: String?
 
     var fraction: Double { duration > 0 ? min(1, max(0, Double(position) / Double(duration))) : 0 }
     var updatedAt: Date { Date(timeIntervalSince1970: Double(lastWatched) / 1_000) }
@@ -68,6 +69,7 @@ struct NuvioProgress: Decodable, Equatable, Identifiable, Sendable {
         case contentID = "content_id"
         case contentType = "content_type"
         case lastWatched = "last_watched"
+        case progressKey = "progress_key"
     }
 }
 
@@ -147,7 +149,7 @@ struct NuvioProgressUpdate: Codable, Sendable {
 
     func row(id: String? = nil, title: String? = nil) -> NuvioProgress {
         NuvioProgress(id: id ?? key, contentID: contentID, contentType: contentType, title: title, season: season,
-                      episode: episode, position: position, duration: duration, lastWatched: timestamp)
+                      episode: episode, position: position, duration: duration, lastWatched: timestamp, progressKey: progressKey)
     }
 
     func matches(_ row: NuvioProgress) -> Bool {
@@ -196,6 +198,17 @@ struct NuvioWatchedUpdate: Codable, Sendable {
         try fields.encode(season, forKey: .season)
         try fields.encode(episode, forKey: .episode)
         try fields.encode(timestamp, forKey: .timestamp)
+    }
+}
+
+struct NuvioWatchedKey: Encodable, Sendable {
+    let contentID: String
+    let season: Int?
+    let episode: Int?
+
+    private enum CodingKeys: String, CodingKey {
+        case contentID = "content_id"
+        case season, episode
     }
 }
 
@@ -347,7 +360,19 @@ struct NuvioCloud: Sendable {
     }
 
     func history(profile: Int, session current: NuvioSession) async throws -> [NuvioHistory] {
-        try await rpc("sync_pull_watched_items", body: ["p_profile_id": profile, "p_page": 1, "p_page_size": 200], session: current)
+        let pageSize = 200
+        var history: [NuvioHistory] = []
+        var seen = Set<NuvioHistory.ID>()
+        var page = 1
+        while true {
+            let rows: [NuvioHistory] = try await rpc("sync_pull_watched_items", body: [
+                "p_profile_id": profile, "p_page": page, "p_page_size": pageSize
+            ], session: current)
+            let additionalRows = rows.filter { seen.insert($0.id).inserted }
+            history += additionalRows
+            guard rows.count == pageSize, !additionalRows.isEmpty else { return history }
+            page += 1
+        }
     }
 
     func pushProgress(_ rows: [NuvioProgressUpdate], profile: Int, origin: String, session current: NuvioSession) async throws {
@@ -360,7 +385,17 @@ struct NuvioCloud: Sendable {
         try await pushPlayback("sync_push_watched_items", payload: payload, session: current)
     }
 
-    private func pushPlayback(_ rpc: String, payload: PlaybackPush, session current: NuvioSession) async throws {
+    func deleteProgress(_ keys: [String], profile: Int, session current: NuvioSession) async throws {
+        try await pushPlayback("sync_delete_watch_progress", payload: PlaybackDelete(profile: profile, keys: keys),
+                               session: current)
+    }
+
+    func deleteWatched(_ keys: [NuvioWatchedKey], profile: Int, session current: NuvioSession) async throws {
+        try await pushPlayback("sync_delete_watched_items", payload: PlaybackDelete(profile: profile, keys: keys),
+                               session: current)
+    }
+
+    private func pushPlayback(_ rpc: String, payload: some Encodable, session current: NuvioSession) async throws {
         _ = try await request(path: "/rest/v1/rpc/\(rpc)", query: [], body: try JSONEncoder().encode(payload),
                               accessToken: current.accessToken)
     }
@@ -546,6 +581,16 @@ struct NuvioCloud: Sendable {
             case origin = "p_origin_client_id"
             case entries = "p_entries"
             case items = "p_items"
+        }
+    }
+
+    private struct PlaybackDelete<Key: Encodable>: Encodable {
+        let profile: Int
+        let keys: [Key]
+
+        private enum CodingKeys: String, CodingKey {
+            case profile = "p_profile_id"
+            case keys = "p_keys"
         }
     }
 }

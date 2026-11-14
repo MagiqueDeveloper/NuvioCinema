@@ -1,36 +1,57 @@
 import SwiftUI
 import UIKit
 
+struct TitleLoadingSkeleton: View {
+    var body: some View {
+        VStack(spacing: 17) {
+            RoundedRectangle(cornerRadius: 15)
+                .frame(width: 260, height: 126)
+            RoundedRectangle(cornerRadius: 7)
+                .frame(width: 190, height: 17)
+            RoundedRectangle(cornerRadius: 7)
+                .frame(width: 130, height: 14)
+        }
+        .foregroundStyle(.white.opacity(0.10))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Loading title")
+    }
+}
+
 struct TitleDetailsView: View {
     let title: CinemetaTitle
     let kind: CinemetaKind
-    let initialResume: CinemaContinueWatchingItem?
+    let restartItem: CinemaContinueWatchingItem?
     let onDismiss: () -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.resetFocus) private var resetFocus
     @Environment(NuvioAccount.self) private var account
     @Environment(CinemaTitleNavigation.self) private var titles
+    @Namespace private var titleFocusScope
     @FocusState private var focus: FocusTarget?
     @State private var details: CinemetaTitle?
     @State private var loadFailed = false
     @State private var loadAttempt = 0
     @State private var selectedSeason: Int?
+    @State private var seasonSlideOffset: CGFloat = 0
     @State private var playbackRequest: TitlePlaybackRequest?
     @State private var playbackOrigin: FocusTarget?
-    @State private var didHandleInitialResume = false
+    @State private var didHandleInitialFocus = false
     @State private var episodeUnavailable = false
     @State private var unavailableEpisodeRelease: Date?
     @State private var trailerUnavailable = false
     @State private var portraits: [String: CastPortrait] = [:]
-    @State private var photoCredit: CastPortrait?
+    @State private var showsCredits = false
+    @State private var credits: CinemaTitleCredits?
     @State private var related: [CinemetaTitle] = []
     @State private var relatedOriginID: String?
 
-    init(title: CinemetaTitle, kind: CinemetaKind, initialResume: CinemaContinueWatchingItem? = nil,
+    init(title: CinemetaTitle, kind: CinemetaKind, restartItem: CinemaContinueWatchingItem? = nil,
          onDismiss: @escaping () -> Void) {
         self.title = title
         self.kind = kind
-        self.initialResume = initialResume
+        self.restartItem = restartItem
         self.onDismiss = onDismiss
     }
     @State private var loadedHeroBackdrop: Image?
@@ -40,7 +61,23 @@ struct TitleDetailsView: View {
         case season(Int), episode(String), retry
     }
 
-    private enum Section: Hashable { case episodes, trailers }
+    private enum Section: Hashable { case hero, episodes, trailers }
+    private enum FocusRegion: Equatable { case hero, seasonPicker, episodeCards }
+
+    private var focusRegion: FocusRegion? {
+        switch focus {
+        case .overview?, .play?, .episodes?, .trailers?:
+            return .hero
+        case .season?:
+            return .seasonPicker
+        case .episode?:
+            return .episodeCards
+        case .retry?:
+            return kind == .series ? .seasonPicker : .hero
+        default:
+            return nil
+        }
+    }
 
     private enum WatchStatus {
         case watched
@@ -60,21 +97,48 @@ struct TitleDetailsView: View {
     private var watchContentID: String { metadata.imdbID ?? title.imdbID ?? title.id }
     private var trailers: [CinemaTrailer] { metadata.trailers.isEmpty ? title.trailers : metadata.trailers }
     private var people: [PersonCredit] {
-        let credits = [
-            (metadata.cast.isEmpty ? title.cast : metadata.cast, String(localized: "Cast")),
-            (metadata.directors.isEmpty ? title.directors : metadata.directors, String(localized: "Director")),
-            (metadata.writers.isEmpty ? title.writers : metadata.writers, String(localized: "Writer")),
-        ]
-        var names: [String] = []
-        var rolesByName: [String: [String]] = [:]
-        for (group, role) in credits {
-            var seen = Set<String>()
-            for name in group where seen.insert(name).inserted {
-                if rolesByName[name] == nil { names.append(name) }
-                rolesByName[name, default: []].append(role)
-            }
+        let extra = credits?.people ?? []
+        let castRole = String(localized: "Cast")
+        let cast = metadata.cast.isEmpty ? title.cast : metadata.cast
+        let directors = metadata.directors.isEmpty ? title.directors : metadata.directors
+        let writers = metadata.writers.isEmpty ? title.writers : metadata.writers
+        let knownCrew = directors.map { CinemaCredit(name: $0, role: String(localized: "Director"), isCast: false) }
+            + writers.map { CinemaCredit(name: $0, role: String(localized: "Writer"), isCast: false) }
+
+        let extraCast = extra.filter(\.isCast)
+        let castByName = Dictionary(grouping: extraCast) { creditNameKey($0.name) }
+        let billedCast = cast.flatMap { name in
+            castByName[creditNameKey(name)] ?? [CinemaCredit(name: name, role: castRole, isCast: true)]
         }
-        return names.map { PersonCredit(name: $0, role: rolesByName[$0, default: []].joined(separator: " · ")) }
+        return mergePeople(billedCast + extraCast + knownCrew + extra.filter { !$0.isCast })
+    }
+
+    private func mergePeople(_ credits: [CinemaCredit]) -> [PersonCredit] {
+        var castKeys: [String] = []
+        var crewKeys: [String] = []
+        var people: [String: PersonCredit] = [:]
+        for credit in credits {
+            let key = creditNameKey(credit.name)
+            if people[key] == nil {
+                if credit.isCast {
+                    guard castKeys.count < 24 else { continue }
+                    castKeys.append(key)
+                } else {
+                    guard crewKeys.count < 24 else { continue }
+                    crewKeys.append(key)
+                }
+                people[key] = PersonCredit(id: key, name: credit.name, roles: [])
+            }
+            if people[key]?.roles.contains(credit.role) == false { people[key]?.roles.append(credit.role) }
+        }
+        return (castKeys + crewKeys).compactMap { people[$0] }
+    }
+
+    private var creditsIMDbID: String? { metadata.imdbID ?? title.imdbID }
+
+    private func creditNameKey(_ name: String) -> String {
+        name.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: Locale(identifier: "en"))
+            .filter { $0.isLetter || $0.isNumber }
     }
     private var synopsis: String? {
         [metadata.description, title.description]
@@ -96,6 +160,7 @@ struct TitleDetailsView: View {
             ScrollView(.vertical) {
                 VStack(alignment: .leading, spacing: 28) {
                     hero(scroll: scroll)
+                        .id(Section.hero)
                     if kind == .series {
                         episodesSection
                             .id(Section.episodes)
@@ -117,23 +182,35 @@ struct TitleDetailsView: View {
             }
             .scrollIndicators(.hidden)
             .ignoresSafeArea(.container, edges: .top)
+            .onChange(of: focusRegion) { _, region in
+                guard isEnabled, playbackRequest == nil, let region else { return }
+                scrollToSection(region == .hero ? .hero : .episodes, using: scroll)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIFocusSystem.movementDidFailNotification)) { notification in
+                guard isEnabled, playbackRequest == nil, !episodeUnavailable, !trailerUnavailable,
+                      case .season? = focus,
+                      let context = notification.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext,
+                      context.focusHeading == .up else { return }
+                // An offscreen hero may have no eligible target above the focused season.
+                returnToHero(using: scroll)
+            }
         }
         .background { CinemaStyle.background.ignoresSafeArea() }
         .preferredColorScheme(.dark)
-        .defaultFocus($focus, initialHeroFocus)
+        .focusScope(titleFocusScope)
+        .defaultFocus($focus, .play)
         .onExitCommand(perform: playbackRequest == nil ? onDismiss : nil)
         .task {
-            await Task.yield()
-            guard !Task.isCancelled, !didHandleInitialResume, let initialResume else { return }
-            didHandleInitialResume = true
-            guard account.canShareContinueWatchingWithTopShelf,
-                  let current = account.continueWatching.first(where: { $0.id == initialResume.id }),
-                  current.progress.season == initialResume.progress.season,
-                  current.progress.episode == initialResume.progress.episode else { return }
-            if kind == .series {
-                guard let episode = current.episode, !episode.isUpcoming() else { return }
-            }
-            showPlayback(episode: current.episode, progress: current.progress, origin: .play)
+            guard !didHandleInitialFocus else { return }
+            didHandleInitialFocus = true
+            openInitialPlayback()
+            guard playbackRequest == nil else { return }
+            focus = .play
+            // The focus engine may register the new screen on a later layout pass.
+            do { try await Task.sleep(for: .milliseconds(45)) } catch { return }
+            guard !Task.isCancelled, playbackRequest == nil, focus == nil else { return }
+            resetFocus(in: titleFocusScope)
+            focus = .play
         }
         #if NUVIO_UPSTREAM_PLAYER
         .disabled(playbackRequest != nil)
@@ -141,6 +218,7 @@ struct TitleDetailsView: View {
         .overlay {
             if let playbackRequest {
                 playbackView(for: playbackRequest)
+                    .transition(.opacity)
             }
         }
         .onChange(of: playbackRequest?.id) { _, id in
@@ -156,7 +234,7 @@ struct TitleDetailsView: View {
             Button("OK", role: .cancel) {}
         } message: {
             if let unavailableEpisodeRelease {
-                Text("This episode airs \(Self.airDate(unavailableEpisodeRelease)).")
+                Text("This episode airs \(CinemetaEpisode.displayAirDate(unavailableEpisodeRelease)).")
             } else if details == nil && !loadFailed {
                 Text("Episode information hasn’t loaded yet. Choose an episode when it’s available.")
             } else {
@@ -168,19 +246,16 @@ struct TitleDetailsView: View {
         } message: {
             Text("This trailer opens in the YouTube app when it’s available on your Apple TV.")
         }
-        .alert("Portrait Credit", isPresented: Binding(
-            get: { photoCredit != nil }, set: { if !$0 { photoCredit = nil } }
-        ), presenting: photoCredit) { _ in
-            Button("OK", role: .cancel) {}
-        } message: { portrait in
-            Text([portrait.attribution, String(localized: "Displayed in a circular crop."),
-                  portrait.sourceURL.absoluteString, portrait.licenseURL?.absoluteString]
-                .compactMap { $0 }.joined(separator: "\n"))
-        }
         .task(id: relatedSeed.genres?.first) {
             let matches = await CinemetaClient().related(to: relatedSeed, kind: kind)
             guard !Task.isCancelled else { return }
             related = matches
+        }
+        .task(id: creditsIMDbID) {
+            guard let imdbID = creditsIMDbID else { return }
+            let loaded = await CinemaCredits.shared.load(imdbID: imdbID, kind: kind)
+            guard !Task.isCancelled else { return }
+            credits = loaded
         }
         .task(id: loadAttempt) {
             let loaded = await CinemetaClient().details(for: title, kind: kind)
@@ -196,7 +271,6 @@ struct TitleDetailsView: View {
     private func hero(scroll: ScrollViewProxy) -> some View {
         VStack(alignment: .leading, spacing: 28) {
             overview
-                .modifier(HeroOverviewReveal(reduceMotion: reduceMotion))
             heroActions(scroll: scroll)
         }
         .frame(maxWidth: 690, alignment: .leading)
@@ -210,24 +284,16 @@ struct TitleDetailsView: View {
         .focusSection()
     }
 
-    private struct HeroOverviewReveal: ViewModifier {
-        let reduceMotion: Bool
-        @State private var revealed = false
-
-        func body(content: Content) -> some View {
-            content
-                .opacity(revealed || reduceMotion ? 1 : 0.72)
-                .offset(y: revealed || reduceMotion ? 0 : 12)
-                .task {
-                    withAnimation(reduceMotion ? nil : .smooth(duration: 0.42)) {
-                        revealed = true
-                    }
-                }
+    private func openInitialPlayback() {
+        guard let restartItem,
+              let current = account.continueWatching.first(where: { $0.id == restartItem.id }),
+              current.progress.season == restartItem.progress.season,
+              current.progress.episode == restartItem.progress.episode else { return }
+        if kind == .series {
+            guard let episode = current.episode, !episode.isUpcoming() else { return }
         }
-    }
-
-    private var initialHeroFocus: FocusTarget {
-        .play
+        showPlayback(episode: current.episode, progress: current.progress, origin: .play,
+                     startsFromBeginning: true)
     }
 
     private func heroActions(scroll: ScrollViewProxy) -> some View {
@@ -260,17 +326,16 @@ struct TitleDetailsView: View {
             .accessibilityLabel(progress == nil ? Text("Play") : Text("Resume"))
             .accessibilityValue(remaining.map { Text("\($0) remaining") } ?? Text(""))
             .focused($focus, equals: .play)
+            .prefersDefaultFocus(in: titleFocusScope)
 
             if kind == .series {
                 Button {
-                    withAnimation(reduceMotion ? nil : .smooth(duration: 0.46)) {
-                        scroll.scrollTo(Section.episodes, anchor: .top)
-                        let groups = episodeGroups
-                        if let season = displayedSeason(in: groups, currentEpisode: currentEpisode(in: groups)) {
-                            focus = .season(season)
-                        } else if loadFailed {
-                            focus = .retry
-                        }
+                    scrollToSection(.episodes, using: scroll)
+                    let groups = episodeGroups
+                    if let season = displayedSeason(in: groups, currentEpisode: currentEpisode(in: groups)) {
+                        focus = .season(season)
+                    } else if loadFailed {
+                        focus = .retry
                     }
                 } label: {
                     Image(systemName: "list.bullet.rectangle")
@@ -303,6 +368,29 @@ struct TitleDetailsView: View {
             }
         }
         .buttonBorderShape(.capsule)
+    }
+
+    private func scrollToSection(_ section: Section, using scroll: ScrollViewProxy) {
+        withAnimation(reduceMotion ? nil : .smooth(duration: 0.42)) {
+            scroll.scrollTo(section, anchor: section == .episodes ? .center : .top)
+        }
+    }
+
+    private func returnToHero(using scroll: ScrollViewProxy) {
+        let origin = focus
+        Task { @MainActor in
+            await Task.yield()
+            guard isEnabled, playbackRequest == nil, !episodeUnavailable, !trailerUnavailable, focus == origin else { return }
+            withAnimation(reduceMotion ? nil : .smooth(duration: 0.42)) {
+                scroll.scrollTo(Section.hero, anchor: .top)
+                focus = .play
+            } completion: {
+                guard isEnabled, playbackRequest == nil, !episodeUnavailable, !trailerUnavailable,
+                      focus == nil || focus == origin else { return }
+                resetFocus(in: titleFocusScope)
+                focus = .play
+            }
+        }
     }
 
     private func savedHeroProgress(for episode: CinemetaEpisode?) -> NuvioProgress? {
@@ -349,15 +437,12 @@ struct TitleDetailsView: View {
         showPlayback(episode: episode, progress: episodeProgress(episode), origin: .episode(episode.id))
     }
 
-    private static func airDate(_ date: Date) -> String {
-        date.formatted(Date.FormatStyle(date: .abbreviated, time: .omitted, timeZone: .gmt))
-    }
-
     private func episodeProgress(_ episode: CinemetaEpisode) -> NuvioProgress? {
         account.progress(for: watchContentID, kind: kind, season: episode.season, episode: episode.episode)
     }
 
-    private func showPlayback(episode: CinemetaEpisode?, progress: NuvioProgress?, origin: FocusTarget) {
+    private func showPlayback(episode: CinemetaEpisode?, progress: NuvioProgress?, origin: FocusTarget,
+                              startsFromBeginning: Bool = false) {
         let candidates: [String]
         if let episode {
             let standardID = "\(watchContentID):\(episode.season):\(episode.episode)"
@@ -368,7 +453,8 @@ struct TitleDetailsView: View {
             candidates = [watchContentID, title.id, progress?.contentID].compactMap { $0 }
         }
         var seen = Set<String>()
-        let position = progress.flatMap { NuvioAccount.hasStarted($0) && $0.fraction < 0.95 ? $0.position : nil } ?? 0
+        let resumePosition = progress.flatMap { NuvioAccount.hasStarted($0) && $0.fraction < 0.95 ? $0.position : nil }
+        let position = startsFromBeginning ? 0 : (resumePosition ?? 0)
         playbackOrigin = origin
         let contentID = progress?.contentID ?? watchContentID
         let request = TitlePlaybackRequest(title: metadata.name, episode: episode.map {
@@ -377,7 +463,8 @@ struct TitleDetailsView: View {
                                            contentID: contentID, season: episode?.season, episodeNumber: episode?.episode,
                                            profileID: account.profileID, accountID: account.playbackAccountID,
                                            followingEpisodes: episode.map { nextEpisodesForPlayback(after: $0) } ?? [],
-                                           metadata: metadata, selectedEpisode: episode)
+                                           metadata: metadata, selectedEpisode: episode,
+                                           startsFromBeginning: startsFromBeginning)
         setPlaybackRequest(request)
     }
 
@@ -403,14 +490,20 @@ struct TitleDetailsView: View {
     }
 
     private func setPlaybackRequest(_ request: TitlePlaybackRequest?) {
-        var transaction = Transaction()
-        transaction.disablesAnimations = true
-        withTransaction(transaction) { playbackRequest = request }
+        withAnimation(.easeInOut(duration: reduceMotion ? 0.14 : 0.25)) {
+            playbackRequest = request
+        }
     }
 
     private func restorePlaybackFocus() {
-        if let playbackOrigin { focus = playbackOrigin }
-        playbackOrigin = nil
+        guard let playbackOrigin else { return }
+        self.playbackOrigin = nil
+        focus = playbackOrigin
+        Task { @MainActor in
+            await Task.yield()
+            guard playbackRequest == nil, focus == nil else { return }
+            focus = playbackOrigin
+        }
     }
 
     private var heroBackdrop: some View {
@@ -507,7 +600,14 @@ struct TitleDetailsView: View {
                     .lineLimit(3)
                     .frame(maxWidth: 640, alignment: .leading)
             } else if details == nil && !loadFailed {
-                ProgressView("Loading title information…")
+                VStack(alignment: .leading, spacing: 11) {
+                    skeletonLine(width: 600, height: 17)
+                    skeletonLine(width: 530, height: 17)
+                    skeletonLine(width: 352, height: 17)
+                }
+                .frame(height: 90, alignment: .center)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("Loading title information")
             } else if loadFailed && kind == .movie {
                 Text("Couldn’t load title information.")
                     .foregroundStyle(.secondary)
@@ -648,16 +748,11 @@ struct TitleDetailsView: View {
     }
 
     private struct PersonCredit: Identifiable {
+        let id: String
         let name: String
-        let role: String
+        var roles: [String]
 
-        var id: String { name }
-    }
-
-    private struct PortraitButtonStyle: ButtonStyle {
-        func makeBody(configuration: Configuration) -> some View {
-            configuration.label
-        }
+        var role: String { roles.joined(separator: " · ") }
     }
 
     private var castShelf: some View {
@@ -669,22 +764,16 @@ struct TitleDetailsView: View {
             ScrollView(.horizontal) {
                 LazyHStack(alignment: .top, spacing: DetailShelf.cardGap) {
                     ForEach(people) { person in
-                        let portrait = portraits[person.name]
-                        Button {
-                            photoCredit = portrait
-                        } label: {
-                            castCard(person, portrait: portrait)
-                        }
-                        .focused($focus, equals: .cast(person.id))
-                        .accessibilityLabel("\(person.name), \(person.role)")
-                        .accessibilityValue(portrait?.attribution ?? "")
+                        castCard(person, portrait: portraits[person.name])
+                            .focusable()
+                            .focused($focus, equals: .cast(person.id))
+                            .accessibilityElement(children: .combine)
                     }
                 }
                 .padding(.vertical, 4)
             }
             .scrollIndicators(.hidden)
             .fixedSize(horizontal: false, vertical: true)
-            .buttonStyle(PortraitButtonStyle())
             .focusEffectDisabled()
         }
         .padding(.horizontal, 16)
@@ -735,6 +824,7 @@ struct TitleDetailsView: View {
                     .foregroundStyle(isFocused ? .white : .white.opacity(0.8))
                 Text(person.role)
                     .font(.system(size: 19))
+                    .lineLimit(3)
                     .foregroundStyle(.white.opacity(isFocused ? 0.7 : 0.5))
             }
             .multilineTextAlignment(.center)
@@ -916,7 +1006,43 @@ struct TitleDetailsView: View {
                     .accessibilityElement(children: .combine)
                 }
             }
+            if credits != nil || !portraits.isEmpty {
+                Button {
+                    showsCredits.toggle()
+                } label: {
+                    Label(showsCredits ? "Hide Credits" : "Show Credits", systemImage: "photo.on.rectangle")
+                }
+                .buttonStyle(.bordered)
+
+                if showsCredits {
+                    attributionCredits
+                }
+            }
         }
+    }
+
+    private var attributionCredits: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            if let credits {
+                Link(credits.sourceName, destination: credits.sourceURL)
+            }
+            ForEach(portraits.keys.sorted(), id: \.self) { name in
+                if let portrait = portraits[name] {
+                    HStack(spacing: 18) {
+                        Link("\(name) · \(portrait.attribution)", destination: portrait.sourceURL)
+                        if let licenseURL = portrait.licenseURL {
+                            Link("License", destination: licenseURL)
+                                .accessibilityLabel("Photo license for \(name)")
+                        }
+                    }
+                }
+            }
+            if !portraits.isEmpty {
+                Text("Portraits are displayed with a circular crop.")
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .font(.system(size: 21))
     }
 
     private func detailPanel<Content: View>(
@@ -948,24 +1074,56 @@ struct TitleDetailsView: View {
             .accessibilityAddTraits(.isHeader)
     }
 
+    private func skeletonLine(width: CGFloat, height: CGFloat) -> some View {
+        RoundedRectangle(cornerRadius: min(height / 2, 12))
+            .fill(.white.opacity(0.10))
+            .frame(width: width, height: height)
+            .accessibilityHidden(true)
+    }
+
+    private var episodeSkeleton: some View {
+        VStack(alignment: .leading, spacing: DetailShelf.sectionGap) {
+            skeletonLine(width: 148, height: 48)
+            HStack(alignment: .top, spacing: DetailShelf.cardGap) {
+                ForEach(0..<4) { index in
+                    VStack(alignment: .leading, spacing: 10) {
+                        RoundedRectangle(cornerRadius: 16)
+                            .fill(.white.opacity(0.08))
+                            .aspectRatio(16 / 9, contentMode: .fit)
+                        skeletonLine(width: index.isMultiple(of: 2) ? 180 : 224, height: 18)
+                        skeletonLine(width: 106, height: 13)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Loading episodes")
+    }
+
     @ViewBuilder
     private var episodesSection: some View {
         let groups = episodeGroups
         let currentEpisode = currentEpisode(in: groups)
+        let seasons = orderedSeasons(groups)
+        let displayedSeason = displayedSeason(in: groups, currentEpisode: currentEpisode)
         VStack(alignment: .leading, spacing: DetailShelf.sectionGap) {
             sectionHeading("Episodes")
-            if let season = displayedSeason(in: groups, currentEpisode: currentEpisode), let seasonEpisodes = groups[season] {
-                seasonPicker(seasons: orderedSeasons(groups), current: season)
-                episodeShelf(seasonEpisodes.sorted { $0.episode < $1.episode },
-                             initialEpisodeID: currentEpisode?.season == season ? currentEpisode?.id : nil)
-                    .id(season)
+            if let season = displayedSeason, let seasonEpisodes = groups[season] {
+                seasonPicker(seasons: seasons, current: season)
+                ZStack {
+                    episodeShelf(seasonEpisodes.sorted { $0.episode < $1.episode },
+                                 initialEpisodeID: currentEpisode?.season == season ? currentEpisode?.id : nil)
+                        .id(season)
+                        .transition(seasonShelfTransition)
+                }
             } else if loadFailed {
                 Text("Couldn’t load episodes.")
                     .foregroundStyle(.secondary)
                 Button("Try Again", action: retry)
                     .focused($focus, equals: .retry)
             } else if details == nil {
-                ProgressView("Loading episodes…")
+                episodeSkeleton
             } else {
                 Text("No episodes available.")
                     .foregroundStyle(.secondary)
@@ -975,13 +1133,33 @@ struct TitleDetailsView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .focusSection()
         .onChange(of: focus) { _, focused in
-            // Late progress or metadata must not replace a shelf the viewer is already using.
-            guard selectedSeason == nil else { return }
-            if case .season? = focused {
-                selectedSeason = displayedSeason(in: groups, currentEpisode: currentEpisode)
-            } else if case let .episode(id)? = focused {
+            if case let .season(season)? = focused {
+                selectSeason(season, from: displayedSeason, in: seasons)
+            } else if selectedSeason == nil, case let .episode(id)? = focused {
+                // Late progress or metadata must not replace a shelf the viewer is already using.
                 selectedSeason = groups.first { $0.value.contains { $0.id == id } }?.key
             }
+        }
+    }
+
+    private var seasonShelfTransition: AnyTransition {
+        guard !reduceMotion else { return .identity }
+        return .asymmetric(
+            insertion: .offset(x: seasonSlideOffset).combined(with: .opacity),
+            removal: .identity
+        )
+    }
+
+    private func selectSeason(_ season: Int, from current: Int?, in seasons: [Int]) {
+        guard selectedSeason != season else { return }
+        guard let current, let fromIndex = seasons.firstIndex(of: current),
+              let toIndex = seasons.firstIndex(of: season), fromIndex != toIndex else {
+            selectedSeason = season
+            return
+        }
+        seasonSlideOffset = toIndex > fromIndex ? 104 : -104
+        withAnimation(reduceMotion ? nil : .easeOut(duration: 0.26)) {
+            selectedSeason = season
         }
     }
 
@@ -1014,7 +1192,7 @@ struct TitleDetailsView: View {
                     ForEach(seasons, id: \.self) { season in
                         let label: LocalizedStringKey = season == 0 ? "Specials" : "Season \(season)"
                         Button {
-                            selectedSeason = season
+                            selectSeason(season, from: current, in: seasons)
                         } label: {
                             Text(label)
                         }
@@ -1036,22 +1214,27 @@ struct TitleDetailsView: View {
     }
 
     private func episodeShelf(_ episodes: [CinemetaEpisode], initialEpisodeID: CinemetaEpisode.ID?) -> some View {
-        ScrollViewReader { scroll in
+        let now = Date.now
+        return ScrollViewReader { scroll in
             ScrollView(.horizontal) {
                 LazyHStack(alignment: .top, spacing: DetailShelf.cardGap) {
                     ForEach(episodes) { episode in
-                        let status = episodeWatchStatus(episode)
-                        let airDate = episode.isUpcoming() ? episode.releasedAt.map(Self.airDate) : nil
+                        let upcoming = episode.isUpcoming(at: now)
+                        let status = upcoming ? nil : episodeWatchStatus(episode)
+                        let airDate = episode.releasedAt.map { release in
+                            let date = CinemetaEpisode.displayAirDate(release)
+                            return upcoming ? String(localized: "Coming \(date)") : date
+                        }
                         Button {
                             playEpisode(episode)
                         } label: {
-                            episodeCard(episode, status: status, airDate: airDate)
+                            episodeCard(episode, status: status, airDate: airDate, upcoming: upcoming)
                         }
                         .focused($focus, equals: .episode(episode.id))
                         .accessibilityLabel("Episode \(episode.episode), \(episode.name)")
-                        .accessibilityValue([airDate.map { String(localized: "Airs \($0)") }
-                            ?? status?.accessibilityDescription, episode.overview]
+                        .accessibilityValue([airDate, status?.accessibilityDescription, episode.overview]
                             .compactMap { $0 }.joined(separator: ". "))
+                        .contextMenu { episodeMenu(for: episode, status: status) }
                     }
                 }
             }
@@ -1068,6 +1251,42 @@ struct TitleDetailsView: View {
         .focusSection()
     }
 
+    @ViewBuilder
+    private func episodeMenu(for episode: CinemetaEpisode, status: WatchStatus?) -> some View {
+        if account.profileID != nil, !episode.isUpcoming() {
+            if case .watched? = status {
+                Button("Mark as Unwatched", systemImage: "eye.slash") {
+                    setEpisodesWatched([episode], watched: false)
+                }
+            } else {
+                Button("Mark as Watched", systemImage: "checkmark") {
+                    setEpisodesWatched([episode], watched: true)
+                }
+            }
+            Button("Mark Watched Up to Here", systemImage: "checklist.checked") {
+                let target = (episode.season, episode.episode)
+                let now = Date.now
+                let previous = episodes.filter {
+                    ($0.season, $0.episode) <= target && ($0.season == 0) == (episode.season == 0)
+                        && !$0.isUpcoming(at: now)
+                }
+                setEpisodesWatched(previous, watched: true)
+            }
+        }
+    }
+
+    private func setEpisodesWatched(_ episodes: [CinemetaEpisode], watched: Bool) {
+        let profileID = account.profileID
+        let accountID = account.playbackAccountID
+        let title = metadata
+        let contentID = watchContentID
+        // Let the native menu finish dismissing before updating the cards it belongs to.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+            guard account.profileID == profileID, account.playbackAccountID == accountID else { return }
+            account.setEpisodesWatched(episodes, title: title, contentID: contentID, watched: watched)
+        }
+    }
+
     private func episodeWatchStatus(_ episode: CinemetaEpisode) -> WatchStatus? {
         if account.hasWatched(watchContentID, kind: kind, season: episode.season, episode: episode.episode) {
             return .watched
@@ -1077,14 +1296,14 @@ struct TitleDetailsView: View {
         return .inProgress(progress.fraction)
     }
 
-    private func episodeCard(_ episode: CinemetaEpisode, status: WatchStatus?, airDate: String?) -> some View {
+    private func episodeCard(_ episode: CinemetaEpisode, status: WatchStatus?, airDate: String?, upcoming: Bool) -> some View {
         let size = CGSize(width: 380, height: 214)
         let shape = RoundedRectangle(cornerRadius: 18)
 
         return VStack(alignment: .leading, spacing: 0) {
             episodeArtwork(episode.thumbnail, size: size)
                 .overlay(alignment: .bottom) {
-                    if airDate == nil, case let .inProgress(fraction)? = status {
+                    if case let .inProgress(fraction)? = status {
                         ProgressView(value: fraction)
                             .progressViewStyle(.linear)
                             .tint(.white)
@@ -1095,21 +1314,31 @@ struct TitleDetailsView: View {
                 }
 
             VStack(alignment: .leading, spacing: 6) {
-                HStack {
+                HStack(spacing: 8) {
                     Text("Episode \(episode.episode)")
                         .font(.system(size: 18, weight: .medium))
                         .foregroundStyle(.white.opacity(0.66))
-                    Spacer(minLength: 8)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                    if case .watched? = status {
+                        Image(systemName: "checkmark.circle.fill")
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.78))
+                            .accessibilityHidden(true)
+                    }
+                    Spacer(minLength: 4)
                     if let airDate {
-                        Text("Airs \(airDate)")
+                        Text(airDate)
                             .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.78))
-                    } else if case .watched? = status {
-                        Label("Watched", systemImage: "checkmark")
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.78))
+                            .foregroundStyle(upcoming ? Color.cyan : .white.opacity(0.72))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.8)
+                            .padding(.horizontal, upcoming ? 10 : 0)
+                            .background(upcoming ? .cyan.opacity(0.13) : .clear, in: Capsule())
+                            .layoutPriority(1)
                     }
                 }
+                .frame(height: 27)
 
                 Text(episode.name)
                     .font(.system(size: 24, weight: .semibold))
@@ -1117,7 +1346,7 @@ struct TitleDetailsView: View {
                 Text(episode.overview ?? "")
                     .font(.system(size: 20))
                     .foregroundStyle(.white.opacity(0.72))
-                    .lineLimit(3, reservesSpace: true)
+                    .lineLimit(2, reservesSpace: true)
             }
             .padding(17)
         }
@@ -1159,11 +1388,5 @@ struct TitleDetailsView: View {
         }
         .frame(width: size.width, height: size.height)
         .clipped()
-    }
-}
-
-private extension CinemetaEpisode {
-    func isUpcoming(at date: Date = .now) -> Bool {
-        releasedAt.map { $0 > date } ?? false
     }
 }

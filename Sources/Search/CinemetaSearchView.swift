@@ -103,7 +103,7 @@ private final class SearchResultsController: UICollectionViewController, UIColle
     private var searchTask: Task<Void, Never>?
     private var query = ""
     private var isActive = false
-    private var resultsByID: [String: CinemetaSearchResult] = [:]
+    private var resultsByID: [String: SearchPosterResult] = [:]
     private var names: [String: String] = [:]
     private var hasFailure = false
     private var searchFinished = false
@@ -112,7 +112,6 @@ private final class SearchResultsController: UICollectionViewController, UIColle
 
     private struct GridStatus: Equatable {
         let message: String
-        var isLoading = false
         var canRetry = false
     }
 
@@ -138,10 +137,14 @@ private final class SearchResultsController: UICollectionViewController, UIColle
         collectionView.register(SearchGridStatus.self, forSupplementaryViewOfKind: UICollectionView.elementKindSectionFooter,
                                 withReuseIdentifier: "Status")
         let registration = UICollectionView.CellRegistration<PosterCell, String> { [weak self] cell, _, id in
-            guard let self, let result = resultsByID[id] else { return }
-            cell.configure(name: names[id] ?? result.title.name,
-                           primaryURL: BetterPosters.url(for: result.title.imdbID),
-                           fallbackURL: result.title.poster)
+            guard let self else { return }
+            guard let result = resultsByID[id] else {
+                cell.showSkeleton()
+                return
+            }
+            cell.configure(name: names[id] ?? result.entry.title.name,
+                           primaryURL: result.artworkURLs.first,
+                           fallbackURL: result.artworkURLs.dropFirst().first)
         }
         dataSource = UICollectionViewDiffableDataSource(collectionView: collectionView) { view, indexPath, id in
             view.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: id)
@@ -188,21 +191,33 @@ private final class SearchResultsController: UICollectionViewController, UIColle
             let catalog = await CinemetaClient().load(query: term)
             guard !Task.isCancelled, let self, isActive, query == term else { return }
             hasFailure = catalog.hasFailure
+            var seen = Set<String>()
+            let ranked = catalog.rankedResults(for: term).filter { seen.insert($0.id).inserted }
+            var results: [SearchPosterResult] = []
+            let batchSize = 12
+            for start in stride(from: 0, to: ranked.count, by: batchSize) {
+                let end = min(start + batchSize, ranked.count)
+                let batch = await SearchPosterResult.resolve(ranked[start..<end])
+                guard !Task.isCancelled, isActive, query == term else { return }
+                results += batch
+                if !results.isEmpty {
+                    applyResults(results)
+                }
+            }
             searchFinished = true
-            applyResults(catalog.rankedResults(for: term))
+            applyResults(results)
         }
     }
 
-    private func applyResults(_ rankedResults: [CinemetaSearchResult] = []) {
-        var seen = Set<String>()
-        let results = rankedResults.filter { seen.insert($0.id).inserted }
-        let newNames = CinemetaSearchResult.disambiguatedNames(for: results)
+    private func applyResults(_ results: [SearchPosterResult] = []) {
+        let newNames = CinemetaSearchResult.disambiguatedNames(for: results.map(\.entry))
         let previousIDs = Set(dataSource.snapshot().itemIdentifiers)
         resultsByID = Dictionary(uniqueKeysWithValues: results.map { ($0.id, $0) })
 
         var snapshot = NSDiffableDataSourceSnapshot<Int, String>()
         snapshot.appendSections([0])
-        snapshot.appendItems(results.map(\.id))
+        let showsSkeleton = isActive && !query.isEmpty && !searchFinished && results.isEmpty
+        snapshot.appendItems(showsSkeleton ? (0..<12).map { "skeleton-\($0)" } : results.map(\.id))
         snapshot.reconfigureItems(results.map(\.id).filter { previousIDs.contains($0) && names[$0] != newNames[$0] })
         names = newNames
         let previousStatus = gridStatus
@@ -220,10 +235,7 @@ private final class SearchResultsController: UICollectionViewController, UIColle
     }
 
     private func statusForResults(hasResults: Bool) -> GridStatus? {
-        guard !query.isEmpty else { return nil }
-        if !searchFinished {
-            return GridStatus(message: String(localized: "Searching Cinemeta…"), isLoading: true)
-        }
+        guard !query.isEmpty, searchFinished else { return nil }
         if hasFailure {
             let message = hasResults
                 ? String(localized: "Some search results couldn’t load.")
@@ -237,7 +249,7 @@ private final class SearchResultsController: UICollectionViewController, UIColle
     private func configureStatus(_ footer: SearchGridStatus) {
         footer.isHidden = gridStatus == nil
         guard let gridStatus else { return }
-        footer.configure(gridStatus.message, isLoading: gridStatus.isLoading, canRetry: gridStatus.canRetry)
+        footer.configure(gridStatus.message, canRetry: gridStatus.canRetry)
         footer.retryAction = { [weak self] in self?.startSearch() }
     }
 
@@ -261,7 +273,7 @@ private final class SearchResultsController: UICollectionViewController, UIColle
     override func collectionView(_ collectionView: UICollectionView, didSelectItemAt indexPath: IndexPath) {
         collectionView.deselectItem(at: indexPath, animated: false)
         guard isActive, titles.screens.isEmpty,
-              let id = dataSource.itemIdentifier(for: indexPath), let result = resultsByID[id] else { return }
+              let id = dataSource.itemIdentifier(for: indexPath), let result = resultsByID[id]?.entry else { return }
         let offset = collectionView.contentOffset.y + collectionView.adjustedContentInset.top
         let resultIDs = dataSource.snapshot().itemIdentifiers
         titles.show(onDismiss: { [weak self] in
@@ -294,10 +306,67 @@ private final class SearchResultsController: UICollectionViewController, UIColle
     }
 }
 
+private struct SearchPosterResult: Identifiable, Sendable {
+    let entry: CinemetaSearchResult
+    let artworkURLs: [URL]
+
+    var id: String { entry.id }
+
+    static func resolve(_ entries: ArraySlice<CinemetaSearchResult>) async -> [Self] {
+        await withTaskGroup(of: (Int, Self?).self) { group in
+            for (index, entry) in entries.enumerated() {
+                group.addTask { (index, await resolve(entry)) }
+            }
+            var resolved: [(Int, Self)] = []
+            for await (index, result) in group {
+                if let result { resolved.append((index, result)) }
+            }
+            return resolved.sorted { $0.0 < $1.0 }.map(\.1)
+        }
+    }
+
+    private static func resolve(_ entry: CinemetaSearchResult) async -> Self? {
+        let primary = BetterPosters.url(for: entry.title.imdbID)
+        let fallback = entry.title.poster == primary ? nil : entry.title.poster
+        if let primary, CinemaImageCache.cached(primary) != nil {
+            return Self(entry: entry, artworkURLs: [primary])
+        }
+        if let fallback, CinemaImageCache.cached(fallback) != nil {
+            return Self(entry: entry, artworkURLs: [fallback])
+        }
+
+        async let preferred = availability(of: primary)
+        async let alternative = availability(of: fallback)
+        switch await (preferred, alternative) {
+        case (.available, _): return primary.map { Self(entry: entry, artworkURLs: [$0]) }
+        case (_, .available): return fallback.map { Self(entry: entry, artworkURLs: [$0]) }
+        case (.unverified, _), (_, .unverified):
+            return Self(entry: entry, artworkURLs: [primary, fallback].compactMap { $0 })
+        case (.missing, .missing): return nil
+        }
+    }
+
+    private enum Availability {
+        case available, missing, unverified
+    }
+
+    private static func availability(of url: URL?) async -> Availability {
+        guard let url else { return .missing }
+        guard !Task.isCancelled else { return .unverified }
+        do {
+            _ = try await CinemaImageCache.shared.image(for: url)
+            return .available
+        } catch CinemaImageError.missing, CinemaImageError.invalidImage {
+            return .missing
+        } catch {
+            return .unverified
+        }
+    }
+}
+
 private final class SearchGridStatus: UICollectionReusableView {
     var retryAction: (() -> Void)?
     private let label = UILabel()
-    private let spinner = UIActivityIndicatorView(style: .large)
     private let retry = UIButton(type: .system)
 
     override init(frame: CGRect) {
@@ -308,7 +377,7 @@ private final class SearchGridStatus: UICollectionReusableView {
         label.numberOfLines = 2
         retry.setTitle(String(localized: "Try Again"), for: .normal)
         retry.addAction(UIAction { [weak self] _ in self?.retryAction?() }, for: .primaryActionTriggered)
-        let stack = UIStackView(arrangedSubviews: [spinner, label, retry])
+        let stack = UIStackView(arrangedSubviews: [label, retry])
         stack.axis = .vertical
         stack.alignment = .center
         stack.spacing = 12
@@ -325,10 +394,8 @@ private final class SearchGridStatus: UICollectionReusableView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("Search status is created in code") }
 
-    func configure(_ message: String, isLoading: Bool = false, canRetry: Bool = false) {
+    func configure(_ message: String, canRetry: Bool = false) {
         label.text = message
         retry.isHidden = !canRetry
-        if isLoading { spinner.startAnimating() } else { spinner.stopAnimating() }
-        spinner.isHidden = !isLoading
     }
 }

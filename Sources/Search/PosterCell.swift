@@ -1,21 +1,16 @@
 import SwiftUI
 import UIKit
 
-private struct PosterLoadingIndicator: View {
-    var body: some View {
-        ProgressView().progressViewStyle(.circular).tint(.white)
-    }
-}
-
 final class PosterCell: UICollectionViewCell {
     private let poster = UIImageView()
     private let label = UILabel()
     private let placeholder = UIImageView(image: UIImage(systemName: "film"))
-    private let spinner = UIHostingConfiguration { PosterLoadingIndicator() }
-        .margins(.all, 0)
-        .makeContentView()
+    private let titleSkeleton = UIView()
     private var loadTask: Task<Void, Never>?
     private var artworkURLs: [URL]?
+    private var isSkeleton = false
+
+    override var canBecomeFocused: Bool { !isSkeleton && super.canBecomeFocused }
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -31,13 +26,15 @@ final class PosterCell: UICollectionViewCell {
         label.isAccessibilityElement = false
         contentView.addSubview(poster)
         contentView.addSubview(label)
-        poster.addSubview(spinner)
+        contentView.addSubview(titleSkeleton)
         poster.addSubview(placeholder)
+        titleSkeleton.backgroundColor = UIColor.white.withAlphaComponent(0.10)
+        titleSkeleton.layer.cornerRadius = 7
         poster.translatesAutoresizingMaskIntoConstraints = false
         label.translatesAutoresizingMaskIntoConstraints = false
-        spinner.translatesAutoresizingMaskIntoConstraints = false
+        titleSkeleton.translatesAutoresizingMaskIntoConstraints = false
         placeholder.translatesAutoresizingMaskIntoConstraints = false
-        spinner.isHidden = true
+        titleSkeleton.isHidden = true
         placeholder.isHidden = true
         NSLayoutConstraint.activate([
             poster.topAnchor.constraint(equalTo: contentView.topAnchor),
@@ -47,8 +44,10 @@ final class PosterCell: UICollectionViewCell {
             label.topAnchor.constraint(equalTo: poster.bottomAnchor, constant: 8),
             label.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
             label.trailingAnchor.constraint(equalTo: contentView.trailingAnchor),
-            spinner.centerXAnchor.constraint(equalTo: poster.centerXAnchor),
-            spinner.centerYAnchor.constraint(equalTo: poster.centerYAnchor),
+            titleSkeleton.leadingAnchor.constraint(equalTo: poster.leadingAnchor),
+            titleSkeleton.topAnchor.constraint(equalTo: poster.bottomAnchor, constant: 13),
+            titleSkeleton.widthAnchor.constraint(equalTo: poster.widthAnchor, multiplier: 0.70),
+            titleSkeleton.heightAnchor.constraint(equalToConstant: 14),
             placeholder.centerXAnchor.constraint(equalTo: poster.centerXAnchor),
             placeholder.centerYAnchor.constraint(equalTo: poster.centerYAnchor),
         ])
@@ -76,11 +75,26 @@ final class PosterCell: UICollectionViewCell {
         artworkURLs = nil
         poster.image = nil
         updateFocusAppearance(false)
-        spinner.isHidden = true
+        titleSkeleton.isHidden = true
         placeholder.isHidden = true
+        isSkeleton = false
+    }
+
+    func showSkeleton() {
+        isSkeleton = true
+        isAccessibilityElement = false
+        titleSkeleton.isHidden = false
+        poster.backgroundColor = UIColor(white: 0.16, alpha: 1)
+        poster.image = nil
+        label.text = nil
+        placeholder.isHidden = true
+        updateFocusAppearance(false)
     }
 
     func configure(name: String, primaryURL: URL?, fallbackURL: URL?) {
+        isSkeleton = false
+        isAccessibilityElement = true
+        titleSkeleton.isHidden = true
         label.text = name
         accessibilityLabel = name
         updateFocusAppearance(isFocused)
@@ -101,7 +115,7 @@ final class PosterCell: UICollectionViewCell {
             return
         }
         poster.image = nil
-        spinner.isHidden = false
+        poster.backgroundColor = UIColor(white: 0.16, alpha: 1)
         loadTask = Task { [weak self] in
             for url in urls {
                 guard self != nil, !Task.isCancelled else { return }
@@ -117,12 +131,12 @@ final class PosterCell: UICollectionViewCell {
 
     private func showPoster(_ image: CGImage) {
         poster.image = UIImage(cgImage: image)
-        spinner.isHidden = true
+        poster.backgroundColor = UIColor(white: 0.09, alpha: 1)
     }
 
     private func showPlaceholder() {
         poster.image = nil
-        spinner.isHidden = true
+        poster.backgroundColor = UIColor(white: 0.09, alpha: 1)
         placeholder.isHidden = false
     }
 }

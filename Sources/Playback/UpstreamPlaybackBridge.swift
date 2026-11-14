@@ -83,7 +83,7 @@ struct UpstreamPlaybackBridge: View {
             url: url, meta: meta, subtitle: currentEpisode.map(Self.episodeLabel) ?? "",
             httpHeaders: stream.requestHeaders,
             externalSubtitles: Self.subtitles(stream.subtitles, source: stream.addon),
-            resumeFrom: request.position > 0 ? Double(request.position) / 1_000 : nil,
+            resumeFrom: request.position > 0 || request.startsFromBeginning ? Double(request.position) / 1_000 : nil,
             addonName: stream.addon, provider: "Direct",
             filename: stream.filename, videoSize: stream.videoSize, videoHash: stream.videoHash,
             sourceID: url.absoluteString, episodes: episodes, currentEpisode: currentEpisode,

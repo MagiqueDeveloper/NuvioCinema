@@ -425,7 +425,7 @@ private struct NuvioWatchlistTitle: View {
                     }
                     .buttonStyle(.borderedProminent)
                 } else {
-                    ProgressView("Loading title…")
+                    TitleLoadingSkeleton()
                 }
                 Button("Back", action: onDismiss)
                     .buttonStyle(.bordered)
@@ -516,6 +516,11 @@ private struct NuvioAccountSettings: View {
                     Text(message)
                         .foregroundStyle(.secondary)
                 }
+                #if NUVIO_UPSTREAM_PLAYER
+                if !TopShelfFeedStore.isAvailable {
+                    LabeledContent("Top Shelf", value: "Shared app group unavailable")
+                }
+                #endif
             }
 
             Button("Sign Out", role: .destructive) {

@@ -18,6 +18,7 @@ struct TitlePlaybackRequest: Identifiable, Sendable {
     let followingEpisodes: [CinemetaEpisode]
     var metadata: CinemetaTitle? = nil
     var selectedEpisode: CinemetaEpisode? = nil
+    var startsFromBeginning = false
 
     func videoIDs(for episode: CinemetaEpisode) -> [String] {
         let suffix = ":\(episode.season):\(episode.episode)"
@@ -46,9 +47,7 @@ struct TitlePlaybackView: View {
     @State private var request: TitlePlaybackRequest
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    #if !NUVIO_UPSTREAM_PLAYER
     @FocusState private var focusedItem: FocusTarget?
-    #endif
     @State private var results: AddonStreamResults?
     @State private var selected: AddonStream?
     @State private var loadAttempt = 0
@@ -67,17 +66,17 @@ struct TitlePlaybackView: View {
         self.onDismiss = onDismiss
     }
 
-    #if !NUVIO_UPSTREAM_PLAYER
     private enum FocusTarget: Hashable {
         case status, retry, source(AddonStream.ID)
     }
 
     private var preferredFocus: FocusTarget {
-        if let lastSourceID { return .source(lastSourceID) }
+        if let lastSourceID, results?.streams.contains(where: { $0.id == lastSourceID }) == true {
+            return .source(lastSourceID)
+        }
         if let first = results?.streams.first { return .source(first.id) }
         return results.map { $0.failedAddons > 0 } == true ? .retry : .status
     }
-    #endif
 
     var body: some View {
         playbackContent
@@ -87,18 +86,14 @@ struct TitlePlaybackView: View {
             withAnimation(sheetAnimation(opening: true), completionCriteria: .removed) {
                 isOpen = true
             } completion: {
-                #if !NUVIO_UPSTREAM_PLAYER
                 if !isClosing && focusedItem == nil { focusedItem = preferredFocus }
-                #endif
             }
         }
         .task(id: loadAttempt) {
             let loaded = await AddonStreams().load(addons: request.addons, kind: request.kind, videoIDs: request.videoIDs)
             guard !Task.isCancelled, !isClosing else { return }
             results = loaded
-            #if !NUVIO_UPSTREAM_PLAYER
-            focusedItem = preferredFocus
-            #endif
+            if selected == nil { focusedItem = preferredFocus }
         }
         #if !NUVIO_UPSTREAM_PLAYER
         .fullScreenCover(item: $selected, onDismiss: restoreSourceFocus, content: player)
@@ -117,37 +112,30 @@ struct TitlePlaybackView: View {
     private var playbackContent: some View {
         #if NUVIO_UPSTREAM_PLAYER
         // Keep the player in the same presentation so Back is routed to its focused menu.
-        if let selected {
-            player(selected)
-                .id(selected.id)
-        } else {
+        ZStack {
             sourcePicker
+                .disabled(selected != nil)
+                .allowsHitTesting(selected == nil)
+                .accessibilityHidden(selected != nil)
+                .task(id: selected == nil) {
+                    guard selected == nil, !isClosing else { return }
+                    await Task.yield()
+                    guard !Task.isCancelled, selected == nil, !isClosing, focusedItem == nil else { return }
+                    focusedItem = preferredFocus
+                }
+            if let selected {
+                player(selected)
+                    .id(selected.id)
+                    .transition(.opacity)
+                    .zIndex(1)
+            }
         }
         #else
         sourcePicker
         #endif
     }
 
-    @ViewBuilder
     private var sourcePicker: some View {
-        #if NUVIO_UPSTREAM_PLAYER
-        ZStack {
-            if isOpen {
-                SourcesSidePanel(
-                    sources: results?.streams ?? [],
-                    isLoading: results == nil,
-                    preferredID: lastSourceID,
-                    presentation: { $0.panelStream },
-                    onSelect: open,
-                    emptyMessage: results.map(emptyMessage),
-                    onRetry: (results?.failedAddons ?? 0) > 0 ? resultsReset : nil,
-                    onExit: close
-                )
-                .focusSection()
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        #else
         GeometryReader { geometry in
             let panelWidth = min(740, geometry.size.width * 0.48)
             ZStack(alignment: .trailing) {
@@ -162,15 +150,25 @@ struct TitlePlaybackView: View {
         }
         .ignoresSafeArea()
         .defaultFocus($focusedItem, preferredFocus)
-        .onExitCommand(perform: close)
-        #endif
+        .onExitCommand(perform: sourceExitAction)
     }
 
-    private func sheetAnimation(opening: Bool) -> Animation? {
+    private var sourceExitAction: (() -> Void)? {
         #if NUVIO_UPSTREAM_PLAYER
-        reduceMotion ? nil : .easeOut(duration: 0.22)
-        #else
+        if selected != nil { return nil }
+        #endif
+        return close
+    }
+
+    private func sheetAnimation(opening: Bool) -> Animation {
         reduceMotion ? .easeOut(duration: opening ? 0.15 : 0.12) : .smooth(duration: opening ? 0.4 : 0.3)
+    }
+
+    private func selectSource(_ stream: AddonStream?) {
+        #if NUVIO_UPSTREAM_PLAYER
+        withAnimation(.easeInOut(duration: reduceMotion ? 0.16 : 0.28)) { selected = stream }
+        #else
+        selected = stream
         #endif
     }
 
@@ -194,7 +192,7 @@ struct TitlePlaybackView: View {
         let episodeChanged = request.id != updatedRequest.id
         request = updatedRequest
         playerFailure = failure
-        selected = nil
+        selectSource(nil)
         if episodeChanged { resultsReset() }
         restoreSourceFocus()
     }
@@ -204,7 +202,7 @@ struct TitlePlaybackView: View {
         let needsSources = request.videoIDs != restoredRequest.videoIDs
         request = restoredRequest
         if needsSources { resultsReset() }
-        selected = stream
+        selectSource(stream)
         return true
     }
     #endif
@@ -219,7 +217,6 @@ struct TitlePlaybackView: View {
         return { advanceEpisode() }
     }
 
-    #if !NUVIO_UPSTREAM_PLAYER
     private var panel: some View {
         VStack(alignment: .leading, spacing: 20) {
             header
@@ -228,26 +225,7 @@ struct TitlePlaybackView: View {
                 .padding(.horizontal, 42)
 
             if let results {
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 18) {
-                        if results.streams.isEmpty {
-                            emptyState(results)
-                        } else {
-                            ForEach(results.streams) { stream in
-                                Button { open(stream) } label: {
-                                    sourceLabel(stream)
-                                }
-                                .buttonStyle(.card)
-                                .focused($focusedItem, equals: .source(stream.id))
-                                .accessibilityHint(stream.destination.isExternal ? Text("Opens in another app") : Text("Plays this source"))
-                            }
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.horizontal, 42)
-                    .padding(.vertical, 12)
-                }
-                .scrollIndicators(.hidden)
+                sourceList(results)
             } else {
                 loadingSources
             }
@@ -259,22 +237,75 @@ struct TitlePlaybackView: View {
         .focusSection()
     }
 
-    private var loadingSources: some View {
-        HStack(spacing: 18) {
-            ProgressView()
-                .progressViewStyle(.circular)
-                .tint(.white)
-                .accessibilityHidden(true)
-            Text("Loading sources…")
-                .font(.headline)
+    private func sourceList(_ results: AddonStreamResults) -> some View {
+        ScrollViewReader { scroll in
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    if results.streams.isEmpty {
+                        emptyState(results)
+                    } else {
+                        ForEach(results.streams) { stream in
+                            Button { open(stream) } label: {
+                                sourceLabel(stream)
+                            }
+                            .buttonStyle(.card)
+                            .focused($focusedItem, equals: .source(stream.id))
+                            .id(stream.id)
+                            .accessibilityHint(stream.destination.isExternal ? Text("Opens in another app") : Text("Plays this source"))
+                        }
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 42)
+                .padding(.vertical, 12)
+            }
+            .scrollIndicators(.hidden)
+            .task {
+                guard let lastSourceID, preferredFocus == .source(lastSourceID) else { return }
+                scroll.scrollTo(lastSourceID, anchor: .center)
+                await Task.yield()
+                guard !Task.isCancelled, !isClosing, selected == nil else { return }
+                focusedItem = .source(lastSourceID)
+            }
         }
-        .foregroundStyle(.white)
+    }
+
+    private var loadingSources: some View {
+        VStack(spacing: 18) {
+            ForEach(0..<4) { row in
+                HStack(alignment: .top, spacing: 20) {
+                    Circle()
+                        .fill(.white.opacity(0.10))
+                        .frame(width: 28, height: 28)
+                    VStack(alignment: .leading, spacing: 10) {
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(.white.opacity(0.14))
+                            .frame(maxWidth: row.isMultiple(of: 2) ? 250 : 310)
+                            .frame(height: 18)
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(.white.opacity(0.09))
+                            .frame(maxWidth: 120)
+                            .frame(height: 13)
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill(.white.opacity(0.07))
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 13)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 24)
+                .padding(.vertical, 18)
+                .background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 18))
+            }
+        }
         .padding(.horizontal, 42)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .topLeading)
         .focusable()
         .focusEffectDisabled()
         .focused($focusedItem, equals: .status)
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("Loading sources…")
     }
 
     private var header: some View {
@@ -342,7 +373,6 @@ struct TitlePlaybackView: View {
         .padding(.horizontal, 24)
         .padding(.vertical, 18)
     }
-    #endif
 
     private func emptyMessage(_ results: AddonStreamResults) -> String {
         if !request.addons.contains(where: \.enabled) {
@@ -362,7 +392,7 @@ struct TitlePlaybackView: View {
         switch stream.destination {
         case .video:
             lastSourceID = stream.id
-            selected = stream
+            selectSource(stream)
         case .external(let url):
             Task {
                 let opened = await UIApplication.shared.open(url, options: [.universalLinksOnly: true])
@@ -384,9 +414,7 @@ struct TitlePlaybackView: View {
                 return
             }
         }
-        #if !NUVIO_UPSTREAM_PLAYER
         focusedItem = preferredFocus
-        #endif
         if let playerFailure {
             self.playerFailure = nil
             playbackError = playerFailure
@@ -402,9 +430,7 @@ struct TitlePlaybackView: View {
         guard !isClosing else { return }
         lastSourceID = nil
         results = nil
-        #if !NUVIO_UPSTREAM_PLAYER
         focusedItem = .status
-        #endif
         loadAttempt += 1
     }
 
@@ -419,20 +445,12 @@ struct TitlePlaybackView: View {
     }
 }
 
-#if NUVIO_UPSTREAM_PLAYER
-private extension AddonStream {
-    var panelStream: NuvioStream {
-        NuvioStream(url: nil, name: name, description: description, addonName: addon, filename: filename)
-    }
-}
-#else
 private extension AddonStream.Destination {
     var isExternal: Bool {
         if case .external = self { return true }
         return false
     }
 }
-#endif
 
 #if !NUVIO_UPSTREAM_PLAYER
 private struct StreamPlaybackScreen: View {

@@ -234,6 +234,14 @@ struct CinemetaEpisode: Decodable, Identifiable, Sendable {
     let thumbnail: URL?
     let releasedAt: Date?
 
+    func isUpcoming(at date: Date = .now) -> Bool {
+        releasedAt.map { $0 > date } ?? false
+    }
+
+    static func displayAirDate(_ date: Date) -> String {
+        date.formatted(Date.FormatStyle(date: .abbreviated, time: .omitted, timeZone: .gmt))
+    }
+
     private enum CodingKeys: String, CodingKey {
         case id, season, episode, number, name, title, overview, description, thumbnail, released
     }
@@ -321,6 +329,7 @@ struct CinemetaSearchResult: Identifiable, Sendable {
     let kind: CinemetaKind
 
     var id: String { "\(kind.rawValue):\(title.id)" }
+    fileprivate var catalogID: String { title.imdbID ?? id }
 
     private var nameKey: String {
         title.name.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
@@ -345,27 +354,111 @@ struct CinemetaSearchResult: Identifiable, Sendable {
 struct HomeCatalog: Sendable {
     let rows: [HomeCollection]
     let featuredEntries: [CinemetaSearchResult]
+    let collections: [HomeCollection]
+    let genrePreviews: [HomeGenre: [CinemetaSearchResult]]
 
-    var collections: [HomeCollection] { rows.filter { !$0.entries.isEmpty } }
     var hasFailure: Bool { rows.contains(where: \.hasFailure) }
     var isEmpty: Bool { collections.isEmpty }
 
+    init(rows: [HomeCollection], featuredEntries: [CinemetaSearchResult]) {
+        self.rows = rows
+        self.featuredEntries = featuredEntries
+
+        // Allocate chart and release titles first so broader rows can fill from deeper in their feeds.
+        var used = Set(featuredEntries.map(\.catalogID))
+        var selection: [HomeCollection.ID: HomeCollection] = [:]
+        for row in rows.sorted(by: { $0.id.selectionPriority < $1.id.selectionPriority }) {
+            let entries = row.isRanked
+                ? row.entries
+                : Array(row.entries.lazy.filter { !used.contains($0.catalogID) }.prefix(row.id.entryLimit))
+            if !entries.isEmpty {
+                used.formUnion(entries.map(\.catalogID))
+                selection[row.id] = HomeCollection(id: row.id, entries: entries, hasFailure: row.hasFailure)
+            }
+        }
+        collections = rows.compactMap { selection[$0.id] }
+        genrePreviews = Self.makeGenrePreviews(rows: rows, visibleRows: collections)
+    }
+
     func preservingAvailableCollections(from previous: Self?) -> Self {
         guard hasFailure, let previous else { return self }
-        let previousCollections = previous.collections
         let rows = rows.map { row in
             guard row.hasFailure,
-                  let cached = previousCollections.first(where: { $0.id == row.id }) else { return row }
+                  let cached = previous.rows.first(where: { $0.id == row.id && !$0.entries.isEmpty }) else { return row }
             return HomeCollection(id: row.id, entries: cached.entries, hasFailure: true)
         }
         let featured = featuredEntries.isEmpty ? previous.featuredEntries : featuredEntries
         return HomeCatalog(rows: rows, featuredEntries: featured)
     }
+
+    private static func makeGenrePreviews(
+        rows: [HomeCollection], visibleRows: [HomeCollection]
+    ) -> [HomeGenre: [CinemetaSearchResult]] {
+        let editorial = visibleRows.compactMap { row -> HomeGenre? in
+            if case .genre(let genre) = row.id { return genre }
+            return nil
+        }
+        let genres = editorial + HomeGenre.allCases.filter { !editorial.contains($0) }
+        let candidates = visibleRows.flatMap(\.entries) + rows.flatMap(\.entries)
+        var featuredBackdrops = Set<URL>()
+        var previews: [HomeGenre: [CinemetaSearchResult]] = [:]
+
+        for genre in genres {
+            let curated = visibleRows.first(where: { $0.id == .genre(genre) })?.entries ?? []
+            let matching = candidates.filter { genre.matches($0.title.genres) }
+            var ids = Set<String>()
+            var entries = (curated + matching).filter { ids.insert($0.catalogID).inserted }
+            if let index = entries.firstIndex(where: { entry in
+                entry.title.background.map { !featuredBackdrops.contains($0) } ?? false
+            }) {
+                let cover = entries.remove(at: index)
+                entries.insert(cover, at: 0)
+                if let url = cover.title.background { featuredBackdrops.insert(url) }
+            }
+            previews[genre] = Array(entries.prefix(8))
+        }
+        return previews
+    }
 }
 
 struct HomeCollection: Identifiable, Sendable {
     enum ID: Hashable, Sendable {
-        case continueWatching, watching, today, newReleases, topRated, genre(HomeGenre), popularMovies, popularSeries
+        case continueWatching, watching, today, newReleases, newSeries, topRated
+        case genres, genre(HomeGenre), popularMovies, popularSeries
+
+        var title: String {
+            switch self {
+            case .continueWatching: String(localized: "Continue Watching")
+            case .watching: String(localized: "What We’re Watching")
+            case .today: String(localized: "Popular Today")
+            case .newReleases: String(localized: "New Movies")
+            case .newSeries: String(localized: "New TV Shows")
+            case .topRated: String(localized: "Top Rated")
+            case .genres: String(localized: "Browse by Genre")
+            case .genre(let genre): genre.title
+            case .popularMovies: String(localized: "Popular Movies")
+            case .popularSeries: String(localized: "Popular TV Shows")
+            }
+        }
+
+        fileprivate var selectionPriority: Int {
+            switch self {
+            case .today: 0
+            case .newReleases, .newSeries: 1
+            case .topRated: 2
+            case .watching: 3
+            case .genre: 4
+            case .popularMovies, .popularSeries: 5
+            case .genres, .continueWatching: 6
+            }
+        }
+
+        fileprivate var entryLimit: Int {
+            switch self {
+            case .newReleases, .newSeries: 14
+            default: 16
+            }
+        }
     }
 
     let id: ID
@@ -377,32 +470,66 @@ struct HomeCollection: Identifiable, Sendable {
 
 enum HomeGenre: String, CaseIterable, Sendable {
     case action = "Action"
+    case adventure = "Adventure"
+    case animation = "Animation"
     case comedy = "Comedy"
     case crime = "Crime"
-    case horror = "Horror"
-    case scienceFiction = "Sci-Fi"
-    case animation = "Animation"
     case documentary = "Documentary"
     case drama = "Drama"
+    case family = "Family"
+    case fantasy = "Fantasy"
+    case horror = "Horror"
+    case mystery = "Mystery"
+    case romance = "Romance"
+    case scienceFiction = "Sci-Fi"
+    case thriller = "Thriller"
+
+    var name: String {
+        switch self {
+        case .action: String(localized: "Action")
+        case .adventure: String(localized: "Adventure")
+        case .animation: String(localized: "Animation")
+        case .comedy: String(localized: "Comedy")
+        case .crime: String(localized: "Crime")
+        case .documentary: String(localized: "Documentary")
+        case .drama: String(localized: "Drama")
+        case .family: String(localized: "Family")
+        case .fantasy: String(localized: "Fantasy")
+        case .horror: String(localized: "Horror")
+        case .mystery: String(localized: "Mystery")
+        case .romance: String(localized: "Romance")
+        case .scienceFiction: String(localized: "Science Fiction")
+        case .thriller: String(localized: "Thriller")
+        }
+    }
 
     var title: String {
         switch self {
-        case .action: String(localized: "Action")
         case .comedy: String(localized: "Comedy Night")
         case .crime: String(localized: "Crime Stories")
-        case .horror: String(localized: "Horror")
-        case .scienceFiction: String(localized: "Science Fiction")
-        case .animation: String(localized: "Animation")
         case .documentary: String(localized: "Documentaries")
-        case .drama: String(localized: "Drama")
+        case .family: String(localized: "Family Time")
+        default: name
         }
+    }
+
+    fileprivate func matches(_ genres: [String]?) -> Bool {
+        genres?.contains { value in
+            value.caseInsensitiveCompare(rawValue) == .orderedSame
+                || (self == .scienceFiction && value.caseInsensitiveCompare("Science Fiction") == .orderedSame)
+        } ?? false
     }
 
     static func rotation(on date: Date) -> [Self] {
         let week = Int(floor(date.timeIntervalSince1970 / (7 * 86_400)))
-        let count = allCases.count
+        let lineup: [Self] = [
+            .action, .comedy, .documentary, .horror,
+            .romance, .scienceFiction, .crime, .animation,
+            .fantasy, .drama, .family, .thriller, .adventure, .mystery
+        ]
+        let count = lineup.count
         let first = (week % count + count) % count
-        return (0..<3).map { allCases[(first + $0) % count] }
+        return (0..<4).map { lineup[(first + $0) % count] }
     }
 }
 
@@ -422,20 +549,23 @@ struct CinemetaClient: Sendable {
 
     func loadHome(on date: Date = .now) async -> HomeCatalog {
         async let popular = load()
+        async let favorites = betterPostersCatalog(movie: "trakt-popular", series: "trakt-popular")
         async let watching = betterPostersCatalog(movie: "trakt-trending", series: "trakt-trending")
         async let today = betterPostersCatalog(movie: "tmdb-today", series: "tmdb-today-shows")
         async let releases = betterPostersCatalog(movie: "tmdb-latest", series: "tmdb-latest-shows")
         async let genres = genreCollections(on: date)
 
-        let (popularCatalog, watchingCatalog, todayCatalog, releaseCatalog, genreRows) = await (popular, watching, today, releases, genres)
-        let recentTrends = Self.mixedEntries(watchingCatalog, limit: 24)
-        let dailyChart = Self.mixedEntries(todayCatalog, limit: 10)
-        let newReleases = Self.mixedEntries(releaseCatalog, limit: 24)
-        let popularMovies = Self.entries(in: popularCatalog, kind: .movie)
-        let popularSeries = Self.entries(in: popularCatalog, kind: .series)
+        let (popularCatalog, favoriteCatalog, watchingCatalog, todayCatalog, releaseCatalog, genreRows) =
+            await (popular, favorites, watching, today, releases, genres)
+        let recentTrends = Self.mixedEntries(watchingCatalog)
+        let dailyChart = Array(Self.mixedEntries(todayCatalog).prefix(10))
+        let newMovies = Self.entries(in: releaseCatalog, kind: .movie)
+        let newSeries = Self.entries(in: releaseCatalog, kind: .series)
+        let popularMovies = Self.popularEntries(from: favoriteCatalog, fallback: popularCatalog, kind: .movie)
+        let popularSeries = Self.popularEntries(from: favoriteCatalog, fallback: popularCatalog, kind: .series)
         let dailyChartComplete = dailyChart.count == 10 && dailyChart.filter { $0.kind == .movie }.count == 5
-        let needsPopularFallback = watchingCatalog.hasFailure || !dailyChartComplete || recentTrends.isEmpty
-        let rated = (popularMovies + popularSeries + genreRows.flatMap(\.entries))
+        let ranked = dailyChartComplete ? dailyChart : []
+        let rated = (Self.mixedEntries(popularCatalog) + genreRows.flatMap(\.entries))
             .compactMap { entry -> (CinemetaSearchResult, Double)? in
                 guard let rating = entry.title.imdbRating, rating >= 8 else { return nil }
                 return (entry, rating)
@@ -443,28 +573,35 @@ struct CinemetaClient: Sendable {
             .sorted { $0.1 > $1.1 }
             .map(\.0)
 
-        var rows = [
+        let rows = [
             HomeCollection(id: .watching, entries: recentTrends,
                            hasFailure: watchingCatalog.hasFailure || recentTrends.isEmpty),
-            HomeCollection(id: .today, entries: dailyChartComplete ? dailyChart : [],
-                           hasFailure: !dailyChartComplete),
-            HomeCollection(id: .newReleases, entries: newReleases, hasFailure: releaseCatalog.hasFailure),
-            HomeCollection(id: .topRated, entries: Self.uniqueEntries(rated, limit: 24),
+            HomeCollection(id: .today, entries: ranked, hasFailure: !dailyChartComplete),
+            HomeCollection(id: .newReleases, entries: newMovies, hasFailure: releaseCatalog.movies == nil),
+            HomeCollection(id: .newSeries, entries: newSeries, hasFailure: releaseCatalog.series == nil),
+            HomeCollection(id: .topRated, entries: Self.uniqueEntries(rated, limit: rated.count),
                            hasFailure: popularCatalog.hasFailure || genreRows.contains(where: \.hasFailure)),
-        ]
-        rows += genreRows
-        if needsPopularFallback {
-            rows.append(HomeCollection(id: .popularMovies, entries: Array(popularMovies.prefix(24)),
-                                       hasFailure: popularCatalog.movies == nil))
-            rows.append(HomeCollection(id: .popularSeries, entries: Array(popularSeries.prefix(24)),
-                                       hasFailure: popularCatalog.series == nil))
-        }
+            HomeCollection(id: .popularSeries, entries: popularSeries,
+                           hasFailure: favoriteCatalog.series == nil && popularCatalog.series == nil),
+            HomeCollection(id: .popularMovies, entries: popularMovies,
+                           hasFailure: favoriteCatalog.movies == nil && popularCatalog.movies == nil),
+        ] + genreRows
 
         return HomeCatalog(
             rows: rows,
             featuredEntries: Self.featuredEntries(from: [watchingCatalog, todayCatalog, releaseCatalog, popularCatalog],
-                                                  on: date)
+                                                  excluding: Set(ranked.map(\.catalogID)), on: date)
         )
+    }
+
+    func loadGenre(_ genre: HomeGenre, skip: Int = 0) async -> CinemetaCatalog {
+        async let movies = loadGenre(genre, kind: .movie, skip: skip)
+        async let series = loadGenre(genre, kind: .series, skip: skip)
+        return await CinemetaCatalog(movies: movies, series: series)
+    }
+
+    func loadGenre(_ genre: HomeGenre, kind: CinemetaKind, skip: Int) async -> [CinemetaTitle]? {
+        await catalog(kind: kind, filter: ("genre", genre.rawValue), skip: skip)
     }
 
     private func genreCollections(on date: Date) async -> [HomeCollection] {
@@ -472,10 +609,8 @@ struct CinemetaClient: Sendable {
         return await withTaskGroup(of: HomeCollection.self) { group in
             for genre in genres {
                 group.addTask {
-                    async let movies = catalog(kind: .movie, filter: ("genre", genre.rawValue))
-                    async let series = catalog(kind: .series, filter: ("genre", genre.rawValue))
-                    let titles = await CinemetaCatalog(movies: movies, series: series)
-                    return HomeCollection(id: .genre(genre), entries: Self.mixedEntries(titles, limit: 24),
+                    let titles = await loadGenre(genre)
+                    return HomeCollection(id: .genre(genre), entries: Self.mixedEntries(titles),
                                           hasFailure: titles.hasFailure)
                 }
             }
@@ -491,20 +626,31 @@ struct CinemetaClient: Sendable {
         return await CinemetaCatalog(movies: movies, series: shows)
     }
 
-    private static func mixedEntries(_ catalog: CinemetaCatalog, limit: Int) -> [CinemetaSearchResult] {
+    private static func mixedEntries(_ catalog: CinemetaCatalog) -> [CinemetaSearchResult] {
         let movies = entries(in: catalog, kind: .movie)
         let series = entries(in: catalog, kind: .series)
-        return uniqueEntries(interleave(movies, series), limit: limit)
+        return uniqueEntries(interleave(movies, series), limit: movies.count + series.count)
     }
 
-    private static func featuredEntries(from catalogs: [CinemetaCatalog], on date: Date) -> [CinemetaSearchResult] {
+    private static func popularEntries(
+        from catalog: CinemetaCatalog, fallback: CinemetaCatalog, kind: CinemetaKind
+    ) -> [CinemetaSearchResult] {
+        let candidates = entries(in: catalog, kind: kind) + entries(in: fallback, kind: kind)
+        return uniqueEntries(candidates, limit: candidates.count)
+    }
+
+    private static func featuredEntries(
+        from catalogs: [CinemetaCatalog], excluding used: Set<String>, on date: Date
+    ) -> [CinemetaSearchResult] {
         let calendar = Calendar.current
         let localMidnight = calendar.startOfDay(for: date)
         let day = Int(floor((localMidnight.timeIntervalSince1970 + Double(calendar.timeZone.secondsFromGMT(for: localMidnight))) / 86_400))
 
         func rotatedCandidates(for kind: CinemetaKind) -> [CinemetaSearchResult] {
             let candidates = catalogs.flatMap { catalog in
-                entries(in: catalog, kind: kind).lazy.filter { $0.title.background != nil }.prefix(8)
+                entries(in: catalog, kind: kind).lazy
+                    .filter { $0.title.background != nil && !used.contains($0.catalogID) }
+                    .prefix(8)
             }
             // An unchanged pool keeps its lineup even when a feed shuffles its ranking.
             let pool = uniqueEntries(candidates, limit: candidates.count).sorted {
@@ -537,7 +683,7 @@ struct CinemetaClient: Sendable {
     private static func uniqueEntries(_ entries: [CinemetaSearchResult], limit: Int) -> [CinemetaSearchResult] {
         var seen = Set<String>()
         var result: [CinemetaSearchResult] = []
-        for entry in entries where seen.insert(entry.title.imdbID ?? entry.id).inserted {
+        for entry in entries where seen.insert(entry.catalogID).inserted {
             result.append(entry)
             if result.count == limit { break }
         }
@@ -574,14 +720,20 @@ struct CinemetaClient: Sendable {
         case betterPosters = "btttr.cc"
     }
 
-    private func catalog(kind: CinemetaKind, filter: (name: String, value: String)?, id: String = "top", source: CatalogSource = .cinemeta) async -> [CinemetaTitle]? {
+    private func catalog(
+        kind: CinemetaKind, filter: (name: String, value: String)?, id: String = "top",
+        source: CatalogSource = .cinemeta, skip: Int = 0
+    ) async -> [CinemetaTitle]? {
         var path = "/catalog/\(kind.rawValue)/\(id)"
+        var extra: [String] = []
         if let filter {
             // Stremio transports catalog filters as encoded path segments.
             let unreserved = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~")
             guard let value = filter.value.addingPercentEncoding(withAllowedCharacters: unreserved) else { return nil }
-            path += "/\(filter.name)=\(value)"
+            extra.append("\(filter.name)=\(value)")
         }
+        if skip > 0 { extra.append("skip=\(skip)") }
+        if !extra.isEmpty { path += "/" + extra.joined(separator: "&") }
         guard let response = await fetch(CatalogResponse.self, path: path + ".json", source: source) else { return nil }
         var seen = Set<String>()
         return response.metas.compactMap { entry in
