@@ -1,0 +1,352 @@
+diff --git a/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift b/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift
+index d32d8a9..06fe7f5 100644
+--- a/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift
+@@ -117,10 +117,8 @@ enum MPVPlaybackLifecyclePolicy {
+     }
+ }
+ 
+-/// MPV exposes an external subtitle filename for applicable tracks, but this
+-/// bridge does not expose a complete parsed cue list. `sub-text` is therefore
+-/// the only safe input here: translate one active cue at a time while the host
+-/// overlay keeps the original visible until the response arrives.
++/// Presents the current MPV text cue in the host overlay for rounded
++/// backgrounds and translates one cue at a time when AI is enabled.
+ @MainActor
+ final class MPVSubtitleTranslationState: ObservableObject {
+     typealias TranslationRequest = (
+@@ -130,6 +128,7 @@ final class MPVSubtitleTranslationState: ObservableObject {
+     @Published private(set) var sourceText = ""
+     @Published private(set) var translatedText: String?
+     @Published private(set) var isTranslating = false
++    @Published private var styledSourceText: String?
+ 
+     var onFirstOutcome: ((Result<Void, Error>) -> Void)?
+ 
+@@ -164,12 +163,19 @@ final class MPVSubtitleTranslationState: ObservableObject {
+     }
+ 
+     var shouldDisplayOverlay: Bool {
+-        isActive && !sourceText.isEmpty
++        displayText != nil
+     }
+ 
+     var displayText: String? {
+-        guard shouldDisplayOverlay else { return nil }
+-        return translatedText ?? sourceText
++        if !sourceText.isEmpty && isActive {
++            return translatedText ?? sourceText
++        }
++        return styledSourceText
++    }
++
++    func updateStyledSourceText(_ text: String?) {
++        guard styledSourceText != text else { return }
++        styledSourceText = text
+     }
+ 
+     func setManualActivation(_ enabled: Bool) {
+@@ -192,10 +198,8 @@ final class MPVSubtitleTranslationState: ObservableObject {
+                 || currentSettings != settings {
+                 deactivate()
+             } else {
+-                sourceText = ""
+                 currentSource = nil
+-                translatedText = nil
+-                isTranslating = false
++                clearTranslationPresentation()
+             }
+             return
+         }
+@@ -271,6 +275,7 @@ final class MPVSubtitleTranslationState: ObservableObject {
+         sourceText = ""
+         translatedText = nil
+         isTranslating = false
++        updateStyledSourceText(nil)
+         manualActivation = false
+         didReportSuccess = false
+         didReportFailure = false
+@@ -376,14 +381,18 @@ final class MPVSubtitleTranslationState: ObservableObject {
+         currentSource = nil
+         currentSettings = nil
+         sessionID = UUID()
+-        sourceText = ""
+-        translatedText = nil
+-        isTranslating = false
++        clearTranslationPresentation()
+         failedSourceTexts = []
+         hasPermanentProviderFailure = false
+         needsReevaluation = false
+     }
+ 
++    private func clearTranslationPresentation() {
++        if !sourceText.isEmpty { sourceText = "" }
++        if translatedText != nil { translatedText = nil }
++        if isTranslating { isTranslating = false }
++    }
++
+     private func refreshCurrentPresentation() {
+         guard let currentSource else {
+             translatedText = nil
+@@ -1055,7 +1064,6 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
+     private var audioSelectionGeneration: UInt64 = 0
+     private var desiredAudioSelection: DesiredTrackSelection?
+     let subtitleTranslationState = MPVSubtitleTranslationState()
+-    private var isMPVSubtitleRendererHiddenForTranslation = false
+     private var playerControlsVisibleForSubtitles = false
+     private var subtitleStyleViewportHeight: CGFloat = 0
+ 
+@@ -1300,23 +1308,17 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
+         if let slang = SubtitleLanguagePreferences.mpvLanguageList(for: preferredSubtitleLanguages) {
+             checkError(mpv_set_option_string(mpv, "slang", slang))
+         }
+-        // ASS/SSA override: Off (default) preserves original authored styling and positioning;
+-        // Strip flattens styling into app subtitle style; Scale keeps layout with size adjust;
+-        // Force applies style more aggressively.
+-        let assMode = (ProfileSettings.current.string(forKey: SettingsKey.assOverrideMode) ?? "Off")
+-            .trimmingCharacters(in: .whitespacesAndNewlines)
+-            .lowercased()
+-        let assOverride: String
+-        switch assMode {
+-        case "scale": assOverride = "scale"
+-        case "force": assOverride = "force"
+-        case "strip": assOverride = "strip"
+-        case "off", "no", "disabled", "native", "authored", "none": assOverride = "no"
+-        default: assOverride = "no"
+-        }
+-        checkError(mpv_set_option_string(mpv, "sub-ass-override", assOverride))
++        // MPV keeps drawing bitmap subtitles. Make its text renderer transparent
++        // before the first cue so only the host overlay draws visible text.
++        checkError(mpv_set_option_string(mpv, "sub-ass", "no"))
++        checkError(mpv_set_option_string(mpv, "sub-ass-override", "no"))
++        checkError(mpv_set_option_string(mpv, "sub-color", "#00FFFFFF"))
++        checkError(mpv_set_option_string(mpv, "sub-outline-color", "#00000000"))
++        checkError(mpv_set_option_string(mpv, "sub-back-color", "#00000000"))
++        checkError(mpv_set_option_string(mpv, "sub-outline-size", "0"))
++        checkError(mpv_set_option_string(mpv, "sub-shadow-offset", "0"))
++        checkError(mpv_set_option_string(mpv, "sub-border-style", "outline-and-shadow"))
+         checkError(mpv_set_option_string(mpv, "sub-use-margins", "yes"))
+-        checkError(mpv_set_option_string(mpv, "sub-ass-force-margins", assOverride == "no" ? "no" : "yes"))
+         checkError(mpv_set_option_string(mpv, "keep-open", "yes"))
+         checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
+         checkError(mpv_set_option_string(mpv, "tone-mapping", "auto"))
+@@ -1368,8 +1370,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
+         // moment a selection actually changes. See `refreshTracks`.
+         mpv_observe_property(mpv, 0, "aid", MPV_FORMAT_STRING)
+         mpv_observe_property(mpv, 0, "sid", MPV_FORMAT_STRING)
+-        // Available for text tracks even when `sub-visibility` is off, which
+-        // lets the host overlay replace MPV's renderer without losing cues.
++        // The host overlay follows changes to the active plain-text cue.
+         mpv_observe_property(mpv, 0, "sub-text", MPV_FORMAT_STRING)
+ 
+         mpv_set_wakeup_callback(mpv, { ctx in
+@@ -1655,8 +1656,6 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
+         applyHTTPHeaders(pendingHTTPHeaders, isLiveStream: pendingIsLiveStream)
+         pendingHTTPHeaders = [:]
+         subtitleTranslationState.reset()
+-        isMPVSubtitleRendererHiddenForTranslation = false
+-        setFlag("sub-visibility", true)
+         lifecyclePositionMs = nil
+         lifecycleDurationMs = nil
+         lastVerifiedPositionMs = nil
+@@ -2304,15 +2303,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
+         let style = SubtitleStyle.current
+         setStringProperty("sub-scale", String(format: "%.3f", style.subScale))
+         setStringProperty("sub-bold", style.bold ? "yes" : "no")
+-        setStringProperty("sub-outline-size", String(format: "%.3f", style.subOutlineSize))
+         setStringProperty("sub-margin-y", String(style.subMarginY))
+         setStringProperty("sub-margin-x", String(style.subMarginX))
+         setStringProperty("sub-spacing", String(style.subSpacing))
+-        setStringProperty("sub-shadow-offset", style.backgroundEnabled ? "4" : "0")
+-        setStringProperty("sub-border-style", style.backgroundEnabled ? "background-box" : "outline-and-shadow")
+-        setStringProperty("sub-color", style.subColor)
+-        setStringProperty("sub-outline-color", style.subOutlineColor)
+-        setStringProperty("sub-back-color", style.subBackgroundColor)
+         if !style.mpvFontName.isEmpty {
+             setStringProperty("sub-font", style.mpvFontName)
+         } else {
+@@ -2365,7 +2358,6 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
+         NotificationCenter.default.removeObserver(self)
+         pendingURL = nil
+         subtitleTranslationState.reset()
+-        isMPVSubtitleRendererHiddenForTranslation = false
+         pendingLoadConfiguration = nil
+         resetStartupDisplayGateState(clearAnchor: true)
+         clearDisplayCriteria()
+@@ -2559,18 +2551,15 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
+         #if os(tvOS) || os(iOS)
+         updateMPVNowPlayingInfo()
+         #endif
+-        refreshSubtitleTranslation()
++        refreshSubtitles()
+     }
+ 
+-    private func refreshSubtitleTranslation() {
++    private func refreshSubtitles() {
+         guard mpv != nil else { return }
+-        subtitleTranslationState.update(sourceText: getString("sub-text") ?? "")
+-        let shouldHideRenderer = subtitleTranslationState.shouldDisplayOverlay
+-        guard shouldHideRenderer != isMPVSubtitleRendererHiddenForTranslation else { return }
+-        isMPVSubtitleRendererHiddenForTranslation = shouldHideRenderer
+-        // MPV continues decoding `sub-text` while invisible, so original text
+-        // is immediately available in the host overlay until Gemini responds.
+-        setFlag("sub-visibility", !shouldHideRenderer)
++        // MPV returns plain text for every text format and no text for bitmap cues.
++        let text = getString("sub-text")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
++        subtitleTranslationState.update(sourceText: text)
++        subtitleTranslationState.updateStyledSourceText(text.isEmpty ? nil : text)
+     }
+ 
+     func updateState() {
+@@ -3738,6 +3727,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
+                 case MPV_EVENT_END_FILE:
+                     DispatchQueue.main.async {
+                         self.subtitleTranslationState.cancelPendingTranslations()
++                        self.subtitleTranslationState.updateStyledSourceText(nil)
+                     }
+                     if let data = eventPtr.pointee.data {
+                         let endFile = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee
+diff --git a/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift b/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift
+index 183eebe..7b392c0 100644
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift
+@@ -266,10 +266,8 @@ struct PlayerSubtitleOverlay: View {
+     }
+ }
+ 
+-/// MPV decodes its active text subtitle through `sub-text`. When AI
+-/// translation is active MPV's own renderer stays hidden, and this host layer
+-/// immediately renders the original text until the translated replacement is
+-/// available. Bitmap subtitles remain entirely under MPV's renderer.
++/// Renders MPV text with the shared rounded background. While AI is
++/// translating, the overlay shows the original cue until the result arrives.
+ struct MPVSubtitleOverlay: View {
+     @ObservedObject var translation: MPVSubtitleTranslationState
+     let videoNaturalSize: CGSize
+@@ -280,11 +278,6 @@ struct MPVSubtitleOverlay: View {
+     private var textSize: CGFloat {
+         min(max(CGFloat(style.textSize) / 100 * 55, 2), 125)
+     }
+-    private var outlineWidth: CGFloat {
+-        guard style.outlineEnabled else { return 0 }
+-        let configured = CGFloat(min(max(style.outlineWidth, 1), 8))
+-        return min(configured, max(0.5, textSize * 0.3))
+-    }
+     private var isTopAligned: Bool { style.verticalAlignment.caseInsensitiveCompare("Top") == .orderedSame }
+     private var controlsVisibleOffset: CGFloat {
+         controlsVisible && !isTopAligned ? -PlayerSubtitleLayoutMetrics.controlsVisibleLiftPoints : 0
+@@ -294,18 +287,18 @@ struct MPVSubtitleOverlay: View {
+ 
+     var body: some View {
+         GeometryReader { geo in
+-            if let text = translation.displayText {
++            if let text = translation.displayText, !text.isEmpty {
+                 let videoRect = displayedVideoRect(
+                     container: geo.size,
+                     video: videoNaturalSize,
+                     mode: aspectMode
+                 )
+                 let appearance = subtitleTextAppearance(
+-                    style: style, textSize: textSize, outlineWidth: outlineWidth, alignment: .center
++                    style: style, textSize: textSize, alignment: .center
+                 )
+                 VStack(spacing: 8) {
+                     OutlinedSubtitleText(SubtitleAttributedText.make(plain: text, appearance: appearance), appearance: appearance)
+-                        .subtitleBackground(style: style)
++                        .subtitleBackground()
+                     if translation.isTranslating {
+                         HStack(spacing: 5) {
+                             Image(systemName: "sparkles")
+@@ -382,80 +375,27 @@ struct MPVSubtitleOverlay: View {
+     }
+ }
+ 
+-/// Place ASS text at its authored alignment or explicit \pos anchor inside the video frame.
+-private struct SubtitleCuePlacementLayout: Layout {
+-    let placement: SubtitleTextPlacement
+-    let horizontalMargin: CGFloat
+-    let verticalMargin: CGFloat
+-
+-    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+-        CGSize(width: proposal.width ?? 0, height: proposal.height ?? 0)
+-    }
+-
+-    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+-        guard let subview = subviews.first else { return }
+-        let alignment = (1...9).contains(placement.alignment ?? 2) ? (placement.alignment ?? 2) : 2
+-        let anchorX = CGFloat((alignment - 1) % 3) / 2
+-        let anchorY = 1 - CGFloat((alignment - 1) / 3) / 2
+-        let point: CGPoint
+-        if let position = placement.position {
+-            point = CGPoint(
+-                x: bounds.minX + position.x * bounds.width,
+-                y: bounds.minY + position.y * bounds.height
++extension View {
++    func subtitleBackground() -> some View {
++        padding(.horizontal, 12)
++            .padding(.vertical, 6)
++            .background(
++                .black.opacity(Double(SubtitleStyleDefaults.backgroundOpacity) / 100),
++                in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+             )
+-        } else {
+-            point = CGPoint(
+-                x: bounds.minX + horizontalMargin + anchorX * max(bounds.width - 2 * horizontalMargin, 0),
+-                y: bounds.minY + verticalMargin + anchorY * max(bounds.height - 2 * verticalMargin, 0)
+-            )
+-        }
+-        let maxWidth = max(bounds.width - 2 * horizontalMargin, 1)
+-        let width = min(subview.sizeThatFits(.unspecified).width, maxWidth)
+-        subview.place(
+-            at: point,
+-            anchor: UnitPoint(x: anchorX, y: anchorY),
+-            proposal: ProposedViewSize(width: width, height: nil)
+-        )
+-    }
+-}
+-
+-private struct SubtitleBackgroundModifier: ViewModifier {
+-    let style: SubtitleStyle
+-
+-    @ViewBuilder
+-    func body(content: Content) -> some View {
+-        if style.backgroundEnabled {
+-            content
+-                .padding(.horizontal, 12)
+-                .padding(.vertical, 6)
+-                .background(
+-                    Color(hex: style.backgroundColorHex)
+-                        .opacity(Double(min(max(style.backgroundOpacity, 0), 100)) / 100),
+-                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+-                )
+-        } else {
+-            content
+-        }
+-    }
+-}
+-
+-private extension View {
+-    func subtitleBackground(style: SubtitleStyle) -> some View {
+-        modifier(SubtitleBackgroundModifier(style: style))
+     }
+ }
+ 
+-/// The host-drawn subtitle look from the user's subtitle style.
+-func subtitleTextAppearance(style: SubtitleStyle, textSize: CGFloat, outlineWidth: CGFloat,
++func subtitleTextAppearance(style: SubtitleStyle, textSize: CGFloat,
+                             alignment: TextAlignment) -> SubtitleTextAppearance {
+     SubtitleTextAppearance(
+         fontSize: textSize,
+         fontFamily: SubtitleFontFamily(styleFontName: style.fontName),
+         bold: style.bold,
+-        color: UIColor(Color(hex: style.textColorHex)),
+-        opacity: CGFloat(min(max(style.textOpacity, 0), 100)) / 100,
+-        outlineColor: UIColor(Color(hex: style.outlineColorHex)),
+-        outlineWidth: outlineWidth,
++        color: .white,
++        opacity: 1,
++        outlineColor: .clear,
++        outlineWidth: 0,
+         kerning: CGFloat(style.subSpacing),
+         alignment: {
+             switch alignment {

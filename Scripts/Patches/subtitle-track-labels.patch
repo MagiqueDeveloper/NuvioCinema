@@ -1,0 +1,161 @@
+diff --git a/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift b/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift
+index 2d5b580..6c645f6 100644
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift
+@@ -2165,31 +2165,30 @@ enum SubtitleMenuFormatter {
+         return (title: displayTitle, subtitle: nil)
+     }
+ 
+-    static func groupedExternalMenuLabels(option: SubtitlePanelOption) -> (title: String, subtitle: String?) {
+-        let addon = option.badge.isEmpty ? "External" : option.badge
+-        let cleanLabel = sanitizeSubtitleLabel(option.detail)
++    static func externalName(_ raw: String?, language: String) -> String? {
++        guard let label = sanitizeSubtitleLabel(raw), !label.contains("://"),
++              label.caseInsensitiveCompare(language) != .orderedSame,
++              label.caseInsensitiveCompare("External") != .orderedSame else { return nil }
++        return label
++    }
+ 
+-        if let cleanLabel, cleanLabel.caseInsensitiveCompare(option.language) != .orderedSame {
+-            if cleanLabel.caseInsensitiveCompare(addon) == .orderedSame
+-                || addon.localizedCaseInsensitiveContains(cleanLabel)
+-                || cleanLabel.localizedCaseInsensitiveContains(addon) {
+-                return (title: addon, subtitle: nil)
+-            }
+-            return (title: cleanLabel, subtitle: addon)
++    static func groupedExternalMenuLabels(option: SubtitlePanelOption) -> (title: String, subtitle: String?) {
++        let provider = option.badge.isEmpty ? nil : option.badge
++        let suppliedLabel: String?
++        if case .external(let subtitle) = option.kind {
++            suppliedLabel = subtitle.label
++        } else {
++            suppliedLabel = nil
+         }
+-
+-        let title = option.title.trimmingCharacters(in: .whitespacesAndNewlines)
+-        if !title.isEmpty,
+-           title.caseInsensitiveCompare(option.language) != .orderedSame {
+-            if title.caseInsensitiveCompare(addon) == .orderedSame
+-                || addon.localizedCaseInsensitiveContains(title)
+-                || title.localizedCaseInsensitiveContains(addon) {
+-                return (title: addon, subtitle: nil)
+-            }
+-            return (title: title, subtitle: addon)
++        let name = externalName(option.title, language: option.language)
++            ?? externalName(suppliedLabel, language: option.language)
++        let note = option.detail == suppliedLabel ? nil : option.detail
++        guard let name else { return (title: provider ?? option.language, subtitle: note) }
++        if let provider, provider.localizedCaseInsensitiveContains(name) {
++            return (title: provider, subtitle: note)
+         }
+-
+-        return (title: addon, subtitle: nil)
++        let details = [provider, note].compactMap { $0 }.joined(separator: " · ")
++        return (title: name, subtitle: details.isEmpty ? nil : details)
+     }
+ 
+     static func optionDisplayTitle(for option: SubtitlePanelOption) -> String {
+@@ -2219,20 +2218,32 @@ enum SubtitleMenuFormatter {
+ private func subtitlePanelOptions(for viewModel: PlayerViewModel) -> [SubtitlePanelOption] {
+     let externalUrls = Set(viewModel.availableExternalSubtitles.map(\.url))
+     var options: [SubtitlePanelOption] = []
++    var unnamedTrackCounts: [String: Int] = [:]
++
++    func externalTitle(_ label: String?, language: String, provider: String? = nil) -> String {
++        if let name = SubtitleMenuFormatter.externalName(label, language: language),
++           provider?.localizedCaseInsensitiveContains(name) != true {
++            return name
++        }
++        let number = unnamedTrackCounts[language, default: 0] + 1
++        unnamedTrackCounts[language] = number
++        return String(localized: "\(language) \(number)")
++    }
+ 
+     for track in viewModel.subtitles where track.id != "off" {
+         // Loaded add-on subtitles are rendered from the add-on list below;
+         // listing their mpv track too would duplicate the row.
+         if !track.externalFilename.isEmpty, externalUrls.contains(track.externalFilename) { continue }
+         let isExternal = !track.externalFilename.isEmpty
+-        let rawLanguage = track.language.isEmpty ? track.name : track.language
++        let rawLanguage = track.language.isEmpty && !isExternal ? track.name : track.language
++        let language = SubtitleLanguageDisplay.name(for: rawLanguage)
+         options.append(SubtitlePanelOption(
+             id: "track-\(track.id)",
+             kind: .track(track),
+-            badge: isExternal ? "External" : "Built in",
+-            title: track.name,
++            badge: isExternal ? "" : "Built in",
++            title: isExternal ? externalTitle(track.name, language: language) : track.name,
+             detail: nil,
+-            language: SubtitleLanguageDisplay.name(for: rawLanguage),
++            language: language,
+             isSelected: track.isSelected
+         ))
+     }
+@@ -2241,16 +2252,15 @@ private func subtitlePanelOptions(for viewModel: PlayerViewModel) -> [SubtitlePa
+         let language = SubtitleLanguageDisplay.name(for: subtitle.language)
+         let loadedTrack = viewModel.subtitles.first { $0.externalFilename == subtitle.url }
+         let label = subtitle.label.flatMap { label in
+-            label.caseInsensitiveCompare(language) == .orderedSame ? nil : label
++            label.caseInsensitiveCompare(subtitle.language) == .orderedSame ? nil : label
+         }
+-        let notes = [label, viewModel.subtitleAutoSyncNote(for: subtitle.url)].compactMap { $0 }
+-        let detail = notes.isEmpty ? nil : notes.joined(separator: " · ")
++        let name = SubtitleMenuFormatter.externalName(label, language: language) ?? loadedTrack?.name
+         options.append(SubtitlePanelOption(
+             id: "ext-\(subtitle.url)",
+             kind: .external(subtitle),
+-            badge: subtitle.source ?? "External",
+-            title: language,
+-            detail: detail,
++            badge: subtitle.source ?? "",
++            title: externalTitle(name, language: language, provider: subtitle.source),
++            detail: viewModel.subtitleAutoSyncNote(for: subtitle.url),
+             language: language,
+             isSelected: loadedTrack?.isSelected ?? false
+         ))
+@@ -2824,14 +2834,16 @@ struct PlayerSettingsPanel: View {
+         } label: {
+             HStack(alignment: .center, spacing: 14) {
+                 VStack(alignment: .leading, spacing: 8) {
+-                    Text(option.badge)
+-                        .font(.system(size: 17, weight: .semibold))
+-                        .foregroundColor(isFocused ? .black.opacity(0.66) : .white.opacity(0.72))
+-                        .padding(.horizontal, 12)
+-                        .padding(.vertical, 4)
+-                        .background(
+-                            Capsule().fill(isFocused ? Color.black.opacity(0.10) : Color.white.opacity(0.14))
+-                        )
++                    if !option.badge.isEmpty {
++                        Text(option.badge)
++                            .font(.system(size: 17, weight: .semibold))
++                            .foregroundColor(isFocused ? .black.opacity(0.66) : .white.opacity(0.72))
++                            .padding(.horizontal, 12)
++                            .padding(.vertical, 4)
++                            .background(
++                                Capsule().fill(isFocused ? Color.black.opacity(0.10) : Color.white.opacity(0.14))
++                            )
++                    }
+                     Text(option.title)
+                         .font(.system(size: 28, weight: .semibold))
+                         .foregroundColor(isFocused ? .black : .white)
+diff --git a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+index 97c9390..77c5054 100644
+--- a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+@@ -1836,9 +1836,14 @@ class PlayerViewModel: ObservableObject {
+             existingIndices[sub.url] = index
+         }
+ 
+-        for sub in fetched {
++        for fetchedSubtitle in fetched {
++            var sub = fetchedSubtitle
+             if let index = existingIndices[sub.url] {
+                 let existing = availableExternalSubtitles[index]
++                sub = NuvioSubtitle(
++                    url: sub.url, language: sub.language, label: sub.label ?? existing.label,
++                    source: sub.source ?? existing.source
++                )
+                 if existing != sub {
+                     availableExternalSubtitles[index] = sub
+                     hasChanges = true

@@ -122,15 +122,23 @@ struct HomeView: View {
     @Environment(\.scenePhase) private var scenePhase
     @Environment(NuvioAccount.self) private var account
     @Environment(CinemaTitleNavigation.self) private var titles
+    @Environment(\.resetFocus) private var resetFocus
+    @Namespace private var focusScope
     @State private var catalog: HomeCatalog?
     @State private var pendingCatalog: HomeCatalog?
     @State private var continueWatching: [CinemaContinueWatchingItem] = []
     @State private var lastRefresh: ContinuousClock.Instant?
     @State private var retryCount = 0
     @State private var completedRequest: Int?
-    @State private var detailOrigin: HomeFocusTarget?
+    @State private var detailOrigin: DetailOrigin?
+    @State private var verticalPosition = ScrollPosition()
     @State private var isBelowHero = false
     @FocusState private var focusedItem: HomeFocusTarget?
+
+    private struct DetailOrigin: Equatable {
+        let target: HomeFocusTarget
+        let verticalOffset: CGFloat
+    }
 
     private struct LoadRequest: Equatable {
         let isAvailable: Bool
@@ -147,12 +155,27 @@ struct HomeView: View {
     }
 
     private var canApplyCatalog: Bool {
-        isAvailable && focusedItem == nil && carousel.slide == nil
+        isAvailable && detailOrigin == nil && focusedItem == nil && carousel.slide == nil
     }
 
     private var canApplyContinueWatching: Bool {
         if case .poster? = focusedItem { return false }
-        return isAvailable && carousel.slide == nil
+        return isAvailable && detailOrigin == nil && carousel.slide == nil
+    }
+
+    private var preferredReturnFocus: HomeFocusTarget? {
+        guard let detailOrigin else { return nil }
+        switch detailOrigin.target {
+        case .poster(.continueWatching, let id):
+            let current = account.continueWatching
+            if current.contains(where: { $0.id == id }) { return detailOrigin.target }
+            if let first = current.first { return .poster(.continueWatching, first.id) }
+            if let firstRow = catalog?.collections.first(where: { !$0.entries.isEmpty }),
+               let first = firstRow.entries.first { return .poster(firstRow.id, first.id) }
+            return carousel.entries.isEmpty ? nil : .hero
+        default:
+            return detailOrigin.target
+        }
     }
 
     var body: some View {
@@ -165,6 +188,10 @@ struct HomeView: View {
             .ignoresSafeArea(.container, edges: .leading)
         }
         .ignoresSafeArea(.container, edges: [.trailing, .bottom])
+        .focusScope(focusScope)
+        .task(id: isAvailable ? detailOrigin : nil) {
+            if isAvailable, let detailOrigin { await restoreFocus(from: detailOrigin) }
+        }
         .task(id: request) {
             await refreshCatalog(for: request)
         }
@@ -203,6 +230,8 @@ struct HomeView: View {
                             isActive: isAvailable,
                             carousel: $carousel,
                             focus: $focusedItem,
+                            focusScope: focusScope,
+                            prefersFocus: preferredReturnFocus == .hero,
                             onSelect: { showDetails($0, from: .hero) }
                         )
                         .padding(.leading, leadingInset)
@@ -210,7 +239,8 @@ struct HomeView: View {
 
                     VStack(alignment: .leading, spacing: 22) {
                         CatalogShelves(collections: catalog?.collections ?? [], continueWatching: continueWatching,
-                                       posterLayout: posterLayout, landscapeLayout: landscapeLayout, focus: $focusedItem) { item, shelf in
+                                       posterLayout: posterLayout, landscapeLayout: landscapeLayout, focus: $focusedItem,
+                                       focusScope: focusScope, returnFocus: preferredReturnFocus, isRestoringFocus: isAvailable) { item, shelf in
                             showDetails(item.entry, from: .poster(shelf, item.id))
                         }
                         if catalog?.hasFailure == true {
@@ -232,6 +262,7 @@ struct HomeView: View {
                 }
             }
         }
+        .scrollPosition($verticalPosition)
         .scrollTargetBehavior(HomeHeroScrollBehavior(shelfOffset: shelfOffset, isBelowHero: isBelowHero))
         .scrollIndicators(.hidden)
         .onScrollGeometryChange(for: HomeHeroScrollPosition.self) { geometry in
@@ -252,15 +283,40 @@ struct HomeView: View {
 
     private func showDetails(_ entry: CinemetaSearchResult, from origin: HomeFocusTarget) {
         guard titles.screens.isEmpty else { return }
-        detailOrigin = origin
-        titles.show(onDismiss: restoreFocus) { close in
+        detailOrigin = DetailOrigin(target: origin, verticalOffset: heroScroll.position.distance)
+        titles.show { close in
             TitleDetailsView(title: entry.title, kind: entry.kind, onDismiss: close)
         }
     }
 
-    private func restoreFocus() {
-        if let detailOrigin, isActive { focusedItem = detailOrigin }
-        detailOrigin = nil
+    private func restoreFocus(from origin: DetailOrigin) async {
+        let target = preferredReturnFocus
+        if case .poster(.continueWatching, let id) = origin.target,
+           !account.continueWatching.contains(where: { $0.id == id }) {
+            continueWatching = account.continueWatching
+        }
+        guard let target else {
+            detailOrigin = nil
+            return
+        }
+        let offset = target == .hero ? 0 : origin.verticalOffset
+        if abs(heroScroll.position.distance - offset) > 1 {
+            var transaction = Transaction(animation: nil)
+            transaction.disablesAnimations = true
+            withTransaction(transaction) { verticalPosition.scrollTo(y: offset) }
+        }
+        // Both scroll views need to lay out the preferred card after Home becomes available.
+        do {
+            try await Task.sleep(for: .milliseconds(50))
+            if focusedItem != target {
+                resetFocus(in: focusScope)
+                focusedItem = target
+            }
+            try await Task.sleep(for: .milliseconds(150))
+            detailOrigin = nil
+        } catch {
+            // A new title or a change of tab invalidates this focus update.
+        }
     }
 
     private func retry() {
@@ -317,6 +373,8 @@ private struct FeaturedHero: View {
     let isActive: Bool
     @Binding var carousel: HeroCarousel
     let focus: FocusState<HomeFocusTarget?>.Binding
+    let focusScope: Namespace.ID
+    let prefersFocus: Bool
     let onSelect: (CinemetaSearchResult) -> Void
 
     @Environment(\.scenePhase) private var scenePhase
@@ -481,6 +539,7 @@ private struct FeaturedHero: View {
                     Label("View Details", systemImage: "info.circle")
                 }
                 .focused(focus, equals: .hero)
+                .prefersDefaultFocus(prefersFocus, in: focusScope)
                 .onMoveCommand { direction in
                     if direction == .left { move(-1) }
                     if direction == .right && entries.count > 1 { focus.wrappedValue = .nextFeatured }
@@ -729,17 +788,22 @@ private struct CatalogShelves: View {
     let posterLayout: HomeShelfLayout
     let landscapeLayout: HomeShelfLayout
     let focus: FocusState<HomeFocusTarget?>.Binding
+    let focusScope: Namespace.ID
+    let returnFocus: HomeFocusTarget?
+    let isRestoringFocus: Bool
     let onSelect: (HomeShelfItem, HomeCollection.ID) -> Void
 
     var body: some View {
         LazyVStack(alignment: .leading, spacing: 32) {
             if !continueWatching.isEmpty {
                 CatalogShelf(shelf: .continueWatching, items: continueWatching.map { HomeShelfItem(entry: $0.entry, watching: $0) },
-                             layout: landscapeLayout, focus: focus, onSelect: onSelect)
+                             layout: landscapeLayout, focus: focus, focusScope: focusScope, returnFocus: returnFocus,
+                             isRestoringFocus: isRestoringFocus, onSelect: onSelect)
             }
             ForEach(collections) { collection in
                 CatalogShelf(shelf: collection.id, items: collection.entries.map { HomeShelfItem(entry: $0) },
-                             layout: posterLayout, focus: focus, onSelect: onSelect)
+                             layout: posterLayout, focus: focus, focusScope: focusScope, returnFocus: returnFocus,
+                             isRestoringFocus: isRestoringFocus, onSelect: onSelect)
             }
         }
     }
@@ -750,10 +814,18 @@ private struct CatalogShelf: View {
     let items: [HomeShelfItem]
     let layout: HomeShelfLayout
     let focus: FocusState<HomeFocusTarget?>.Binding
+    let focusScope: Namespace.ID
+    let returnFocus: HomeFocusTarget?
+    let isRestoringFocus: Bool
     let onSelect: (HomeShelfItem, HomeCollection.ID) -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var firstVisibleIndex = 0
+
+    private var returnItemID: String? {
+        guard case let .poster(returnShelf, id)? = returnFocus, returnShelf == shelf else { return nil }
+        return id
+    }
 
     private var heading: Text {
         switch shelf {
@@ -796,6 +868,7 @@ private struct CatalogShelf: View {
                                 }
                             }
                             .focused(focus, equals: .poster(shelf, item.id))
+                            .prefersDefaultFocus(item.id == returnItemID, in: focusScope)
                             .accessibilityLabel(accessibilityLabel(for: item, rank: rank))
                             .accessibilityHint(item.watching == nil ? Text("") : Text("Opens title details"))
                             .padding(.leading, layout.inset + (index == 0 ? layout.leadingInset : 0))
@@ -815,10 +888,15 @@ private struct CatalogShelf: View {
                 .clipped()
                 .padding(.vertical, -28)
                 .buttonStyle(.borderless)
+                .onChange(of: isRestoringFocus ? returnItemID : nil, initial: true) { _, id in
+                    guard let id, let index = items.firstIndex(where: { $0.id == id }) else { return }
+                    firstVisibleIndex = leadingIndex(for: index)
+                    scrollTo(firstVisibleIndex, using: scroll)
+                }
                 .onChange(of: focus.wrappedValue) { _, next in
                     guard case let .poster(focusedShelf, id)? = next, focusedShelf == shelf,
                           let index = items.firstIndex(where: { $0.id == id }) else { return }
-                    let firstIndex = min(index, max(firstVisibleIndex, index - layout.cardsPerRow + 1))
+                    let firstIndex = leadingIndex(for: index)
                     guard firstIndex != firstVisibleIndex else { return }
                     firstVisibleIndex = firstIndex
                     withAnimation(reduceMotion ? nil : .smooth(duration: 0.34)) {
@@ -837,6 +915,10 @@ private struct CatalogShelf: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .focusSection()
+    }
+
+    private func leadingIndex(for index: Int) -> Int {
+        min(index, max(firstVisibleIndex, index - layout.cardsPerRow + 1))
     }
 
     private func scrollTo(_ firstIndex: Int, using scroll: ScrollViewProxy) {

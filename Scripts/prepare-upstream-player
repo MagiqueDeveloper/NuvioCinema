@@ -99,7 +99,7 @@ def replace_once(source, original, modified):
 
 project = upstream("tvosApp/Project.swift").decode()
 project = replace_once(project, 'let bundleID = "com.pyksel.nuviotvos"', 'let bundleID = "com.nuviocinema.app"')
-project = replace_once(project, 'let marketingVersion = "3.5.1"', 'let marketingVersion = "0.1.0"')
+project = replace_once(project, 'let marketingVersion = "3.5.1"', 'let marketingVersion = "0.1.1"')
 project = replace_once(project, 'let projectVersion = "82"', 'let projectVersion = "1"')
 project = replace_once(project, '    productName: "NuvioTV",', '    productName: "NuvioCinema",')
 project = replace_once(project, '    sources: ["NuvioTV/Sources/**/*.swift"],',
@@ -136,13 +136,18 @@ original_entry = upstream(entrypoint).decode()
 app_source = replace_once(original_entry, '@main\nstruct NuvioTVApp: App {', 'struct NuvioTVApp: App {')
 
 player_controls_path = "tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift"
-player_controls = upstream(player_controls_path).decode()
-player_controls = replace_once(player_controls, "        if status == .playing || status == .paused {\n            TimelineView",
-                               "        if status == .playing {\n            TimelineView")
-player_controls = replace_once(player_controls, '''                        if status == .paused {
+player_controls = (checkout / player_controls_path).read_text()
+original_finish_time = "        if status == .playing || status == .paused {\n            TimelineView"
+playing_finish_time = "        if status == .playing {\n            TimelineView"
+paused_finish_time = '''                        if status == .paused {
                             return L10n.format("player_ends_if_resumed", fallback: "If resumed now, ends at %@", time)
                         }
-''', '')
+'''
+if original_finish_time in player_controls:
+    player_controls = replace_once(player_controls, original_finish_time, playing_finish_time)
+    player_controls = replace_once(player_controls, paused_finish_time, "")
+elif player_controls.count(playing_finish_time) != 1 or paused_finish_time in player_controls:
+    raise SystemExit("Unexpected player finish-time display in the upstream checkout.")
 
 info = plistlib.loads(upstream("tvosApp/NuvioTV/Info.plist"))
 for key in ("NSBonjourServices", "BGTaskSchedulerPermittedIdentifiers"):

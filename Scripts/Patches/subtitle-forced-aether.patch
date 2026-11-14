@@ -1,0 +1,558 @@
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift
+@@ -20,11 +20,6 @@
+     private var textSize: CGFloat {
+         min(max(CGFloat(style.textSize) / 100 * 55, 2), 125)
+     }
+-    private var outlineWidth: CGFloat {
+-        guard style.outlineEnabled else { return 0 }
+-        let configured = CGFloat(min(max(style.outlineWidth, 1), 8))
+-        return min(configured, max(0.5, textSize * 0.3))
+-    }
+     private var isTopAligned: Bool { style.verticalAlignment.caseInsensitiveCompare("Top") == .orderedSame }
+     private var controlsVisibleOffset: CGFloat {
+         controlsVisible && !isTopAligned ? -PlayerSubtitleLayoutMetrics.controlsVisibleLiftPoints : 0
+@@ -33,7 +28,7 @@
+     private var horizontalMargin: CGFloat { CGFloat(min(max(style.horizontalMargin, 0), 200)) }
+ 
+     private func textAppearance(alignment: TextAlignment) -> SubtitleTextAppearance {
+-        subtitleTextAppearance(style: style, textSize: textSize, outlineWidth: outlineWidth, alignment: alignment)
++        subtitleTextAppearance(style: style, textSize: textSize, alignment: alignment)
+     }
+ 
+     private var evaluationTime: Double {
+@@ -43,27 +38,6 @@
+     private var activeCues: [SubtitleCue] {
+         playback.cues.filter { cue in
+             evaluationTime >= cue.startTime && evaluationTime <= cue.endTime
+-        }
+-    }
+-
+-    private var activeTextCues: [SubtitleCue] {
+-        activeCues.filter {
+-            if case .image = $0.body { return false }
+-            return $0.placement == nil
+-        }
+-    }
+-
+-    private var placedTextCues: [SubtitleCue] {
+-        activeCues.filter {
+-            if case .image = $0.body { return false }
+-            return $0.placement != nil
+-        }
+-    }
+-
+-    private var activeBitmapCues: [SubtitleCue] {
+-        activeCues.filter {
+-            if case .image = $0.body { return true }
+-            return false
+         }
+     }
+ 
+@@ -75,88 +49,47 @@
+                 mode: aspectMode
+             )
+             ZStack {
+-                ForEach(activeBitmapCues) { cue in
++                ForEach(activeCues) { cue in
+                     if case .image(let image) = cue.body {
+                         bitmapCue(image, videoRect: videoRect)
+                     }
+                 }
+ 
+-                if let renderer = playback.assRenderer {
+-                    ASSRenderedSubtitles(
+-                        renderer: renderer,
+-                        reloadSignal: playback.assReloadSignal,
+-                        onCanvasSizeChanged: playback.onASSCanvasSizeChanged
+-                    )
+-                    .id(ObjectIdentifier(renderer))
+-                    .frame(width: videoRect.width, height: videoRect.height)
+-                    .position(x: videoRect.midX, y: videoRect.midY)
+-                } else if playback.isASSActive {
+-                    VStack(spacing: 10) {
+-                        ForEach(activeTextCues) { cue in
+-                            if let raw = cue.text,
+-                               let plain = ASSPlainTextFallback.text(from: raw) {
+-                                outlinedText(plain, alignment: .center)
+-                            }
++                // Use the display style and placement for all text cues, including rich text and ASS.
++                VStack(spacing: 10) {
++                    ForEach(activeCues) { cue in
++                        if let original = cue.text {
++                            caption(translation.translatedText(for: cue) ?? original)
+                         }
+                     }
+-                    .frame(
+-                        width: max(videoRect.width - horizontalMargin * 2, 1),
+-                        height: max(videoRect.height - verticalOffset, 1),
+-                        alignment: isTopAligned ? .top : .bottom
+-                    )
+-                    .position(
+-                        x: videoRect.midX,
+-                        y: isTopAligned
+-                            ? videoRect.minY + verticalOffset + max(videoRect.height - verticalOffset, 1) / 2
+-                            : videoRect.minY + max(videoRect.height - verticalOffset, 1) / 2
+-                    )
+-                } else {
+-                    ForEach(placedTextCues) { cue in
+-                        if let placement = cue.placement {
+-                            SubtitleCuePlacementLayout(
+-                                placement: placement,
+-                                horizontalMargin: horizontalMargin,
+-                                verticalMargin: verticalOffset
+-                            ) {
+-                                textBody(cue, alignment: textAlignment(for: placement))
+-                            }
+-                            .frame(width: videoRect.width, height: videoRect.height)
+-                            .position(x: videoRect.midX, y: videoRect.midY)
++                    if let nativeText = playback.nativeSubtitleText {
++                        caption(nativeText)
++                    }
++                    if translation.isTranslating(cueIDs: activeCues.map(\.id)) {
++                        HStack(spacing: 5) {
++                            Image(systemName: "sparkles")
++                            Text("AI")
++                            ProgressView()
++                                .controlSize(.mini)
+                         }
+-                    }
+-
+-                    // Multiple simultaneous dialogue cues stack above the video
+-                    // bottom instead of being painted on the same baseline.
+-                    VStack(spacing: 10) {
+-                        ForEach(activeTextCues) { cue in
+-                            textBody(cue)
+-                        }
+-                        if translation.isTranslating(cueIDs: (activeTextCues + placedTextCues).map(\.id)) {
+-                            HStack(spacing: 5) {
+-                                Image(systemName: "sparkles")
+-                                Text("AI")
+-                                ProgressView()
+-                                    .controlSize(.mini)
+-                            }
+-                            .font(.system(size: 13, weight: .bold))
+-                            .foregroundStyle(.white.opacity(0.72))
+-                            .padding(.horizontal, 8)
+-                            .padding(.vertical, 4)
+-                            .background(.black.opacity(0.36), in: Capsule())
+-                        }
+-                    }
+-                    .frame(
+-                        width: max(videoRect.width - horizontalMargin * 2, 1),
+-                        height: max(videoRect.height - verticalOffset, 1),
+-                        alignment: isTopAligned ? .top : .bottom
+-                    )
+-                    .position(
+-                        x: videoRect.midX,
+-                        y: isTopAligned
+-                            ? videoRect.minY + verticalOffset + max(videoRect.height - verticalOffset, 1) / 2
+-                            : videoRect.minY + max(videoRect.height - verticalOffset, 1) / 2
+-                    )
++                        .font(.system(size: 13, weight: .bold))
++                        .foregroundStyle(.white.opacity(0.72))
++                        .padding(.horizontal, 8)
++                        .padding(.vertical, 4)
++                        .background(.black.opacity(0.36), in: Capsule())
++                    }
+                 }
++                .frame(
++                    width: max(videoRect.width - horizontalMargin * 2, 1),
++                    height: max(videoRect.height - verticalOffset, 1),
++                    alignment: isTopAligned ? .top : .bottom
++                )
++                .position(
++                    x: videoRect.midX,
++                    y: isTopAligned
++                        ? videoRect.minY + verticalOffset + max(videoRect.height - verticalOffset, 1) / 2
++                        : videoRect.minY + max(videoRect.height - verticalOffset, 1) / 2
++                )
+             }
+             .frame(width: geo.size.width, height: geo.size.height)
+         }
+@@ -167,39 +100,11 @@
+     }
+ 
+     @ViewBuilder
+-    private func textBody(_ cue: SubtitleCue, alignment: TextAlignment = .center) -> some View {
+-        switch cue.body {
+-        case .text(let string):
+-            outlinedText(translation.translatedText(for: cue) ?? string, alignment: alignment)
+-        case .richText(let runs):
+-            if let translated = translation.translatedText(for: cue) {
+-                outlinedText(translated, alignment: alignment)
+-            } else {
+-                outlinedRichText(runs, alignment: alignment)
+-            }
+-        case .image:
+-            EmptyView()
+-        }
+-    }
+-
+-    private func outlinedText(_ string: String, alignment: TextAlignment) -> some View {
+-        let appearance = textAppearance(alignment: alignment)
+-        return OutlinedSubtitleText(SubtitleAttributedText.make(plain: string, appearance: appearance), appearance: appearance)
+-            .subtitleBackground(style: style)
+-    }
+-
+-    private func outlinedRichText(_ runs: [SubtitleTextRun], alignment: TextAlignment) -> some View {
+-        let appearance = textAppearance(alignment: alignment)
+-        return OutlinedSubtitleText(SubtitleAttributedText.make(runs: runs, appearance: appearance), appearance: appearance)
+-            .subtitleBackground(style: style)
+-    }
+-
+-    private func textAlignment(for placement: SubtitleTextPlacement) -> TextAlignment {
+-        let alignment = (1...9).contains(placement.alignment ?? 2) ? (placement.alignment ?? 2) : 2
+-        switch alignment % 3 {
+-        case 1: return .leading
+-        case 0: return .trailing
+-        default: return .center
++    private func caption(_ text: String) -> some View {
++        if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
++            let appearance = textAppearance(alignment: .center)
++            OutlinedSubtitleText(SubtitleAttributedText.make(plain: text, appearance: appearance), appearance: appearance)
++                .subtitleBackground()
+         }
+     }
+ 
+--- a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
+@@ -7,7 +7,6 @@
+ import CryptoKit
+ import AetherEngine
+ import AetherEngineSMB
+-import SwiftAssRenderer
+ 
+ @MainActor
+ private final class SceneFrameAnalysisResultBox {
+@@ -62,10 +61,7 @@
+     @Published private(set) var cues: [SubtitleCue] = []
+     @Published private(set) var sourceTime: Double = 0
+     @Published private(set) var nativeVideoRect: CGRect?
+-    @Published private(set) var assRenderer: AssSubtitlesRenderer?
+-    @Published private(set) var isASSActive = false
+-    let assReloadSignal = PassthroughSubject<ASSRenderCoordinator.ReloadEvent, Never>()
+-    var onASSCanvasSizeChanged: ((AssSubtitlesRenderer) -> Void)?
++    @Published var nativeSubtitleText: String?
+ 
+     func updateCues(_ cues: [SubtitleCue]) {
+         self.cues = cues
+@@ -81,17 +77,11 @@
+         nativeVideoRect = validRect
+     }
+ 
+-    func updateASS(renderer: AssSubtitlesRenderer?, isActive: Bool) {
+-        assRenderer = renderer
+-        isASSActive = isActive
+-    }
+-
+     func reset() {
+         cues = []
+         sourceTime = 0
+         nativeVideoRect = nil
+-        assRenderer = nil
+-        isASSActive = false
++        nativeSubtitleText = nil
+     }
+ }
+ 
+@@ -2673,7 +2663,7 @@
+ }
+ 
+ @MainActor
+-final class AetherPlaybackController: UIViewController, PlaybackEngineControlling, ScrubThumbnailProviding {
++final class AetherPlaybackController: UIViewController, PlaybackEngineControlling, ScrubThumbnailProviding, AVPlayerItemLegibleOutputPushDelegate {
+     private struct StartupBenchmarkLoadOwner {
+         let loadGeneration: UInt64
+         let engineGenerationFloor: UInt64
+@@ -2691,9 +2681,8 @@
+     let playerView = AetherPlayerView()
+     let subtitleOverlayState = AetherSubtitleOverlayState()
+     let subtitleTranslationState = AISubtitleTranslationState()
+-    private lazy var assCoordinator = ASSRenderCoordinator(player: engine)
+-    private var activeASSTrackID: Int?
+-    private var activeASSHeader: String?
++    private weak var nativeSubtitleItem: AVPlayerItem?
++    private var nativeSubtitleOutput: AVPlayerItemLegibleOutput?
+ 
+     private var cancellables = Set<AnyCancellable>()
+     private var loadGeneration: UInt64 = 0
+@@ -4181,16 +4170,6 @@
+         }
+         self.engine = resolvedEngine
+         super.init(nibName: nil, bundle: nil)
+-        subtitleOverlayState.onASSCanvasSizeChanged = { [weak self] renderer in
+-            self?.assCoordinator.canvasDidChange(for: renderer)
+-        }
+-        assCoordinator.onRendererChanged = { [weak self] renderer in
+-            guard let self else { return }
+-            self.subtitleOverlayState.updateASS(renderer: renderer, isActive: self.activeASSTrackID != nil)
+-        }
+-        assCoordinator.reloadSignal
+-            .sink { [weak self] event in self?.subtitleOverlayState.assReloadSignal.send(event) }
+-            .store(in: &cancellables)
+         #if os(tvOS) || os(iOS)
+         self.engine.ownsVideoNowPlayingSession = true
+         #endif
+@@ -4545,16 +4524,15 @@
+                 guard let self else { return }
+                 self.subtitleOverlayState.updateSourceTime(sourceTime)
+                 self.subtitleOverlayState.updateNativeVideoRect(self.engine.nativePlayerLayer?.videoRect)
+-                if self.activeASSTrackID == nil {
+-                    self.subtitleTranslationState.update(
+-                        cues: self.subtitleCues,
+-                        at: sourceTime - self.subtitleDelaySeconds
+-                    )
+-                    self.beginAISubtitleStartupHoldIfNeeded(
+-                        cues: self.subtitleCues,
+-                        sourceTime: sourceTime - self.subtitleDelaySeconds
+-                    )
+-                }
++                self.syncNativeSubtitleOutput()
++                self.subtitleTranslationState.update(
++                    cues: self.subtitleCues,
++                    at: sourceTime - self.subtitleDelaySeconds
++                )
++                self.beginAISubtitleStartupHoldIfNeeded(
++                    cues: self.subtitleCues,
++                    sourceTime: sourceTime - self.subtitleDelaySeconds
++                )
+                 self.recordPassivePlaybackThumbnailIfNeeded(atSeconds: sourceTime)
+             }
+             .store(in: &cancellables)
+@@ -4586,14 +4564,6 @@
+             .sink { [weak self] _ in
+                 guard let self else { return }
+                 self.mapSubtitleTracks(self.engine.subtitleTracks)
+-            }
+-            .store(in: &cancellables)
+-
+-        engine.$sidecarASSHeader
+-            .receive(on: DispatchQueue.main)
+-            .sink { [weak self] _ in
+-                guard let self else { return }
+-                self.refreshASSRenderer(for: self.engine.subtitleTracks)
+             }
+             .store(in: &cancellables)
+ 
+@@ -4603,16 +4573,14 @@
+                 guard let self else { return }
+                 self.subtitleCues = cues
+                 self.subtitleOverlayState.updateCues(cues)
+-                if self.activeASSTrackID == nil {
+-                    self.subtitleTranslationState.update(
+-                        cues: cues,
+-                        at: self.engine.clock.sourceTime - self.subtitleDelaySeconds
+-                    )
+-                    self.beginAISubtitleStartupHoldIfNeeded(
+-                        cues: cues,
+-                        sourceTime: self.engine.clock.sourceTime - self.subtitleDelaySeconds
+-                    )
+-                }
++                self.subtitleTranslationState.update(
++                    cues: cues,
++                    at: self.engine.clock.sourceTime - self.subtitleDelaySeconds
++                )
++                self.beginAISubtitleStartupHoldIfNeeded(
++                    cues: cues,
++                    sourceTime: self.engine.clock.sourceTime - self.subtitleDelaySeconds
++                )
+             }
+             .store(in: &cancellables)
+ 
+@@ -4883,77 +4851,60 @@
+                 detail: t.codec
+             )
+         }
+-        refreshASSRenderer(for: tracks)
+-    }
+-
+-    private func refreshASSRenderer(for tracks: [TrackInfo]) {
+-        let selected = tracks.first { $0.id == engine.activeSubtitleTrackIndex }
+-        let codec = selected?.codec.lowercased() ?? ""
+-        let isASS = codec.hasPrefix("ass") || codec.hasPrefix("ssa")
+-            || selected?.assHeader != nil
+-            || (selected?.isExternal == true && engine.sidecarASSHeader != nil)
+-        guard let selected,
+-              !selected.isNativelyRenderedSubtitle,
+-              isASS else {
+-            if activeASSTrackID != nil {
+-                activeASSTrackID = nil
+-                activeASSHeader = nil
+-                assCoordinator.deactivate()
+-                subtitleOverlayState.updateASS(renderer: nil, isActive: false)
++        syncNativeSubtitleOutput()
++    }
++
++    // Remote HLS uses AVPlayer for legible renditions. Pull their text into the same
++    // overlay without changing engines or losing the selected rendition.
++    private func syncNativeSubtitleOutput() {
++        let player = engine.videoRoute == .remoteBypass ? engine.currentAVPlayer : nil
++        let item = player?.currentItem
++        let drawsInApp = !engine.pictureInPictureActive && player?.isExternalPlaybackActive != true
++        guard item !== nativeSubtitleItem || (item == nil && nativeSubtitleOutput != nil) else {
++            if let output = nativeSubtitleOutput, output.suppressesPlayerRendering != drawsInApp {
++                output.suppressesPlayerRendering = drawsInApp
++                subtitleOverlayState.nativeSubtitleText = nil
+             }
+             return
+         }
+-        let rawHeader = selected.isExternal ? engine.sidecarASSHeader : selected.assHeader
+-        let header = resolvedASSHeader(rawHeader)
+-        if activeASSTrackID != selected.id || activeASSHeader != header {
+-            assCoordinator.deactivate()
+-            activeASSTrackID = selected.id
+-            activeASSHeader = header
+-            resetAISubtitleStartupHold()
+-            subtitleTranslationState.reset()
+-            assCoordinator.activate(header: header, itemID: currentStreamKey)
+-        }
+-        subtitleOverlayState.updateASS(renderer: assCoordinator.renderer, isActive: true)
+-    }
+-
+-    /// CodecPrivate occasionally omits PlayRes, which leaves libass on its
+-    /// legacy 384×288 canvas and scales authored font sizes too large at 1080p.
+-    private func resolvedASSHeader(_ header: String?) -> String {
+-        let measuredSourceSize = videoFrameSize.width > 1 && videoFrameSize.height > 1
+-            ? videoFrameSize
+-            : CGSize(width: CGFloat(engine.sourceVideoWidth), height: CGFloat(engine.sourceVideoHeight))
+-        let sourceSize = measuredSourceSize.width > 1 && measuredSourceSize.height > 1
+-            ? measuredSourceSize
+-            : CGSize(width: 1920, height: 1080)
+-        let cleanHeader = header?.replacingOccurrences(of: "\0", with: "") ?? ""
+-        func declaredPlayRes(_ key: String) -> Double? {
+-            for line in cleanHeader.split(whereSeparator: \.isNewline) {
+-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+-                guard trimmed.lowercased().hasPrefix(key.lowercased() + ":"),
+-                      let value = Double(trimmed.dropFirst(key.count + 1).trimmingCharacters(in: .whitespacesAndNewlines)),
+-                      value.isFinite, value > 0 else { continue }
+-                return value
+-            }
+-            return nil
+-        }
+-        let declaredX = declaredPlayRes("PlayResX")
+-        let declaredY = declaredPlayRes("PlayResY")
+-        let sourceAspect = sourceSize.width / sourceSize.height
+-        let playResX = Int((declaredX ?? declaredY.map { $0 * sourceAspect } ?? sourceSize.width).rounded())
+-        let playResY = Int((declaredY ?? declaredX.map { $0 / sourceAspect } ?? sourceSize.height).rounded())
+-        let needsPlayResX = declaredX == nil
+-        let needsPlayResY = declaredY == nil
+-        guard needsPlayResX || needsPlayResY else { return cleanHeader }
+-
+-        var additions = ""
+-        if needsPlayResX { additions += "\nPlayResX: \(playResX)" }
+-        if needsPlayResY { additions += "\nPlayResY: \(playResY)" }
+-        if let marker = cleanHeader.range(of: "[Script Info]", options: .caseInsensitive) {
+-            var result = cleanHeader
+-            result.insert(contentsOf: additions, at: marker.upperBound)
+-            return result
+-        }
+-        return "[Script Info]\nScriptType: v4.00+\nPlayResX: \(playResX)\nPlayResY: \(playResY)\n\n\(cleanHeader)"
++        removeNativeSubtitleOutput()
++        guard let item else { return }
++        let output = AVPlayerItemLegibleOutput()
++        output.textStylingResolution = .sourceAndRulesOnly
++        output.suppressesPlayerRendering = drawsInApp
++        output.setDelegate(self, queue: .main)
++        nativeSubtitleItem = item
++        nativeSubtitleOutput = output
++        item.add(output)
++    }
++
++    private func removeNativeSubtitleOutput() {
++        if let output = nativeSubtitleOutput {
++            nativeSubtitleItem?.remove(output)
++        }
++        nativeSubtitleItem = nil
++        nativeSubtitleOutput = nil
++        subtitleOverlayState.nativeSubtitleText = nil
++    }
++
++    nonisolated func legibleOutput(
++        _ output: AVPlayerItemLegibleOutput,
++        didOutputAttributedStrings strings: [NSAttributedString],
++        nativeSampleBuffers: [Any],
++        forItemTime itemTime: CMTime
++    ) {
++        let text = strings.map(\.string).joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
++        MainActor.assumeIsolated {
++            guard output === nativeSubtitleOutput else { return }
++            subtitleOverlayState.nativeSubtitleText = text.isEmpty || !output.suppressesPlayerRendering ? nil : text
++        }
++    }
++
++    nonisolated func outputSequenceWasFlushed(_ output: AVPlayerItemOutput) {
++        MainActor.assumeIsolated {
++            guard output === nativeSubtitleOutput else { return }
++            subtitleOverlayState.nativeSubtitleText = nil
++        }
+     }
+ 
+     static func dolbyVisionRouteDescription(
+@@ -5145,7 +5096,6 @@
+             }
+         }
+         subtitleDelaySeconds = request.subtitleDelaySeconds
+-        assCoordinator.setSubtitleDelay(subtitleDelaySeconds)
+         setAspectMode(request.aspectMode)
+         didReportTerminalError = false
+         isAwaitingEngineLoad = true
+@@ -5210,9 +5160,7 @@
+         audioTracks = []
+         subtitleTracks = []
+         subtitleCues = []
+-        activeASSTrackID = nil
+-        activeASSHeader = nil
+-        assCoordinator.deactivate()
++        removeNativeSubtitleOutput()
+         subtitleOverlayState.reset()
+         subtitleTranslationState.reset()
+         videoFrameSize = .zero
+@@ -5278,9 +5226,7 @@
+             liveEdgeCushionSeconds: isLive ? 3.0 : nil,
+             liveJoinStartsImmediately: true,
+             nativeRemoteHLS: isRemoteHLS,
+-            // AetherEngine honors this for ASS/SSA codec tracks only; other text
+-            // subtitle decoders keep their normal styled/plain cue path.
+-            preserveASSMarkup: true,
++            preserveASSMarkup: false,
+             prepareNativeSubtitles: false,
+             generatesBackgroundScrubPreviews: generatesBackgroundScrubPreviews,
+             sequentialOrigin: forceSequentialOrigin || request.forceSequentialOrigin,
+@@ -5449,13 +5395,10 @@
+         // Host overlay evaluates cues at sourceTime - delay; use the same clock
+         // for prefetching so negative subtitle delays do not miss their cue.
+         subtitleDelaySeconds = seconds
+-        assCoordinator.setSubtitleDelay(seconds)
+-        if activeASSTrackID == nil {
+-            subtitleTranslationState.update(
+-                cues: subtitleCues,
+-                at: engine.clock.sourceTime - subtitleDelaySeconds
+-            )
+-        }
++        subtitleTranslationState.update(
++            cues: subtitleCues,
++            at: engine.clock.sourceTime - subtitleDelaySeconds
++        )
+     }
+ 
+     func setAudioDelay(_ seconds: Double) {
+@@ -5484,6 +5427,7 @@
+     }
+ 
+     func selectSubtitle(_ trackId: Int) {
++        if engine.activeSubtitleTrackIndex != trackId { subtitleOverlayState.nativeSubtitleText = nil }
+         if trackId < 0 {
+             engine.clearSubtitle()
+         } else {
+@@ -5563,9 +5507,7 @@
+             retainedEngine.stop(resetDisplayCriteria: true)
+         }
+         subtitleCues = []
+-        activeASSTrackID = nil
+-        activeASSHeader = nil
+-        assCoordinator.deactivate()
++        removeNativeSubtitleOutput()
+         subtitleOverlayState.reset()
+         subtitleTranslationState.reset()
+         audioTracks = []

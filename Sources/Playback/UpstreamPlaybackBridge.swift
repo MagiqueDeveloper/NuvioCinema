@@ -269,13 +269,13 @@ struct UpstreamPlaybackBridge: View {
 
     fileprivate static func subtitles(_ tracks: [AddonSubtitle], source: String? = nil) -> [NuvioSubtitle] {
         tracks.filter(\.isHTTPS).map {
-            NuvioSubtitle(url: $0.url.absoluteString, language: $0.lang ?? "und", label: $0.name, source: source)
+            NuvioSubtitle(url: $0.url.absoluteString, language: $0.lang ?? "und", label: $0.name, source: $0.source ?? source)
         }
     }
 
     fileprivate static func addonSubtitle(_ track: NuvioSubtitle) -> AddonSubtitle? {
         guard let url = URL(string: track.url), isHTTPS(url) else { return nil }
-        return AddonSubtitle(url: url, lang: track.language, name: track.label)
+        return AddonSubtitle(url: url, lang: track.language, name: track.label, source: track.source)
     }
 
     fileprivate static func isHTTPS(_ url: URL) -> Bool {

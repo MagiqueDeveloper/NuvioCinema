@@ -19,8 +19,6 @@ struct AetherPlaybackSubtitlePanel: View {
     @State private var isLoading = false
     @State private var showsAppearance = false
     @AppStorage(CaptionPreference.sizeKey) private var captionSize = CaptionPreference.Size.system
-    @AppStorage(CaptionPreference.textKey) private var captionTextColor = CaptionPreference.TextColor.system
-    @AppStorage(CaptionPreference.backgroundKey) private var captionBackground = CaptionPreference.Background.system
 
     private enum Target: Hashable {
         case off, track(Int), appearance, captionSize
@@ -102,14 +100,6 @@ struct AetherPlaybackSubtitlePanel: View {
         VStack(alignment: .leading, spacing: 12) {
             optionButton("Size", value: captionSize.label) { captionSize = captionSize.next }
                 .focused($focus, equals: .captionSize)
-            optionButton("Text Color", value: captionTextColor.label) { captionTextColor = captionTextColor.next }
-            optionButton("Background", value: captionBackground.label) { captionBackground = captionBackground.next }
-            Button("Use System Appearance") {
-                captionSize = .system
-                captionTextColor = .system
-                captionBackground = .system
-            }
-            .buttonStyle(.bordered)
         }
         .focusSection()
     }
@@ -208,8 +198,11 @@ struct AetherPlaybackSubtitlePanel: View {
     }
 
     private func trackName(_ track: TrackInfo) -> String {
+        let number = (tracks.firstIndex { $0.id == track.id } ?? 0) + 1
         let language = track.language.flatMap { Locale.current.localizedString(forIdentifier: $0) }
-        let name = track.name.isEmpty ? language ?? String(localized: "Track \(track.id + 1)") : track.name
+        let title = track.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isGenericExternal = track.isExternal && title.range(of: #"^External(?: \d+)?$"#, options: [.regularExpression, .caseInsensitive]) != nil
+        let name = title.isEmpty || isGenericExternal ? language ?? String(localized: "Track \(number)") : title
         if track.isForced { return String(localized: "\(name) (Forced)") }
         if track.isHearingImpaired { return String(localized: "\(name) (SDH)") }
         return name
@@ -229,38 +222,29 @@ struct AetherPlaybackSubtitleOverlay: View {
     @State private var captionStyle = SubtitleCaptionStyle.current()
     @State private var captionObservation: SubtitleCaptionStyle.Observation?
     @AppStorage(CaptionPreference.sizeKey) private var captionSize = CaptionPreference.Size.system
-    @AppStorage(CaptionPreference.textKey) private var captionTextColor = CaptionPreference.TextColor.system
-    @AppStorage(CaptionPreference.backgroundKey) private var captionBackground = CaptionPreference.Background.system
 
     var body: some View {
         GeometryReader { geometry in
             let frame = videoFrame(in: geometry.size)
             let displayed = isSeeking ? [] : visibleCues
-            let standard = displayed.filter { $0.placement == nil && $0.text != nil }
-            let positioned = displayed.filter { $0.placement != nil || $0.text == nil }
-
             VStack(spacing: 5) {
-                ForEach(standard) { caption($0, width: frame.width) }
+                ForEach(displayed) { cue in
+                    if let text = cue.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        caption(text, width: frame.width)
+                    }
+                }
             }
             .padding(.bottom, controlsVisible ? 190 : 42)
             .frame(width: frame.width, height: frame.height, alignment: .bottom)
             .position(x: frame.midX, y: frame.midY)
 
-            ForEach(positioned) { cue in
+            ForEach(displayed) { cue in
                 if case .image(let image) = cue.body {
                     let target = bitmapFrame(image, in: frame)
                     Image(decorative: image.cgImage, scale: 1)
                         .resizable()
                         .frame(width: target.width, height: target.height)
                         .position(x: target.midX, y: target.midY)
-                } else if let anchor = cue.placement?.position, anchor.x.isFinite, anchor.y.isFinite {
-                    caption(cue, width: frame.width)
-                        .position(x: frame.minX + anchor.x * frame.width, y: frame.minY + anchor.y * frame.height)
-                } else {
-                    caption(cue, width: frame.width)
-                        .padding(42)
-                        .frame(width: frame.width, height: frame.height, alignment: alignment(for: cue.placement?.alignment))
-                        .position(x: frame.midX, y: frame.midY)
                 }
             }
         }
@@ -292,48 +276,17 @@ struct AetherPlaybackSubtitleOverlay: View {
         if active != visibleCues { visibleCues = active }
     }
 
-    private func caption(_ cue: SubtitleCue, width: CGFloat) -> some View {
-        let systemBackground = color(captionStyle.backgroundColor?.value,
-                                     opacity: captionStyle.backgroundOpacity?.value ?? 0.6, defaultColor: .black)
-        let background = captionBackground.override ?? systemBackground
+    private func caption(_ text: String, width: CGFloat) -> some View {
         let size = max(25, width * 0.023) * (captionSize.scale ?? captionStyle.sizeScale)
-        return Text(captionText(cue, size: size))
+        return Text(verbatim: text)
+            .font(.system(size: size, weight: .medium))
+            .foregroundStyle(.white)
             .multilineTextAlignment(.center)
             .fixedSize(horizontal: false, vertical: true)
-            .padding(.horizontal, 11)
-            .padding(.vertical, 4)
-            .background(background, in: RoundedRectangle(cornerRadius: 5))
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
             .frame(maxWidth: width * 0.85)
-    }
-
-    private func captionText(_ cue: SubtitleCue, size: CGFloat) -> AttributedString {
-        let runs: [SubtitleTextRun]
-        switch cue.body {
-        case .text(let text): runs = [SubtitleTextRun(text: text, color: nil)]
-        case .richText(let value): runs = value
-        case .image: runs = []
-        }
-        var result = AttributedString()
-        for run in runs {
-            var segment = AttributedString(run.text)
-            let fontName = captionStyle.fontName?.resolved(cue: run.fontName) ?? run.fontName
-            var font = fontName.map { Font.custom($0, size: size) } ?? .system(size: size, weight: .medium)
-            if run.isBold { font = font.bold() }
-            if run.isItalic { font = font.italic() }
-            segment.font = font
-            let foreground = captionStyle.textColor?.resolved(cue: run.color) ?? run.color
-            segment.foregroundColor = captionTextColor.override
-                ?? color(foreground, opacity: captionStyle.textOpacity?.value ?? 1, defaultColor: .white)
-            if run.isUnderlined { segment.underlineStyle = .single }
-            if run.isStruckThrough { segment.strikethroughStyle = .single }
-            result.append(segment)
-        }
-        return result
-    }
-
-    private func color(_ value: SubtitleColor?, opacity: Double, defaultColor: Color) -> Color {
-        guard let value else { return defaultColor.opacity(opacity) }
-        return Color(red: Double(value.r) / 255, green: Double(value.g) / 255, blue: Double(value.b) / 255, opacity: opacity)
     }
 
     private func videoFrame(in size: CGSize) -> CGRect {
@@ -362,20 +315,6 @@ struct AetherPlaybackSubtitleOverlay: View {
                       width: normalized.width * canvas.width,
                       height: normalized.height * canvas.height)
     }
-
-    private func alignment(for value: Int?) -> Alignment {
-        switch value {
-        case 1: .bottomLeading
-        case 3: .bottomTrailing
-        case 4: .leading
-        case 5: .center
-        case 6: .trailing
-        case 7: .topLeading
-        case 8: .top
-        case 9: .topTrailing
-        default: .bottom
-        }
-    }
 }
 
 private extension TrackInfo {
@@ -388,8 +327,6 @@ private extension TrackInfo {
 
 private enum CaptionPreference {
     static let sizeKey = "playback.subtitleAppearance.size"
-    static let textKey = "playback.subtitleAppearance.text"
-    static let backgroundKey = "playback.subtitleAppearance.background"
 
     enum Size: String, PlaybackOption {
         case system, small, medium, large
@@ -409,48 +346,6 @@ private enum CaptionPreference {
             case .small: 0.85
             case .medium: 1
             case .large: 1.3
-            }
-        }
-    }
-
-    enum TextColor: String, PlaybackOption {
-        case system, white, yellow
-
-        var label: LocalizedStringKey {
-            switch self {
-            case .system: "System"
-            case .white: "White"
-            case .yellow: "Yellow"
-            }
-        }
-
-        var override: Color? {
-            switch self {
-            case .system: nil
-            case .white: .white
-            case .yellow: .yellow
-            }
-        }
-    }
-
-    enum Background: String, PlaybackOption {
-        case system, clear, translucent, solid
-
-        var label: LocalizedStringKey {
-            switch self {
-            case .system: "System"
-            case .clear: "Clear"
-            case .translucent: "Translucent Black"
-            case .solid: "Solid Black"
-            }
-        }
-
-        var override: Color? {
-            switch self {
-            case .system: nil
-            case .clear: .clear
-            case .translucent: .black.opacity(0.6)
-            case .solid: .black
             }
         }
     }

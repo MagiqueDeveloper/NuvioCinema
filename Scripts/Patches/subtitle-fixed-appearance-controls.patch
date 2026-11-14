@@ -1,0 +1,1015 @@
+--- a/tvosApp/NuvioTV/Sources/UI/Settings/SettingsView.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Settings/SettingsView.swift
+@@ -582,12 +582,12 @@
+     static let letterSpacing = 0     // -8...40, negative squeezes, positive opens the text
+     static let textColor = "#FFFFFF"
+     static let textOpacity = 100     // percent, 20...100
+-    static let outlineEnabled = true
++    static let outlineEnabled = false
+     static let outlineColor = "#000000"
+     static let outlineWidth = 2      // 1...8 pt
+-    static let backgroundEnabled = false
++    static let backgroundEnabled = true
+     static let backgroundColor = "#000000"
+-    static let backgroundOpacity = 65
++    static let backgroundOpacity = 55
+ }
+ 
+ /// Curated swatch palette shared by the text-color and outline-color pickers.
+@@ -598,9 +598,8 @@
+     ]
+ }
+ 
+-/// Snapshot of the persisted subtitle appearance. Read by the player to style
+-/// every libmpv session and by the settings live preview. Defaults mirror
+-/// `SubtitleStyleDefaults` so a fresh install renders white, outlined captions.
++/// Subtitle appearance for playback and the live preview. Typography and position
++/// are configurable. Text and background colors are fixed in Cinema.
+ struct SubtitleStyle: Codable, Equatable, Hashable, Sendable {
+     var fontName: String = SubtitleStyleDefaults.fontName
+     var textSize: Int = SubtitleStyleDefaults.textSize
+@@ -644,14 +643,6 @@
+             && bottomOffset == other.bottomOffset
+             && horizontalMargin == other.horizontalMargin
+             && letterSpacing == other.letterSpacing
+-            && textColorHex.caseInsensitiveCompare(other.textColorHex) == .orderedSame
+-            && textOpacity == other.textOpacity
+-            && outlineEnabled == other.outlineEnabled
+-            && outlineColorHex.caseInsensitiveCompare(other.outlineColorHex) == .orderedSame
+-            && outlineWidth == other.outlineWidth
+-            && backgroundEnabled == other.backgroundEnabled
+-            && backgroundColorHex.caseInsensitiveCompare(other.backgroundColorHex) == .orderedSame
+-            && backgroundOpacity == other.backgroundOpacity
+     }
+ 
+     static var current: SubtitleStyle {
+@@ -674,15 +665,7 @@
+                               max(SubtitleStyleDefaults.bottomOffsetRange.lowerBound,
+                                   intValue(SubtitleStyleKey.bottomOffset, SubtitleStyleDefaults.bottomOffset))),
+             horizontalMargin: intValue(SubtitleStyleKey.horizontalMargin, SubtitleStyleDefaults.horizontalMargin),
+-            letterSpacing: intValue(SubtitleStyleKey.letterSpacing, SubtitleStyleDefaults.letterSpacing),
+-            textColorHex: stringValue(SubtitleStyleKey.textColor, SubtitleStyleDefaults.textColor),
+-            textOpacity: intValue(SubtitleStyleKey.textOpacity, SubtitleStyleDefaults.textOpacity),
+-            outlineEnabled: boolValue(SubtitleStyleKey.outlineEnabled, SubtitleStyleDefaults.outlineEnabled),
+-            outlineColorHex: stringValue(SubtitleStyleKey.outlineColor, SubtitleStyleDefaults.outlineColor),
+-            outlineWidth: min(8, max(1, intValue(SubtitleStyleKey.outlineWidth, SubtitleStyleDefaults.outlineWidth))),
+-            backgroundEnabled: boolValue(SubtitleStyleKey.backgroundEnabled, SubtitleStyleDefaults.backgroundEnabled),
+-            backgroundColorHex: stringValue(SubtitleStyleKey.backgroundColor, SubtitleStyleDefaults.backgroundColor),
+-            backgroundOpacity: intValue(SubtitleStyleKey.backgroundOpacity, SubtitleStyleDefaults.backgroundOpacity)
++            letterSpacing: intValue(SubtitleStyleKey.letterSpacing, SubtitleStyleDefaults.letterSpacing)
+         )
+     }
+ 
+@@ -750,7 +733,7 @@
+     }
+ }
+ 
+-// MARK: - Subtitle Style Presets (Apple TV Built-in & Custom)
++// MARK: - Subtitle Style Presets
+ 
+ struct SubtitleStylePreset: Identifiable, Codable, Equatable, Hashable, Sendable {
+     let id: String
+@@ -767,151 +750,23 @@
+ }
+ 
+ extension SubtitleStylePreset {
+-    static let transparentBackground = SubtitleStylePreset(
++    static let standard = SubtitleStylePreset(
+         id: "appletv.transparentBackground",
+-        name: L10n.string("subtitle_style_transparent_bg", fallback: "Transparent Background"),
++        name: L10n.string("cinema_subtitle_style_standard", fallback: "Standard"),
+         isBuiltIn: true,
+-        style: SubtitleStyle(
+-            fontName: "System",
+-            textSize: 100,
+-            bold: false,
+-            verticalAlignment: "Bottom",
+-            bottomOffset: 20,
+-            horizontalMargin: 25,
+-            letterSpacing: 0,
+-            textColorHex: "#FFFFFF",
+-            textOpacity: 100,
+-            outlineEnabled: false,
+-            outlineColorHex: "#000000",
+-            outlineWidth: 2,
+-            backgroundEnabled: true,
+-            backgroundColorHex: "#000000",
+-            backgroundOpacity: 55
+-        )
++        style: SubtitleStyle()
+     )
+ 
+     static let largeText = SubtitleStylePreset(
+         id: "appletv.largeText",
+         name: L10n.string("subtitle_style_large_text", fallback: "Large Text"),
+         isBuiltIn: true,
+-        style: SubtitleStyle(
+-            fontName: "System",
+-            textSize: 135,
+-            bold: true,
+-            verticalAlignment: "Bottom",
+-            bottomOffset: 20,
+-            horizontalMargin: 25,
+-            letterSpacing: 0,
+-            textColorHex: "#FFFFFF",
+-            textOpacity: 100,
+-            outlineEnabled: false,
+-            outlineColorHex: "#000000",
+-            outlineWidth: 2,
+-            backgroundEnabled: true,
+-            backgroundColorHex: "#000000",
+-            backgroundOpacity: 60
+-        )
++        style: SubtitleStyle(textSize: 135, bold: true)
+     )
+ 
+-    static let classic = SubtitleStylePreset(
+-        id: "appletv.classic",
+-        name: L10n.string("subtitle_style_classic", fallback: "Classic"),
+-        isBuiltIn: true,
+-        style: SubtitleStyle(
+-            fontName: "System",
+-            textSize: 100,
+-            bold: false,
+-            verticalAlignment: "Bottom",
+-            bottomOffset: 20,
+-            horizontalMargin: 25,
+-            letterSpacing: 0,
+-            textColorHex: "#FFFFFF",
+-            textOpacity: 100,
+-            outlineEnabled: true,
+-            outlineColorHex: "#000000",
+-            outlineWidth: 2,
+-            backgroundEnabled: false,
+-            backgroundColorHex: "#000000",
+-            backgroundOpacity: 0
+-        )
+-    )
+-
+-    static let outlineText = SubtitleStylePreset(
+-        id: "appletv.outlineText",
+-        name: L10n.string("subtitle_style_outline_text", fallback: "Outline Text"),
+-        isBuiltIn: true,
+-        style: SubtitleStyle(
+-            fontName: "System",
+-            textSize: 105,
+-            bold: true,
+-            verticalAlignment: "Bottom",
+-            bottomOffset: 20,
+-            horizontalMargin: 25,
+-            letterSpacing: 0,
+-            textColorHex: "#F2C94C",
+-            textOpacity: 100,
+-            outlineEnabled: true,
+-            outlineColorHex: "#000000",
+-            outlineWidth: 4,
+-            backgroundEnabled: false,
+-            backgroundColorHex: "#000000",
+-            backgroundOpacity: 0
+-        )
+-    )
+-
+-    static let yellowOnBlack = SubtitleStylePreset(
+-        id: "appletv.yellowOnBlack",
+-        name: L10n.string("subtitle_style_yellow_on_black", fallback: "Yellow on Black"),
+-        isBuiltIn: true,
+-        style: SubtitleStyle(
+-            fontName: "System",
+-            textSize: 100,
+-            bold: true,
+-            verticalAlignment: "Bottom",
+-            bottomOffset: 20,
+-            horizontalMargin: 25,
+-            letterSpacing: 0,
+-            textColorHex: "#F2C94C",
+-            textOpacity: 100,
+-            outlineEnabled: false,
+-            outlineColorHex: "#000000",
+-            outlineWidth: 2,
+-            backgroundEnabled: true,
+-            backgroundColorHex: "#000000",
+-            backgroundOpacity: 75
+-        )
+-    )
+-
+-    static let solidBlack = SubtitleStylePreset(
+-        id: "appletv.solidBlack",
+-        name: L10n.string("subtitle_style_solid_black", fallback: "Solid Black"),
+-        isBuiltIn: true,
+-        style: SubtitleStyle(
+-            fontName: "System",
+-            textSize: 100,
+-            bold: false,
+-            verticalAlignment: "Bottom",
+-            bottomOffset: 20,
+-            horizontalMargin: 25,
+-            letterSpacing: 0,
+-            textColorHex: "#FFFFFF",
+-            textOpacity: 100,
+-            outlineEnabled: false,
+-            outlineColorHex: "#000000",
+-            outlineWidth: 2,
+-            backgroundEnabled: true,
+-            backgroundColorHex: "#000000",
+-            backgroundOpacity: 100
+-        )
+-    )
+-
+-    static let appleTVPresets: [SubtitleStylePreset] = [
+-        .transparentBackground,
+-        .largeText,
+-        .classic,
+-        .outlineText,
+-        .yellowOnBlack,
+-        .solidBlack
++    static let playbackPresets = [standard, largeText]
++    static let retiredPresetIDs: Set<String> = [
++        "appletv.classic", "appletv.outlineText", "appletv.yellowOnBlack", "appletv.solidBlack"
+     ]
+ }
+ 
+@@ -933,11 +788,14 @@
+     }
+ 
+     func allPresets(defaults: UserDefaults = ProfileSettings.current) -> [SubtitleStylePreset] {
++        func isAvailable(_ preset: SubtitleStylePreset) -> Bool {
++            !SubtitleStylePreset.retiredPresetIDs.contains(preset.id)
++        }
+         if !defaults.bool(forKey: Self.defaultsSeededKey) {
+-            var seeded = SubtitleStylePreset.appleTVPresets
++            var seeded = SubtitleStylePreset.playbackPresets
+             if let data = defaults.data(forKey: SubtitleStyleKey.customPresets),
+                let existing = try? JSONDecoder().decode([SubtitleStylePreset].self, from: data) {
+-                for item in existing where !seeded.contains(where: { $0.id == item.id }) {
++                for item in existing where isAvailable(item) && !seeded.contains(where: { $0.id == item.id }) {
+                     seeded.append(item)
+                 }
+             }
+@@ -948,9 +806,18 @@
+ 
+         guard let data = defaults.data(forKey: SubtitleStyleKey.customPresets),
+               let presets = try? JSONDecoder().decode([SubtitleStylePreset].self, from: data) else {
+-            return SubtitleStylePreset.appleTVPresets
+-        }
+-        return presets
++            return SubtitleStylePreset.playbackPresets
++        }
++        let available = presets.filter(isAvailable).map { preset in
++            guard preset.id == SubtitleStylePreset.standard.id,
++                  preset.name == L10n.string("subtitle_style_transparent_bg", fallback: "Transparent Background") else {
++                return preset
++            }
++            var standard = preset
++            standard.name = SubtitleStylePreset.standard.name
++            return standard
++        }
++        return available.isEmpty ? SubtitleStylePreset.playbackPresets : available
+     }
+ 
+     func customPresets(defaults: UserDefaults = ProfileSettings.current) -> [SubtitleStylePreset] {
+@@ -959,26 +826,16 @@
+ 
+     func activePreset(for style: SubtitleStyle, defaults: UserDefaults = ProfileSettings.current) -> SubtitleStylePreset? {
+         let presets = allPresets(defaults: defaults)
+-        if let exact = presets.first(where: { $0.style.matches(style) }) {
+-            return exact
+-        }
+-        if let savedID = savedPresetID(defaults: defaults),
+-           let saved = presets.first(where: { $0.id == savedID }) {
++        let savedID = savedPresetID(defaults: defaults)
++        let saved = presets.first { $0.id == savedID }
++        if let saved, saved.style.matches(style) {
+             return saved
+         }
+-        return nil
++        return presets.first { $0.style.matches(style) } ?? saved
+     }
+ 
+     func activePresetTitle(for style: SubtitleStyle, defaults: UserDefaults = ProfileSettings.current) -> String {
+-        let presets = allPresets(defaults: defaults)
+-        if let exact = presets.first(where: { $0.style.matches(style) }) {
+-            return exact.name
+-        }
+-        if let savedID = savedPresetID(defaults: defaults),
+-           let saved = presets.first(where: { $0.id == savedID }) {
+-            return saved.name
+-        }
+-        return L10n.string("subtitle_style_custom", fallback: "Custom")
++        activePreset(for: style, defaults: defaults)?.name ?? L10n.string("subtitle_style_custom", fallback: "Custom")
+     }
+ 
+     func applyPreset(_ preset: SubtitleStylePreset, defaults: UserDefaults = ProfileSettings.current) {
+@@ -11090,7 +10947,6 @@
+     @AppStorage(SettingsKey.networkCache) private var networkCache = "Auto"
+     @AppStorage(SettingsKey.hybridDiskCacheEnabled) private var hybridDiskCacheEnabled = false
+     @AppStorage(SettingsKey.hybridDiskCacheLimitGB) private var hybridDiskCacheLimitGB = 20
+-    @AppStorage(SettingsKey.assOverrideMode) private var assOverrideMode = "Off"
+     @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
+     @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
+     @AppStorage(SettingsKey.playerShowSources) private var playerShowSources = true
+@@ -11116,7 +10972,6 @@
+     /// Buffer profiles: Auto scales to RAM; Conservative/Large match product names;
+     /// legacy Small/Medium/Large keys still work via PlaybackCacheSettings.
+     private let cacheModes = ["Auto", "Conservative", "Medium", "Large", "Max", "Ultra"]
+-    private let assModes = ["Off", "Strip", "Scale", "Force"]
+     private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
+     private let streamSortModes = StreamSortOption.allCases.filter { $0 != .recommended }.map(\.rawValue)
+     private let lastLinkCacheOptions = ["1 Hour", "6 Hours", "12 Hours", "1 Day", "2 Days", "3 Days", "7 Days"]
+@@ -11862,14 +11717,6 @@
+                     isOn: $forcedSubtitles,
+                     accentColor: accentColor
+                 )
+-
+-                SettingsOptionRow(
+-                    title: L10n.string("tvos_settings_ass_ssa_override", fallback: "ASS/SSA Override"),
+-                    subtitle: L10n.string("tvos_settings_ass_ssa_override_subtitle", fallback: "Off preserves authored styling and positioning. Strip forces dialogue into app style. Scale keeps layout with size adjust. Force applies style aggressively."),
+-                    selection: $assOverrideMode,
+-                    options: assModes,
+-                    accentColor: accentColor
+-                )
+             }
+ 
+         }
+@@ -12467,10 +12314,8 @@
+         var parts: [String] = []
+         parts.append(preset.style.fontName)
+         parts.append("\(Int(preset.style.textSize))%")
+-        if preset.style.backgroundEnabled {
+-            parts.append(L10n.string("subtitle_bg_card", fallback: "Background"))
+-        } else if preset.style.outlineEnabled {
+-            parts.append(L10n.string("subtitle_outline", fallback: "Outline"))
++        if preset.style.bold {
++            parts.append(L10n.string("subtitle_style_bold", fallback: "Bold"))
+         }
+         return parts.joined(separator: " · ")
+     }
+@@ -12605,7 +12450,7 @@
+ 
+                 SettingsActionRow(
+                     title: L10n.string("subtitle_style_reset_all_presets", fallback: "Reset All Styles to Defaults"),
+-                    subtitle: L10n.string("subtitle_style_reset_all_presets_desc", fallback: "Restore the 6 built-in Apple TV subtitle styles"),
++                    subtitle: L10n.string("cinema_subtitle_restore_presets", fallback: "Restore Standard and Large Text presets"),
+                     value: L10n.string("common_reset", fallback: "Reset"),
+                     accentColor: .red,
+                     action: {
+@@ -12667,14 +12512,6 @@
+     @AppStorage(SubtitleStyleKey.bottomOffset) private var bottomOffset = SubtitleStyleDefaults.bottomOffset
+     @AppStorage(SubtitleStyleKey.horizontalMargin) private var horizontalMargin = SubtitleStyleDefaults.horizontalMargin
+     @AppStorage(SubtitleStyleKey.letterSpacing) private var letterSpacing = SubtitleStyleDefaults.letterSpacing
+-    @AppStorage(SubtitleStyleKey.textColor) private var textColor = SubtitleStyleDefaults.textColor
+-    @AppStorage(SubtitleStyleKey.textOpacity) private var textOpacity = SubtitleStyleDefaults.textOpacity
+-    @AppStorage(SubtitleStyleKey.outlineEnabled) private var outlineEnabled = SubtitleStyleDefaults.outlineEnabled
+-    @AppStorage(SubtitleStyleKey.outlineColor) private var outlineColor = SubtitleStyleDefaults.outlineColor
+-    @AppStorage(SubtitleStyleKey.outlineWidth) private var outlineWidth = SubtitleStyleDefaults.outlineWidth
+-    @AppStorage(SubtitleStyleKey.backgroundEnabled) private var backgroundEnabled = SubtitleStyleDefaults.backgroundEnabled
+-    @AppStorage(SubtitleStyleKey.backgroundColor) private var backgroundColor = SubtitleStyleDefaults.backgroundColor
+-    @AppStorage(SubtitleStyleKey.backgroundOpacity) private var backgroundOpacity = SubtitleStyleDefaults.backgroundOpacity
+ 
+     private var style: SubtitleStyle {
+         SubtitleStyle(
+@@ -12684,21 +12521,13 @@
+             verticalAlignment: verticalAlignment,
+             bottomOffset: bottomOffset,
+             horizontalMargin: horizontalMargin,
+-            letterSpacing: letterSpacing,
+-            textColorHex: textColor,
+-            textOpacity: textOpacity,
+-            outlineEnabled: outlineEnabled,
+-            outlineColorHex: outlineColor,
+-            outlineWidth: min(8, max(1, outlineWidth)),
+-            backgroundEnabled: backgroundEnabled,
+-            backgroundColorHex: backgroundColor,
+-            backgroundOpacity: backgroundOpacity
++            letterSpacing: letterSpacing
+         )
+     }
+ 
+     /// Concatenation of every value; `.onChange` on it fires `onChange` once per edit.
+     private var changeToken: String {
+-        "\(fontName)|\(textSize)|\(bold)|\(verticalAlignment)|\(bottomOffset)|\(horizontalMargin)|\(letterSpacing)|\(textColor)|\(textOpacity)|\(outlineEnabled)|\(outlineColor)|\(outlineWidth)|\(backgroundEnabled)|\(backgroundColor)|\(backgroundOpacity)"
++        "\(fontName)|\(textSize)|\(bold)|\(verticalAlignment)|\(bottomOffset)|\(horizontalMargin)|\(letterSpacing)"
+     }
+ 
+     var body: some View {
+@@ -12767,7 +12596,7 @@
+                 showingPresetsSheet = true
+             }
+ 
+-            SettingsGroup(title: L10n.string("tvos_settings_text", fallback: "Text"), subtitle: L10n.string("tvos_settings_size_weight_spacing_color_and_opacity_of_4755001d", fallback: "Size, weight, spacing, color, and opacity of the caption text")) {
++            SettingsGroup(title: L10n.string("tvos_settings_text", fallback: "Text"), subtitle: L10n.string("cinema_subtitle_text_adjustments", fallback: "Adjust the typeface, size, weight, and spacing of subtitles")) {
+                 SettingsOptionRow(
+                     title: L10n.string("subtitle_font", fallback: "Font"),
+                     subtitle: L10n.string("subtitle_font_desc", fallback: "Typeface used for subtitles"),
+@@ -12820,23 +12649,6 @@
+                     suffix: "",
+                     accentColor: accentColor
+                 )
+-
+-                SubtitleColorRow(
+-                    title: L10n.string("subtitle_style_text_color", fallback: "Text Color"),
+-                    subtitle: L10n.string("tvos_settings_caption_fill_color", fallback: "Caption fill color"),
+-                    selection: $textColor,
+-                    accentColor: accentColor
+-                )
+-
+-                SettingsStepperRow(
+-                    title: L10n.string("subtitle_style_text_opacity", fallback: "Text Opacity"),
+-                    subtitle: L10n.string("tvos_settings_caption_transparency", fallback: "Caption transparency"),
+-                    value: $textOpacity,
+-                    range: 20...100,
+-                    step: 5,
+-                    suffix: "%",
+-                    accentColor: accentColor
+-                )
+             }
+ 
+             SettingsGroup(title: L10n.string("tvos_settings_position", fallback: "Position"), subtitle: L10n.string("tvos_settings_where_captions_sit_on_screen", fallback: "Where captions sit on screen")) {
+@@ -12867,81 +12679,6 @@
+                     suffix: "",
+                     accentColor: accentColor
+                 )
+-            }
+-
+-            SettingsGroup(title: L10n.string("subtitle_outline", fallback: "Outline"), subtitle: L10n.string("tvos_settings_border_drawn_around_the_text_for_readability", fallback: "Border drawn around the text for readability")) {
+-                SettingsToggleRow(
+-                    title: L10n.string("subtitle_outline", fallback: "Outline"),
+-                    subtitle: L10n.string("tvos_settings_draw_a_border_around_the_text_for_readability", fallback: "Draw a border around the text for readability"),
+-                    isOn: $outlineEnabled,
+-                    accentColor: accentColor
+-                )
+-
+-                SubtitleColorRow(
+-                    title: L10n.string("subtitle_outline_color", fallback: "Outline Color"),
+-                    subtitle: L10n.string("tvos_settings_border_color_drawn_around_the_text", fallback: "Border color drawn around the text"),
+-                    selection: $outlineColor,
+-                    accentColor: accentColor
+-                )
+-                .opacity(outlineEnabled ? 1 : 0.46)
+-                .disabled(!outlineEnabled)
+-
+-                SettingsStepperRow(
+-                    title: L10n.string("subtitle_outline_width", fallback: "Outline Thickness"),
+-                    subtitle: L10n.string("subtitle_outline_width_desc", fallback: "Width of the text stroke border"),
+-                    value: $outlineWidth,
+-                    range: 1...6,
+-                    step: 1,
+-                    suffix: "pt",
+-                    accentColor: accentColor
+-                )
+-                .opacity(outlineEnabled ? 1 : 0.46)
+-                .disabled(!outlineEnabled)
+-            }
+-
+-            SettingsGroup(
+-                title: L10n.string("subtitle_background", fallback: "Background"),
+-                subtitle: L10n.string(
+-                    "tvos_settings_subtitle_background_subtitle",
+-                    fallback: "A backdrop behind captions for improved readability"
+-                )
+-            ) {
+-                SettingsToggleRow(
+-                    title: L10n.string("subtitle_background", fallback: "Background"),
+-                    subtitle: L10n.string(
+-                        "tvos_settings_subtitle_background_toggle",
+-                        fallback: "Draw a padded box behind subtitle text"
+-                    ),
+-                    isOn: $backgroundEnabled,
+-                    accentColor: accentColor
+-                )
+-
+-                SubtitleColorRow(
+-                    title: L10n.string("subtitle_background_color", fallback: "Background Color"),
+-                    subtitle: L10n.string(
+-                        "tvos_settings_subtitle_background_color_subtitle",
+-                        fallback: "Color of the subtitle backdrop"
+-                    ),
+-                    selection: $backgroundColor,
+-                    accentColor: accentColor
+-                )
+-                .opacity(backgroundEnabled ? 1 : 0.46)
+-                .disabled(!backgroundEnabled)
+-
+-                SettingsStepperRow(
+-                    title: L10n.string("subtitle_background_opacity", fallback: "Background Opacity"),
+-                    subtitle: L10n.string(
+-                        "tvos_settings_subtitle_background_opacity_subtitle",
+-                        fallback: "Transparency of the subtitle backdrop"
+-                    ),
+-                    value: $backgroundOpacity,
+-                    range: 10...100,
+-                    step: 5,
+-                    suffix: "%",
+-                    accentColor: accentColor
+-                )
+-                .opacity(backgroundEnabled ? 1 : 0.46)
+-                .disabled(!backgroundEnabled)
+             }
+ 
+             SettingsGroup(title: L10n.string("subtitle_style_reset", fallback: "Reset"), subtitle: L10n.string("tvos_settings_restore_the_default_subtitle_appearance", fallback: "Restore the default subtitle appearance")) {
+@@ -12965,14 +12702,6 @@
+         bottomOffset = preset.style.bottomOffset
+         horizontalMargin = preset.style.horizontalMargin
+         letterSpacing = preset.style.letterSpacing
+-        textColor = preset.style.textColorHex
+-        textOpacity = preset.style.textOpacity
+-        outlineEnabled = preset.style.outlineEnabled
+-        outlineColor = preset.style.outlineColorHex
+-        outlineWidth = preset.style.outlineWidth
+-        backgroundEnabled = preset.style.backgroundEnabled
+-        backgroundColor = preset.style.backgroundColorHex
+-        backgroundOpacity = preset.style.backgroundOpacity
+         SubtitleStylePresetStore.shared.applyPreset(preset)
+         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+             isApplyingPreset = false
+@@ -12988,14 +12717,6 @@
+         bottomOffset = SubtitleStyleDefaults.bottomOffset
+         horizontalMargin = SubtitleStyleDefaults.horizontalMargin
+         letterSpacing = SubtitleStyleDefaults.letterSpacing
+-        textColor = SubtitleStyleDefaults.textColor
+-        textOpacity = SubtitleStyleDefaults.textOpacity
+-        outlineEnabled = SubtitleStyleDefaults.outlineEnabled
+-        outlineColor = SubtitleStyleDefaults.outlineColor
+-        outlineWidth = SubtitleStyleDefaults.outlineWidth
+-        backgroundEnabled = SubtitleStyleDefaults.backgroundEnabled
+-        backgroundColor = SubtitleStyleDefaults.backgroundColor
+-        backgroundOpacity = SubtitleStyleDefaults.backgroundOpacity
+     }
+ }
+ 
+@@ -13024,22 +12745,6 @@
+ 
+     private var previewTracking: CGFloat {
+         CGFloat(style.subSpacing) * 0.6
+-    }
+-
+-    private var outlineWidth: CGFloat {
+-        guard style.outlineEnabled else { return 0 }
+-        let configured = max(1, CGFloat(style.outlineWidth) * 0.8)
+-        return min(configured, max(0.5, fontSize * 0.3))
+-    }
+-
+-    private var outlineOffsets: [CGPoint] {
+-        let w = outlineWidth
+-        return [
+-            CGPoint(x: -w, y: 0), CGPoint(x: w, y: 0),
+-            CGPoint(x: 0, y: -w), CGPoint(x: 0, y: w),
+-            CGPoint(x: -w, y: -w), CGPoint(x: w, y: -w),
+-            CGPoint(x: -w, y: w), CGPoint(x: w, y: w)
+-        ]
+     }
+ 
+     var body: some View {
+@@ -13086,44 +12791,15 @@
+         }
+     }
+ 
+-    @ViewBuilder
+     private var styledSubtitle: some View {
+-        if style.backgroundEnabled {
+-            styledSubtitleText
+-                .padding(.horizontal, 14)
+-                .padding(.vertical, 7)
+-                .background(
+-                    Color(hex: style.backgroundColorHex)
+-                        .opacity(Double(min(max(style.backgroundOpacity, 0), 100)) / 100),
+-                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+-                )
+-        } else {
+-            styledSubtitleText
+-        }
+-    }
+-
+-    private var styledSubtitleText: some View {
+-        let font = style.font(size: fontSize, weight: style.bold ? .heavy : .semibold)
+-        let fill = Color(hex: style.textColorHex).opacity(Double(min(max(style.textOpacity, 0), 100)) / 100.0)
+-        let outline = Color(hex: style.outlineColorHex)
+-        return ZStack {
+-            if style.outlineEnabled && outlineWidth > 0 {
+-                ForEach(Array(outlineOffsets.enumerated()), id: \.offset) { _, point in
+-                    Text(sampleText)
+-                        .font(font)
+-                        .foregroundColor(outline)
+-                        .offset(x: point.x, y: point.y)
+-                }
+-            }
+-            Text(sampleText)
+-                .font(font)
+-                .foregroundColor(fill)
+-        }
+-        .tracking(previewTracking)
+-        .multilineTextAlignment(.center)
+-        .lineLimit(2)
+-        .shadow(color: .black.opacity(0.5), radius: 3, x: 0, y: 1)
+-        .animation(.easeOut(duration: 0.12), value: fontSize)
++        Text(sampleText)
++            .font(style.font(size: fontSize, weight: style.bold ? .bold : .regular))
++            .foregroundStyle(.white)
++            .tracking(previewTracking)
++            .multilineTextAlignment(.center)
++            .lineLimit(2)
++            .subtitleBackground()
++            .animation(.easeOut(duration: 0.12), value: fontSize)
+     }
+ }
+ 
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift
+@@ -2286,13 +2286,6 @@
+         case heightMinus, heightPlus
+         case bold
+         case position
+-        case color(String)
+-        case opacityMinus, opacityPlus
+-        case outline
+-        case outlineWidthMinus, outlineWidthPlus
+-        case background
+-        case backgroundColor(String)
+-        case backgroundOpacityMinus, backgroundOpacityPlus
+     }
+ 
+     private enum AudioControl: Hashable {
+@@ -2328,10 +2321,6 @@
+         case gestureCustomDelete(String)
+         case gestureExpert
+     }
+-
+-    /// Swatches shown in the Text Color row (white, gray, yellow, blue, red, green).
+-    private static let palette = ["#FFFFFF", "#C7C7C7", "#F2C94C", "#56CCF2", "#EB5757", "#6FCF97"]
+-    private static let backgroundPalette = ["#000000", "#303030", "#FFFFFF", "#1F3A5F", "#5A1F2B", "#214D35"]
+ 
+     @State private var tab: Tab = .subtitles
+     /// Gestures tab: the bindings, the action being recorded, and what the last change did.
+@@ -2903,7 +2892,7 @@
+                         let nextIndex = (currentIndex + 1) % presets.count
+                         let nextPreset = presets[nextIndex]
+                         SubtitleStylePresetStore.shared.applyPreset(nextPreset)
+-                        style = nextPreset.style
++                        style = SubtitleStyle.current
+                         viewModel.applySubtitleStyle()
+                     }
+ 
+@@ -3036,51 +3025,6 @@
+                             $0.verticalAlignment = ($0.verticalAlignment.caseInsensitiveCompare("Top") == .orderedSame) ? "Bottom" : "Top"
+                         }
+                     }
+-
+-                    colorRow
+-
+-                    stepperRow(
+-                        title: L10n.string("subtitle_style_text_opacity", fallback: "Text Opacity"),
+-                        value: "\(style.textOpacity)%",
+-                        minusKey: .opacityMinus,
+-                        plusKey: .opacityPlus,
+-                        onMinus: { updateStyle { $0.textOpacity = max($0.textOpacity - 5, 20) } },
+-                        onPlus: { updateStyle { $0.textOpacity = min($0.textOpacity + 5, 100) } }
+-                    )
+-
+-                    toggleRow(title: L10n.string("subtitle_style_outline", fallback: "Outline"), isOn: style.outlineEnabled, focusKey: .outline) {
+-                        updateStyle { $0.outlineEnabled.toggle() }
+-                    }
+-
+-                    stepperRow(
+-                        title: L10n.string("subtitle_outline_width", fallback: "Outline Thickness"),
+-                        value: "\(style.outlineWidth)pt",
+-                        minusKey: .outlineWidthMinus,
+-                        plusKey: .outlineWidthPlus,
+-                        onMinus: { updateStyle { $0.outlineWidth = max($0.outlineWidth - 1, 1) } },
+-                        onPlus: { updateStyle { $0.outlineWidth = min($0.outlineWidth + 1, 6) } }
+-                    )
+-                    .opacity(style.outlineEnabled ? 1 : 0.46)
+-                    .disabled(!style.outlineEnabled)
+-
+-                    toggleRow(title: L10n.string("subtitle_background", fallback: "Background"), isOn: style.backgroundEnabled, focusKey: .background) {
+-                        updateStyle { $0.backgroundEnabled.toggle() }
+-                    }
+-
+-                    backgroundColorRow
+-                        .opacity(style.backgroundEnabled ? 1 : 0.46)
+-                        .disabled(!style.backgroundEnabled)
+-
+-                    stepperRow(
+-                        title: L10n.string("subtitle_background_opacity", fallback: "Background Opacity"),
+-                        value: "\(style.backgroundOpacity)%",
+-                        minusKey: .backgroundOpacityMinus,
+-                        plusKey: .backgroundOpacityPlus,
+-                        onMinus: { updateStyle { $0.backgroundOpacity = max($0.backgroundOpacity - 5, 10) } },
+-                        onPlus: { updateStyle { $0.backgroundOpacity = min($0.backgroundOpacity + 5, 100) } }
+-                    )
+-                    .opacity(style.backgroundEnabled ? 1 : 0.46)
+-                    .disabled(!style.backgroundEnabled)
+                 }
+                 .padding(.vertical, 6)
+                 .padding(.bottom, 26)
+@@ -3296,82 +3240,6 @@
+         }
+     }
+ 
+-    private var colorRow: some View {
+-        VStack(alignment: .leading, spacing: 16) {
+-            styleLabel(L10n.string("subtitle_style_text_color", fallback: "Text Color"))
+-            HStack(spacing: 20) {
+-                ForEach(Self.palette, id: \.self) { hex in
+-                    colorSwatch(hex)
+-                }
+-            }
+-        }
+-    }
+-
+-    private func colorSwatch(_ hex: String) -> some View {
+-        let isFocused = focus == .style(.color(hex))
+-        let isSelected = style.textColorHex.caseInsensitiveCompare(hex) == .orderedSame
+-        return Button {
+-            updateStyle { $0.textColorHex = hex }
+-        } label: {
+-            Circle()
+-                .fill(Color(hex: hex))
+-                .frame(width: 52, height: 52)
+-                .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 1))
+-                .overlay(
+-                    Circle()
+-                        .strokeBorder(
+-                            isFocused ? Color.white : (isSelected ? Color.white.opacity(0.75) : .clear),
+-                            lineWidth: isFocused ? AppFocusOutline.width : 3
+-                        )
+-                        .padding(-6)
+-                )
+-        }
+-        .buttonStyle(PosterCardButtonStyle())
+-        .focused($focus, equals: .style(.color(hex)))
+-        .focusEffectDisabledIfAvailable()
+-        .scaleEffect(isFocused ? 1.14 : 1)
+-        .zIndex(isFocused ? 1 : 0)
+-        .animation(.easeOut(duration: 0.14), value: isFocused)
+-    }
+-
+-    private var backgroundColorRow: some View {
+-        VStack(alignment: .leading, spacing: 16) {
+-            styleLabel(L10n.string("subtitle_background_color", fallback: "Background Color"))
+-            HStack(spacing: 20) {
+-                ForEach(Self.backgroundPalette, id: \.self) { hex in
+-                    backgroundColorSwatch(hex)
+-                }
+-            }
+-        }
+-    }
+-
+-    private func backgroundColorSwatch(_ hex: String) -> some View {
+-        let isFocused = focus == .style(.backgroundColor(hex))
+-        let isSelected = style.backgroundColorHex.caseInsensitiveCompare(hex) == .orderedSame
+-        return Button {
+-            updateStyle { $0.backgroundColorHex = hex }
+-        } label: {
+-            Circle()
+-                .fill(Color(hex: hex))
+-                .frame(width: 52, height: 52)
+-                .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 1))
+-                .overlay(
+-                    Circle()
+-                        .strokeBorder(
+-                            isFocused ? Color.white : (isSelected ? Color.white.opacity(0.75) : .clear),
+-                            lineWidth: isFocused ? AppFocusOutline.width : 3
+-                        )
+-                        .padding(-6)
+-                )
+-        }
+-        .buttonStyle(PosterCardButtonStyle())
+-        .focused($focus, equals: .style(.backgroundColor(hex)))
+-        .focusEffectDisabledIfAvailable()
+-        .scaleEffect(isFocused ? 1.14 : 1)
+-        .zIndex(isFocused ? 1 : 0)
+-        .animation(.easeOut(duration: 0.14), value: isFocused)
+-    }
+-
+     // MARK: Audio & Speed pages
+ 
+     private var audioPage: some View {
+--- a/tvosApp/NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift
+@@ -77,7 +77,7 @@
+         preferredSubtitleLanguages: [String] = [],
+         matchContentEnabled: Bool = true,
+         cacheProfile: PlaybackCacheProfile = .auto,
+-        assMode: PlaybackASSMode = .off,
++        assMode: PlaybackASSMode = .strip,
+         isAnime: Bool = false,
+         isLiveStream: Bool = false,
+         isSports: Bool = false,
+@@ -239,14 +239,9 @@
+     case force
+     case scale
+ 
+-    static func fromSettings(_ raw: String?) -> PlaybackASSMode {
+-        switch (raw ?? "Off").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+-        case "strip": return .strip
+-        case "force": return .force
+-        case "scale": return .scale
+-        case "off", "no", "disabled", "native", "authored", "none": return .off
+-        default: return .off
+-        }
++    static func fromSettings(_: String?) -> PlaybackASSMode {
++        // Existing profiles can still carry the old ASS preference.
++        .strip
+     }
+ }
+ 
+--- a/tvosApp/NuvioTVTests/PlaybackBackendPolicyTests.swift
++++ b/tvosApp/NuvioTVTests/PlaybackBackendPolicyTests.swift
+@@ -2120,19 +2120,10 @@
+         XCTAssertNil(coordinator.lastLoadError)
+     }
+ 
+-    func testPlaybackASSModeMapping() {
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("Off"), .off)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("off"), .off)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("Native"), .off)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("Authored"), .off)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("Disabled"), .off)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings(nil), .off)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("Strip"), .strip)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("strip"), .strip)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("Scale"), .scale)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("scale"), .scale)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("Force"), .force)
+-        XCTAssertEqual(PlaybackASSMode.fromSettings("force"), .force)
++    func testPlaybackAlwaysStripsAuthoredASSStyles() {
++        for preference: String? in [nil, "Off", "Native", "Authored", "Strip", "Scale", "Force"] {
++            XCTAssertEqual(PlaybackASSMode.fromSettings(preference), .strip)
++        }
+     }
+ 
+     func testIsRemoteHTTPLocalLoopback() {
+--- a/tvosApp/NuvioTVTests/PlayerControlsSettingsTests.swift
++++ b/tvosApp/NuvioTVTests/PlayerControlsSettingsTests.swift
+@@ -551,52 +551,26 @@
+         XCTAssertEqual(style.verticalAlignment, "Top")
+     }
+ 
+-    func testAppleTVSubtitleStylePresets() {
+-        let presets = SubtitleStylePreset.appleTVPresets
+-        XCTAssertEqual(presets.count, 6)
+-
+-        let transparent = SubtitleStylePreset.transparentBackground
+-        XCTAssertEqual(transparent.id, "appletv.transparentBackground")
+-        XCTAssertTrue(transparent.isBuiltIn)
+-        XCTAssertTrue(transparent.style.backgroundEnabled)
+-        XCTAssertEqual(transparent.style.backgroundOpacity, 55)
+-        XCTAssertFalse(transparent.style.outlineEnabled)
+-        XCTAssertEqual(transparent.style.textColorHex, "#FFFFFF")
+-
+-        let large = SubtitleStylePreset.largeText
+-        XCTAssertEqual(large.id, "appletv.largeText")
+-        XCTAssertTrue(large.isBuiltIn)
+-        XCTAssertEqual(large.style.textSize, 135)
+-        XCTAssertTrue(large.style.bold)
+-        XCTAssertTrue(large.style.backgroundEnabled)
+-
+-        let classic = SubtitleStylePreset.classic
+-        XCTAssertEqual(classic.id, "appletv.classic")
+-        XCTAssertTrue(classic.isBuiltIn)
+-        XCTAssertTrue(classic.style.outlineEnabled)
+-        XCTAssertFalse(classic.style.backgroundEnabled)
+-
+-        let outline = SubtitleStylePreset.outlineText
+-        XCTAssertEqual(outline.id, "appletv.outlineText")
+-        XCTAssertTrue(outline.isBuiltIn)
+-        XCTAssertTrue(outline.style.outlineEnabled)
+-        XCTAssertEqual(outline.style.outlineWidth, 4)
+-        XCTAssertEqual(outline.style.textColorHex, "#F2C94C")
+-        XCTAssertFalse(outline.style.backgroundEnabled)
+-
+-        let yellowOnBlack = SubtitleStylePreset.yellowOnBlack
+-        XCTAssertEqual(yellowOnBlack.id, "appletv.yellowOnBlack")
+-        XCTAssertEqual(yellowOnBlack.style.textColorHex, "#F2C94C")
+-        XCTAssertTrue(yellowOnBlack.style.backgroundEnabled)
+-
+-        let solidBlack = SubtitleStylePreset.solidBlack
+-        XCTAssertEqual(solidBlack.id, "appletv.solidBlack")
+-        XCTAssertTrue(solidBlack.style.backgroundEnabled)
+-        XCTAssertEqual(solidBlack.style.backgroundOpacity, 100)
+-    }
+-
+-    func testSubtitleStyleMatchingAndEquality() {
+-        let base = SubtitleStylePreset.transparentBackground.style
++    func testSubtitlePresetsUseTheFixedAppearance() {
++        let presets = SubtitleStylePreset.playbackPresets
++        XCTAssertEqual(presets.map(\.id), ["appletv.transparentBackground", "appletv.largeText"])
++        XCTAssertEqual(SubtitleStylePreset.standard.style.textSize, 100)
++        XCTAssertEqual(SubtitleStylePreset.largeText.style.textSize, 135)
++        XCTAssertTrue(SubtitleStylePreset.largeText.style.bold)
++
++        for preset in presets {
++            XCTAssertTrue(preset.isBuiltIn)
++            XCTAssertEqual(preset.style.textColorHex, "#FFFFFF")
++            XCTAssertEqual(preset.style.textOpacity, 100)
++            XCTAssertFalse(preset.style.outlineEnabled)
++            XCTAssertTrue(preset.style.backgroundEnabled)
++            XCTAssertEqual(preset.style.backgroundColorHex, "#000000")
++            XCTAssertEqual(preset.style.backgroundOpacity, 55)
++        }
++    }
++
++    func testSubtitlePresetMatchingIgnoresRetiredAppearanceFields() {
++        let base = SubtitleStylePreset.standard.style
+         var modified = base
+         XCTAssertTrue(base.matches(modified))
+ 
+@@ -605,11 +579,11 @@
+ 
+         modified = base
+         modified.textColorHex = "#F2C94C"
+-        XCTAssertFalse(base.matches(modified))
++        XCTAssertTrue(base.matches(modified))
+ 
+         modified = base
+         modified.outlineEnabled = true
+-        XCTAssertFalse(base.matches(modified))
++        XCTAssertTrue(base.matches(modified))
+     }
+ 
+     @MainActor
+@@ -639,17 +613,17 @@
+             }
+         }
+ 
+-        // Apply Apple TV Classic preset
+-        store.applyPreset(SubtitleStylePreset.classic, defaults: defaults)
+-        XCTAssertEqual(store.savedPresetID(defaults: defaults), SubtitleStylePreset.classic.id)
+-        XCTAssertEqual(SubtitleStyle.current.outlineEnabled, true)
+-        XCTAssertEqual(SubtitleStyle.current.backgroundEnabled, false)
+-        XCTAssertEqual(store.activePreset(for: SubtitleStyle.current, defaults: defaults)?.id, SubtitleStylePreset.classic.id)
+-        XCTAssertEqual(store.activePresetTitle(for: SubtitleStyle.current, defaults: defaults), SubtitleStylePreset.classic.name)
++        store.applyPreset(SubtitleStylePreset.largeText, defaults: defaults)
++        XCTAssertEqual(store.savedPresetID(defaults: defaults), SubtitleStylePreset.largeText.id)
++        XCTAssertEqual(SubtitleStyle.current.textSize, 135)
++        XCTAssertFalse(SubtitleStyle.current.outlineEnabled)
++        XCTAssertTrue(SubtitleStyle.current.backgroundEnabled)
++        XCTAssertEqual(store.activePreset(for: SubtitleStyle.current, defaults: defaults)?.id, SubtitleStylePreset.largeText.id)
++        XCTAssertEqual(store.activePresetTitle(for: SubtitleStyle.current, defaults: defaults), SubtitleStylePreset.largeText.name)
+ 
+         // Save current appearance as custom preset
+-        let custom = store.saveCurrentAsPreset(name: "My Custom Yellow", defaults: defaults)
+-        XCTAssertEqual(custom.name, "My Custom Yellow")
++        let custom = store.saveCurrentAsPreset(name: "My Large Captions", defaults: defaults)
++        XCTAssertEqual(custom.name, "My Large Captions")
+         XCTAssertFalse(custom.isBuiltIn)
+         XCTAssertEqual(store.savedPresetID(defaults: defaults), custom.id)
+         XCTAssertTrue(store.customPresets(defaults: defaults).contains(where: { $0.id == custom.id }))
+@@ -658,12 +632,12 @@
+         // Update custom preset style and name
+         var updatedStyle = custom.style
+         updatedStyle.textSize = 175
+-        updatedStyle.textColorHex = "#6FCF97"
+-        store.updateCustomPresetStyle(id: custom.id, style: updatedStyle, newName: "My Green Style", defaults: defaults)
++        updatedStyle.verticalAlignment = "Top"
++        store.updateCustomPresetStyle(id: custom.id, style: updatedStyle, newName: "Large at Top", defaults: defaults)
+         let updatedPreset = store.customPresets(defaults: defaults).first(where: { $0.id == custom.id })
+-        XCTAssertEqual(updatedPreset?.name, "My Green Style")
++        XCTAssertEqual(updatedPreset?.name, "Large at Top")
+         XCTAssertEqual(updatedPreset?.style.textSize, 175)
+-        XCTAssertEqual(updatedPreset?.style.textColorHex, "#6FCF97")
++        XCTAssertEqual(updatedPreset?.style.verticalAlignment, "Top")
+ 
+         // Rename custom preset
+         store.renameCustomPreset(id: custom.id, newName: "My Renamed Style", defaults: defaults)
+@@ -691,8 +665,8 @@
+         // Reset to defaults
+         store.resetToDefaults(defaults: defaults)
+         let resetPresets = store.allPresets(defaults: defaults)
+-        XCTAssertEqual(resetPresets.count, SubtitleStylePreset.appleTVPresets.count)
+-        XCTAssertEqual(resetPresets.map(\.name), SubtitleStylePreset.appleTVPresets.map(\.name))
++        XCTAssertEqual(resetPresets.count, SubtitleStylePreset.playbackPresets.count)
++        XCTAssertEqual(resetPresets.map(\.name), SubtitleStylePreset.playbackPresets.map(\.name))
+     }
+ 
+     @MainActor
+@@ -723,24 +697,24 @@
+         }
+ 
+         // Apply a built-in preset
+-        store.applyPreset(SubtitleStylePreset.classic, defaults: defaults)
+-        XCTAssertEqual(store.savedPresetID(defaults: defaults), SubtitleStylePreset.classic.id)
++        store.applyPreset(SubtitleStylePreset.largeText, defaults: defaults)
++        XCTAssertEqual(store.savedPresetID(defaults: defaults), SubtitleStylePreset.largeText.id)
+ 
+         // Mutating appearance without manual save button updates active preset in-place
+         var editedStyle = SubtitleStyle.current
+         editedStyle.textSize = 140
+-        editedStyle.textColorHex = "#FFCC00"
++        editedStyle.bottomOffset = 30
+ 
+         let targetID = store.savedPresetID(defaults: defaults)
+         XCTAssertNotNil(targetID)
+         store.updateCustomPresetStyle(id: targetID!, style: editedStyle, defaults: defaults)
+ 
+         // Verify active preset title retains the preset name without requiring manual save
+-        XCTAssertEqual(store.activePresetTitle(for: editedStyle, defaults: defaults), SubtitleStylePreset.classic.name)
++        XCTAssertEqual(store.activePresetTitle(for: editedStyle, defaults: defaults), SubtitleStylePreset.largeText.name)
+         let activePreset = store.activePreset(for: editedStyle, defaults: defaults)
+-        XCTAssertEqual(activePreset?.id, SubtitleStylePreset.classic.id)
++        XCTAssertEqual(activePreset?.id, SubtitleStylePreset.largeText.id)
+         XCTAssertEqual(activePreset?.style.textSize, 140)
+-        XCTAssertEqual(activePreset?.style.textColorHex, "#FFCC00")
++        XCTAssertEqual(activePreset?.style.bottomOffset, 30)
+     }
+ 
+     func testPromptFocusBlocksWindowInputCaptureButTimelineCaptureRemainsAllowed() {

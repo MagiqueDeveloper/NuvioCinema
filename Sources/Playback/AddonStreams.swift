@@ -30,6 +30,30 @@ struct AddonSubtitle: Decodable, Sendable {
     let url: URL
     let lang: String?
     var name: String?
+    var source: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case url, lang, language, name, title, label, filename
+    }
+
+    init(url: URL, lang: String?, name: String?, source: String? = nil) {
+        self.url = url
+        self.lang = lang
+        self.name = name
+        self.source = source
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        func text(for key: CodingKeys) -> String? {
+            let value = try? values.decode(String.self, forKey: key)
+            let words = value?.split(whereSeparator: \.isWhitespace) ?? []
+            return words.isEmpty ? nil : String(words.joined(separator: " ").prefix(160))
+        }
+        url = try values.decode(URL.self, forKey: .url)
+        lang = text(for: .lang) ?? text(for: .language)
+        name = text(for: .name) ?? text(for: .title) ?? text(for: .label) ?? text(for: .filename)
+    }
 
     var isHTTPS: Bool {
         url.scheme?.lowercased() == "https" && url.host() != nil && url.user() == nil && url.password() == nil
@@ -57,16 +81,17 @@ struct AddonStreams: Sendable {
             for addon in addons where addon.enabled {
                 group.addTask {
                     guard let url = manifestURL(addon), let manifest: Manifest = try? await fetch(url) else { return [] }
+                    let provider = clean(manifest.name) ?? clean(addon.name)
                     for id in videoIDs where manifest.supports(kind: kind, id: id, resourceName: "subtitles") {
                         guard !Task.isCancelled,
                               let base = subtitleEndpoint(manifest: url, kind: kind, id: id) else { continue }
                         if let extra, let matching = subtitleEndpoint(manifest: url, kind: kind, id: id, extra: extra) {
-                            async let matchedTracks = subtitleTracks(at: matching)
-                            async let baseTracks = subtitleTracks(at: base)
+                            async let matchedTracks = subtitleTracks(at: matching, source: provider)
+                            async let baseTracks = subtitleTracks(at: base, source: provider)
                             let tracks = await matchedTracks + baseTracks
                             if !tracks.isEmpty { return tracks }
                         } else {
-                            let tracks = await subtitleTracks(at: base)
+                            let tracks = await subtitleTracks(at: base, source: provider)
                             if !tracks.isEmpty { return tracks }
                         }
                     }
@@ -162,9 +187,13 @@ struct AddonStreams: Sendable {
         return try JSONDecoder().decode(Value.self, from: data)
     }
 
-    private func subtitleTracks(at endpoint: URL) async -> [AddonSubtitle] {
+    private func subtitleTracks(at endpoint: URL, source: String?) async -> [AddonSubtitle] {
         guard !Task.isCancelled, let response: Subtitles = try? await fetch(endpoint) else { return [] }
-        return response.tracks.filter(\.isHTTPS)
+        return response.tracks.filter(\.isHTTPS).map { track in
+            var track = track
+            track.source = source
+            return track
+        }
     }
 
     private func subtitleExtra(for stream: AddonStream?) -> String? {
