@@ -1,0 +1,451 @@
+--- a/tvosApp/NuvioTV/Sources/UI/Player/Scene/ScenePanelView.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/Scene/ScenePanelView.swift
+@@ -43,13 +43,7 @@
+     @State private var contentFocusAnchors: [SceneTab: String] = [:]
+     @State private var focusHandoffGeneration = 0
+     @State private var pendingTabFocusTarget: SceneTab?
+-    @State private var tabOrder: [SceneTab] = TVSceneTabOrder.currentOrder()
+-    @State private var disabledTabs: Set<SceneTab> = TVSceneTabOrder.disabledTabs()
+     @State private var needsTabReconciliation = false
+-    /// The card the panel is handing the focus to as it opens (the Chapters tab opens on the
+-    /// playing chapter): until it has it, the tabs stand aside and only that card takes focus.
+-    @State private var pendingCardFocusTarget: String?
+-    
+     init(
+         viewModel: SceneViewModel,
+         isAdvancing: Bool = false,
+@@ -116,26 +110,9 @@
+         .onDisappear {
+             focusHandoffGeneration &+= 1
+             pendingTabFocusTarget = nil
+-            pendingCardFocusTarget = nil
+-        }
+-        .onAppear {
+-            reloadSettings()
+-            if let firstTab = visibleTabs.first {
+-                if firstTab == .chapters, chaptersContent != nil {
+-                    // Chapters open straight on the playing chapter: one Down from playback.
+-                    // Up goes to the tabs, and Up again closes the panel.
+-                    openOnChapters()
+-                } else {
+-                    requestTabFocus(firstTab)
+-                }
+-            } else {
+-                reconcileAvailableTabs()
+-            }
+-        }
++        }
++        .onAppear { requestTabFocus(.info) }
+         .onChange(of: visibleTabs) { _, _ in
+-            reconcileAvailableTabs()
+-        }
+-        .onChange(of: viewModel.availableTabs) { _, _ in
+             reconcileAvailableTabs()
+         }
+         .onChange(of: viewModel.isDetailVisible) { _, isVisible in
+@@ -146,27 +123,11 @@
+                 invalidateFocusHandoff()
+             } else if needsTabReconciliation {
+                 needsTabReconciliation = false
+-                if !reloadSettings() {
+-                    reconcileAvailableTabs()
+-                }
+-            }
+-        }
+-        .onReceive(NotificationCenter.default.publisher(for: TVSceneTabOrder.changedNotification).receive(on: RunLoop.main)) { _ in
+-            reloadSettings()
+-        }
+-        .onReceive(NotificationCenter.default.publisher(for: ProfileSettings.settingsChangedNotification).receive(on: RunLoop.main)) { _ in
+-            reloadSettings()
+-        }
+-        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification).receive(on: RunLoop.main)) { _ in
+-            reloadSettings()
++                reconcileAvailableTabs()
++            }
+         }
+         .onChange(of: focusedTab) { _, newTab in
+             guard !viewModel.isDetailVisible else { return }
+-            if let card = pendingCardFocusTarget {
+-                // A tab took the focus while the panel opens on a card: hand it back.
+-                if newTab != nil { reassertPendingCardFocus(card) }
+-                return
+-            }
+             if let pending = pendingTabFocusTarget {
+                 guard let newTab else {
+                     reassertPendingTabFocus(pending)
+@@ -194,8 +155,6 @@
+         }
+         .onChange(of: viewModel.selectedTab) { _, newTab in
+             guard !viewModel.isDetailVisible else { return }
+-            // Opening on a chapter card selects the Chapters tab without focusing it.
+-            guard pendingCardFocusTarget == nil else { return }
+             guard visibleTabs.contains(newTab) else {
+                 reconcileAvailableTabs()
+                 return
+@@ -273,7 +232,6 @@
+                 .focused($focusedTab, equals: tab)
+                 .focusEffectDisabledIfAvailable()
+                 .disabled((pendingTabFocusTarget != nil && pendingTabFocusTarget != tab)
+-                    || pendingCardFocusTarget != nil
+                     || (activeFocusSection == .content && selectedVisibleTab != tab))
+                 .scaleEffect(isTabFocused ? 1.05 : 1.0)
+                 .animation(.easeOut(duration: 0.14), value: isTabFocused)
+@@ -296,14 +254,7 @@
+     }
+ 
+     private var visibleTabs: [SceneTab] {
+-        var runtimeTabs = viewModel.availableTabs.filter {
+-            $0 != .watchParty && ($0 != .autoSync || autoSyncContent != nil)
+-        }
+-        if watchPartyContent != nil {
+-            runtimeTabs.append(.watchParty)
+-        }
+-        let runtimeTabSet = Set(runtimeTabs)
+-        return tabOrder.filter { runtimeTabSet.contains($0) && !disabledTabs.contains($0) }
++        viewModel.availableTabs.filter { $0 != .chapters || chaptersContent != nil }
+     }
+ 
+     private var selectedVisibleTab: SceneTab? {
+@@ -343,11 +294,8 @@
+                 chaptersContent(
+                     $focusedCardID,
+                     ScenePanelWatchPartyFocusContext(
+-                        entryLocked: viewModel.isDetailVisible
+-                            || activeFocusSection != .content
+-                            || pendingCardFocusTarget != nil,
+-                        entryFocusTarget: pendingCardFocusTarget
+-                            ?? contentFocusAnchor(for: .chapters) ?? chaptersFocusTarget,
++                        entryLocked: viewModel.isDetailVisible || activeFocusSection != .content,
++                        entryFocusTarget: contentFocusAnchor(for: .chapters) ?? chaptersFocusTarget,
+                         entryFallbackTarget: chaptersFocusTarget,
+                         onFocusChanged: rememberChapterFocus,
+                         onMoveUpFromContent: focusSelectedTabFromContent,
+@@ -716,22 +664,6 @@
+     
+     // MARK: - Focus Management
+ 
+-    @discardableResult
+-    private func reloadSettings() -> Bool {
+-        let currentOrder = TVSceneTabOrder.currentOrder()
+-        let currentDisabledTabs = TVSceneTabOrder.disabledTabs()
+-        let settingsChanged = tabOrder != currentOrder || disabledTabs != currentDisabledTabs
+-        guard settingsChanged else { return false }
+-        if viewModel.isDetailVisible {
+-            needsTabReconciliation = true
+-            return false
+-        }
+-        tabOrder = currentOrder
+-        disabledTabs = currentDisabledTabs
+-        reconcileAvailableTabs()
+-        return true
+-    }
+-
+     private func reconcileAvailableTabs() {
+         guard !viewModel.isDetailVisible else {
+             needsTabReconciliation = true
+@@ -853,59 +785,9 @@
+         }
+     }
+ 
+-    /// Opens on the playing chapter's card instead of the Chapters tab (see `requestCardFocus`).
+-    private func openOnChapters() {
+-        if viewModel.selectedTab != .chapters {
+-            viewModel.selectTab(.chapters)
+-        }
+-        guard let card = contentFocusAnchor(for: .chapters) else {
+-            requestTabFocus(.chapters)
+-            return
+-        }
+-        requestCardFocus(card)
+-    }
+-
+-    /// Hands the focus to a card of the selected tab instead of its tab, like `requestTabFocus`:
+-    /// while the handoff settles, the tabs are disabled and the card is the only one that can focus.
+-    private func requestCardFocus(_ card: String) {
+-        guard !viewModel.isDetailVisible else { return }
+-        invalidateFocusHandoff()
+-        let generation = focusHandoffGeneration
+-        let tab = viewModel.selectedTab
+-        pendingCardFocusTarget = card
+-        activeFocusSection = .content
+-        focusedCardID = card
+-        DispatchQueue.main.async {
+-            guard focusHandoffGeneration == generation,
+-                  !viewModel.isDetailVisible,
+-                  viewModel.selectedTab == tab,
+-                  pendingCardFocusTarget == card else { return }
+-            if focusedCardID != card { focusedCardID = card }
+-        }
+-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+-            guard focusHandoffGeneration == generation,
+-                  pendingCardFocusTarget == card else { return }
+-            pendingCardFocusTarget = nil
+-            // The card never took the focus: the tab takes it, as for the other tabs.
+-            if focusedCardID == nil, focusedTab == nil { focusSelectedTabFromContent() }
+-        }
+-    }
+-
+-    private func reassertPendingCardFocus(_ card: String) {
+-        let generation = focusHandoffGeneration
+-        DispatchQueue.main.async {
+-            guard focusHandoffGeneration == generation,
+-                  !viewModel.isDetailVisible,
+-                  pendingCardFocusTarget == card else { return }
+-            activeFocusSection = .content
+-            if focusedCardID != card { focusedCardID = card }
+-        }
+-    }
+-
+     private func invalidateFocusHandoff() {
+         focusHandoffGeneration &+= 1
+         pendingTabFocusTarget = nil
+-        pendingCardFocusTarget = nil
+     }
+ 
+     private func isContentEntryLocked(_ id: String) -> Bool {
+--- a/tvosApp/NuvioTV/Sources/ViewModels/SceneViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/SceneViewModel.swift
+@@ -5,8 +5,8 @@
+ @MainActor
+ final class SceneViewModel: ObservableObject {
+     @Published var isVisible: Bool = false
+-    @Published var selectedTab: SceneTab = .scene
+-    @Published var availableTabs: [SceneTab] = [.scene, .info]
++    @Published var selectedTab: SceneTab = .info
++    @Published var availableTabs: [SceneTab] = [.info, .scene]
+     @Published var snapshot: SceneSnapshot = .empty
+     @Published var selectedDetailItem: SceneDetailItem? = nil
+     @Published var focusedCardID: String? = nil
+@@ -57,8 +57,7 @@
+         runtime: String?,
+         nextEpisode: NuvioVideo?,
+         playbackInfo: ScenePlaybackInfo? = nil,
+-        hasChapters: Bool = false,
+-        hasAutoSync: Bool = false
++        hasChapters: Bool = false
+     ) {
+         self.infoTitle = title
+         self.infoYear = year.map(String.init)
+@@ -73,16 +72,7 @@
+             self.playbackInfo = playbackInfo
+         }
+         
+-        // The file's chapters are a tab of their own (ordered with the others in InSight Sections).
+-        var tabs: [SceneTab] = hasChapters ? [.chapters, .scene, .info] : [.scene, .info]
+-        // AutoSubSync, for add-on subtitles on a file it can read.
+-        if hasAutoSync {
+-            tabs.append(.autoSync)
+-        }
+-        if nextEpisode != nil {
+-            tabs.append(.upNext)
+-        }
+-        self.availableTabs = tabs
++        availableTabs = hasChapters ? [.info, .scene, .chapters] : [.info, .scene]
+     }
+     
+     func updatePlaybackInfo(_ playbackInfo: ScenePlaybackInfo) {
+@@ -92,7 +82,7 @@
+     func open() {
+         guard !isVisible else { return }
+         isVisible = true
+-        selectedTab = .scene
++        selectedTab = .info
+         coordinator.openPanel()
+     }
+     
+--- a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+@@ -4956,14 +4956,6 @@
+                 guard !Task.isCancelled, let self, let provider,
+                       PlaybackChapters.isSameList(self.chapters, chapters),
+                       self.scrubThumbnailProvider === provider, self.canShowChapterThumbnails else { return }
+-                guard !self.isChaptersTabHidden else {
+-                    // Chapters switched off in Settings meanwhile: stop, and start again on
+-                    // their own if they are switched back on.
+-                    self.chapterThumbnailsAutoStarted = false
+-                    self.chapterThumbnailsEligibleSince = nil
+-                    self.publishChapterThumbnailStatus("off")
+-                    return
+-                }
+                 let missing = chapters.indices.filter { store.images[chapters[$0].id] == nil }
+                 guard !missing.isEmpty else {
+                     self.publishChapterThumbnailStatus("done")
+@@ -4991,7 +4991,6 @@
+         }
+         guard now.timeIntervalSince(since) >= Self.chapterThumbnailsAutoStartDelay,
+               canShowChapterThumbnails,
+-              !self.isChaptersTabHidden,
+               !isScrubbing, !isHoldingSeek, pendingSeekDelta == 0,
+               chapterThumbnailsMayLoadInBackground else { return }
+         chapterThumbnailsAutoStarted = true
+@@ -4999,11 +4998,6 @@
+     }
+ 
+     static let chapterThumbnailsAutoStartDelay: TimeInterval = 10
+-
+-    /// Chapters switched off (their section in InSight Sections, or InSight itself): no stills load.
+-    private var isChaptersTabHidden: Bool {
+-        !isSceneEnabled || TVSceneTabOrder.disabledTabs().contains(.chapters)
+-    }
+ 
+     /// The panel's focused chapter, which loads next.
+     func focusChapterThumbnail(id: Int?) {
+@@ -7850,20 +7844,9 @@
+     
+     @Published var showScenePanel: Bool = false
+     
+-    var isSceneEnabled: Bool {
+-        (ProfileSettings.current.object(forKey: SettingsKey.sceneFeatureEnabled) as? Bool)
+-            ?? (UserDefaults.standard.object(forKey: SettingsKey.sceneFeatureEnabled) as? Bool)
+-            ?? true
+-    }
+-
+-    func setSceneEnabled(_ enabled: Bool) {
+-        ProfileSettings.current.set(enabled, forKey: SettingsKey.sceneFeatureEnabled)
+-        if !enabled && showScenePanel {
+-            closeScene()
+-        }
+-        objectWillChange.send()
+-    }
+-    
++    // Info and InSight are always available for playback, including profiles with the old toggle off.
++    var isSceneEnabled: Bool { true }
++
+     var isSceneDetailVisible: Bool {
+         sceneViewModel.isDetailVisible
+     }
+@@ -8337,8 +8320,7 @@
+             runtime: activeMeta?.runtime,
+             nextEpisode: nextEpisode,
+             playbackInfo: playbackInfo,
+-            hasChapters: !chapters.isEmpty,
+-            hasAutoSync: !availableExternalSubtitles.isEmpty && !isLiveStream && !isTrailerPlaybackSession
++            hasChapters: !chapters.isEmpty
+         )
+         sceneViewModel.open()
+     }
+--- a/tvosApp/NuvioTVTests/PlaybackChaptersTests.swift
++++ b/tvosApp/NuvioTVTests/PlaybackChaptersTests.swift
+@@ -312,30 +312,13 @@
+         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.timelineSnapEnabled))
+     }
+ 
+-    func testChaptersAreAnInSightSectionOfTheirOwn() throws {
+-        let suite = "PlaybackChaptersTests.sections"
+-        let settings = try XCTUnwrap(UserDefaults(suiteName: suite))
+-        defer { settings.removePersistentDomain(forName: suite) }
+-        // First by default; after the others in an order saved before Chapters was a section.
+-        XCTAssertEqual(TVSceneTabOrder.currentOrder(in: settings).first, .chapters)
+-        settings.set(try JSONEncoder().encode(["info", "scene"]), forKey: SettingsKey.sceneTabOrder)
+-        XCTAssertEqual(TVSceneTabOrder.currentOrder(in: settings), [.info, .scene, .chapters, .autoSync, .upNext, .watchParty])
+-        // Switched off and on, and moved, like the other sections.
+-        TVSceneTabOrder.setTabEnabled(.chapters, isEnabled: false, in: settings)
+-        XCTAssertTrue(TVSceneTabOrder.disabledTabs(in: settings).contains(.chapters))
+-        TVSceneTabOrder.saveOrder([.chapters, .info], in: settings)
+-        XCTAssertEqual(TVSceneTabOrder.currentOrder(in: settings).first, .chapters)
+-        TVSceneTabOrder.setTabEnabled(.chapters, isEnabled: true, in: settings)
+-        XCTAssertFalse(TVSceneTabOrder.disabledTabs(in: settings).contains(.chapters))
+-    }
+-
+     @MainActor
+     func testTheChaptersTabOnlyForAFileWithChapters() {
+         let sceneVM = SceneViewModel(coordinator: SceneCoordinator(frameProvider: UnsupportedSceneFrameProvider()))
+         sceneVM.setMetadata(title: "Show", year: nil, overview: nil, runtime: nil, nextEpisode: nil)
+-        XCTAssertFalse(sceneVM.availableTabs.contains(.chapters))
++        XCTAssertEqual(sceneVM.availableTabs, [.info, .scene])
+         sceneVM.setMetadata(title: "Show", year: nil, overview: nil, runtime: nil, nextEpisode: nil, hasChapters: true)
+-        XCTAssertTrue(sceneVM.availableTabs.contains(.chapters))
++        XCTAssertEqual(sceneVM.availableTabs, [.info, .scene, .chapters])
+     }
+ 
+     func testThePlayingChapterStandsAboutTwiceAsTallAsTheOthers() {
+--- a/tvosApp/NuvioTVTests/SceneNavigationTests.swift
++++ b/tvosApp/NuvioTVTests/SceneNavigationTests.swift
+@@ -36,33 +36,6 @@
+         viewModel.remoteTouchEnded(dx: 0, dy: 35)
+     }
+ 
+-    func testTouchpadSwipeDownRevealsControlsWhenSceneDisabled() {
+-        let previous = ProfileSettings.current.object(forKey: SettingsKey.sceneFeatureEnabled)
+-        ProfileSettings.current.set(false, forKey: SettingsKey.sceneFeatureEnabled)
+-        defer {
+-            if let previous {
+-                ProfileSettings.current.set(previous, forKey: SettingsKey.sceneFeatureEnabled)
+-            } else {
+-                ProfileSettings.current.removeObject(forKey: SettingsKey.sceneFeatureEnabled)
+-            }
+-        }
+-
+-        let viewModel = PlayerViewModel()
+-        viewModel.status = .playing
+-        viewModel.showControls = false
+-        XCTAssertFalse(viewModel.isSceneEnabled)
+-        XCTAssertFalse(viewModel.showScenePanel)
+-
+-        viewModel.remoteTouchBegan()
+-        viewModel.remoteTouchMoved(dx: 0, dy: 35) // Downward swipe on touch surface
+-
+-        XCTAssertFalse(viewModel.showScenePanel, "Scene panel must not open when disabled in settings")
+-        XCTAssertTrue(viewModel.showControls, "Swipe down should fall back to revealing controls when Scene is disabled")
+-        XCTAssertTrue(viewModel.moveSuppressed)
+-
+-        viewModel.remoteTouchEnded(dx: 0, dy: 35)
+-    }
+-
+     func testTouchpadSwipeUpRevealsControls() {
+         let viewModel = PlayerViewModel()
+         viewModel.status = .playing
+@@ -141,28 +114,6 @@
+         XCTAssertFalse(viewModel.showControls, "Controls must be hidden when Scene/InSight panel opens")
+     }
+ 
+-    func testRemoteDownDoesNotOpenSceneWhenDisabledInSettings() {
+-        let previous = ProfileSettings.current.object(forKey: SettingsKey.sceneFeatureEnabled)
+-        ProfileSettings.current.set(false, forKey: SettingsKey.sceneFeatureEnabled)
+-        defer {
+-            if let previous {
+-                ProfileSettings.current.set(previous, forKey: SettingsKey.sceneFeatureEnabled)
+-            } else {
+-                ProfileSettings.current.removeObject(forKey: SettingsKey.sceneFeatureEnabled)
+-            }
+-        }
+-
+-        let viewModel = PlayerViewModel()
+-        viewModel.status = .playing
+-        XCTAssertFalse(viewModel.isSceneEnabled, "isSceneEnabled must reflect ProfileSettings.current = false")
+-        XCTAssertFalse(viewModel.showScenePanel)
+-
+-        // Simulating remote Down when controls are hidden
+-        viewModel.openScene()
+-
+-        XCTAssertFalse(viewModel.showScenePanel, "Scene panel must not open when disabled in settings")
+-    }
+-    
+     func testTabsAndCardsFocusNavigationLifecycle() {
+         let coordinator = SceneCoordinator(
+             frameProvider: UnsupportedSceneFrameProvider()
+@@ -171,7 +122,7 @@
+         
+         sceneVM.open()
+         XCTAssertTrue(sceneVM.isVisible)
+-        XCTAssertEqual(sceneVM.selectedTab, .scene)
++        XCTAssertEqual(sceneVM.selectedTab, .info)
+         
+         // Switching tabs
+         sceneVM.selectTab(.info)
+@@ -736,7 +687,6 @@
+             nextEpisode: airedEpisode
+         )
+         XCTAssertEqual(sceneVM.nextEpisode?.id, "ep1")
+-        XCTAssertTrue(sceneVM.availableTabs.contains(.upNext))
+ 
+         sceneVM.setMetadata(
+             title: "Test Show",
+@@ -746,7 +696,6 @@
+             nextEpisode: unreleasedEpisode
+         )
+         XCTAssertEqual(sceneVM.nextEpisode?.id, "ep2")
+-        XCTAssertTrue(sceneVM.availableTabs.contains(.upNext))
+ 
+         let panelView = ScenePanelView(
+             viewModel: sceneVM,

@@ -1,6 +1,7 @@
 import AetherEngine
 import AVFoundation
 import SwiftUI
+import Vision
 
 struct AetherPlaybackSubtitlePanel: View {
     let engine: AetherEngine
@@ -219,6 +220,7 @@ struct AetherPlaybackSubtitleOverlay: View {
     @State private var visibleCues: [SubtitleCue] = []
     @State private var isSeeking = false
     @State private var allowsDriftCorrection = false
+    @StateObject private var bitmapCaptions = LegacyBitmapCaptions()
     @State private var captionStyle = SubtitleCaptionStyle.current()
     @State private var captionObservation: SubtitleCaptionStyle.Observation?
     @AppStorage(CaptionPreference.sizeKey) private var captionSize = CaptionPreference.Size.system
@@ -229,7 +231,18 @@ struct AetherPlaybackSubtitleOverlay: View {
             let displayed = isSeeking ? [] : visibleCues
             VStack(spacing: 5) {
                 ForEach(displayed) { cue in
-                    if let text = cue.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    if case .image(let image) = cue.body {
+                        switch bitmapCaptions.result(for: cue.id, image: image) {
+                        case .text(let text):
+                            caption(text, width: frame.width)
+                        case .unreadable:
+                            let size = bitmapSize(image, in: frame)
+                            BitmapSubtitleFallback(image: image.cgImage)
+                                .frame(width: size.width, height: size.height)
+                        case nil:
+                            EmptyView()
+                        }
+                    } else if let text = cue.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         caption(text, width: frame.width)
                     }
                 }
@@ -237,16 +250,6 @@ struct AetherPlaybackSubtitleOverlay: View {
             .padding(.bottom, controlsVisible ? 190 : 42)
             .frame(width: frame.width, height: frame.height, alignment: .bottom)
             .position(x: frame.midX, y: frame.midY)
-
-            ForEach(displayed) { cue in
-                if case .image(let image) = cue.body {
-                    let target = bitmapFrame(image, in: frame)
-                    Image(decorative: image.cgImage, scale: 1)
-                        .resizable()
-                        .frame(width: target.width, height: target.height)
-                        .position(x: target.midX, y: target.midY)
-                }
-            }
         }
         .allowsHitTesting(false)
         .accessibilityHidden(true)
@@ -255,9 +258,18 @@ struct AetherPlaybackSubtitleOverlay: View {
             cues = value
             updateVisible(at: engine.clock.sourceTime, cues: value)
         }
-        .onReceive(engine.$isSeeking) { isSeeking = $0 }
+        .onReceive(engine.$isSeeking.removeDuplicates()) { seeking in
+            isSeeking = seeking
+            if seeking {
+                bitmapCaptions.reset()
+            } else {
+                updateVisible(at: engine.clock.sourceTime)
+            }
+        }
         .onReceive(engine.$subtitleTracks.combineLatest(engine.$activeSubtitleTrackIndex)) { tracks, selected in
-            allowsDriftCorrection = tracks.first { $0.id == selected }?.supportsDriftCorrection == true
+            let track = tracks.first { $0.id == selected }
+            bitmapCaptions.selectTrack(id: selected, language: track?.language)
+            allowsDriftCorrection = track?.supportsDriftCorrection == true
             updateVisible(at: engine.clock.sourceTime)
         }
         .onChange(of: delay) { _, _ in updateVisible(at: engine.clock.sourceTime) }
@@ -267,13 +279,18 @@ struct AetherPlaybackSubtitleOverlay: View {
                 Task { @MainActor in captionStyle = style }
             }
         }
-        .onDisappear { captionObservation = nil }
+        .onDisappear {
+            bitmapCaptions.reset()
+            captionObservation = nil
+        }
     }
 
     private func updateVisible(at sourceTime: Double, cues replacement: [SubtitleCue]? = nil) {
         let time = (sourceTime - delay) * (allowsDriftCorrection ? rate : 1)
-        let active = (replacement ?? cues).filter { $0.startTime <= time && time < $0.endTime }
+        let available = replacement ?? cues
+        let active = available.filter { $0.startTime <= time && time < $0.endTime }
         if active != visibleCues { visibleCues = active }
+        if !isSeeking { bitmapCaptions.prepare(available, at: time) }
     }
 
     private func caption(_ text: String, width: CGFloat) -> some View {
@@ -301,19 +318,133 @@ struct AetherPlaybackSubtitleOverlay: View {
         return AVMakeRect(aspectRatio: source, insideRect: CGRect(origin: .zero, size: size))
     }
 
-    private func bitmapFrame(_ image: SubtitleImage, in frame: CGRect) -> CGRect {
-        var canvas = frame
+    private func bitmapSize(_ image: SubtitleImage, in frame: CGRect) -> CGSize {
+        var canvasHeight = frame.height
         if image.canvasSize.width > 0, image.canvasSize.height > 0, engine.sourceVideoWidth > 0, engine.sourceVideoHeight > 0 {
             let codedWidth = Double(engine.sourceVideoWidth)
             let codedHeight = Double(engine.sourceVideoHeight)
-            let mappedHeight = image.canvasSize.height * (codedWidth / image.canvasSize.width) * (frame.height / codedHeight)
-            canvas = CGRect(x: frame.minX, y: frame.midY - mappedHeight / 2, width: frame.width, height: mappedHeight)
+            canvasHeight = image.canvasSize.height * (codedWidth / image.canvasSize.width) * (frame.height / codedHeight)
         }
-        let normalized = image.position
-        return CGRect(x: canvas.minX + normalized.minX * canvas.width,
-                      y: canvas.minY + normalized.minY * canvas.height,
-                      width: normalized.width * canvas.width,
-                      height: normalized.height * canvas.height)
+        let width = image.position.width * frame.width
+        let scale = min(1, frame.width * 0.85 / max(width, 1))
+        return CGSize(width: width * scale, height: image.position.height * canvasHeight * scale)
+    }
+}
+
+@MainActor
+private final class LegacyBitmapCaptions: ObservableObject {
+    enum Result {
+        case text(String)
+        case unreadable
+    }
+
+    private struct Key: Hashable {
+        let id: Int
+        let image: ObjectIdentifier
+
+        init(_ id: Int, _ image: SubtitleImage) {
+            self.id = id
+            self.image = ObjectIdentifier(image.cgImage)
+        }
+    }
+
+    @Published private var results: [Key: Result] = [:]
+    private var order: [Key] = []
+    private var task: Task<Void, Never>?
+    private var trackID: Int?
+    private var language: String?
+    private nonisolated static let visionQueue = DispatchQueue(
+        label: "com.nuviocinema.subtitle-recognition", qos: .userInitiated
+    )
+
+    func selectTrack(id: Int?, language: String?) {
+        guard trackID != id || self.language != language else { return }
+        trackID = id
+        self.language = language
+        reset()
+    }
+
+    func result(for id: Int, image: SubtitleImage) -> Result? {
+        results[Key(id, image)]
+    }
+
+    func reset() {
+        task?.cancel()
+        task = nil
+        order.removeAll()
+        if !results.isEmpty { results.removeAll() }
+    }
+
+    func prepare(_ cues: [SubtitleCue], at time: Double) {
+        guard task == nil, time.isFinite else { return }
+        let upcoming = cues.lazy.filter { $0.endTime > time && $0.startTime <= time + 12 }
+            .compactMap { cue -> (Key, SubtitleImage)? in
+                guard case .image(let image) = cue.body else { return nil }
+                return (Key(cue.id, image), image)
+            }
+            .prefix(16)
+        let next = Array(upcoming.lazy.filter { self.results[$0.0] == nil }.prefix(8))
+        guard !next.isEmpty else { return }
+        task = Task { [weak self, language] in
+            for (key, image) in next {
+                guard !Task.isCancelled else { return }
+                let text = await Self.recognize(image, language: language)
+                guard !Task.isCancelled, let self else { return }
+                self.store(text.map(Result.text) ?? .unreadable, for: key)
+            }
+            self?.task = nil
+        }
+    }
+
+    private func store(_ result: Result, for key: Key) {
+        if order.count >= 32 { results.removeValue(forKey: order.removeFirst()) }
+        order.append(key)
+        results[key] = result
+    }
+
+    private nonisolated static func recognize(_ image: SubtitleImage, language: String?) async -> String? {
+        await withCheckedContinuation { continuation in
+            visionQueue.async {
+                continuation.resume(returning: autoreleasepool {
+                    recognizeSynchronously(image.cgImage, language: language)
+                })
+            }
+        }
+    }
+
+    private nonisolated static func recognizeSynchronously(_ image: CGImage, language: String?) -> String? {
+        let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        guard let context = CGContext(data: nil, width: image.width, height: image.height,
+                                      bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        context.setFillColor(gray: 0, alpha: 1)
+        context.fill(bounds)
+        context.draw(image, in: bounds)
+        guard let flattened = context.makeImage() else { return nil }
+
+        let request = VNRecognizeTextRequest()
+        request.recognitionLevel = .fast
+        request.usesLanguageCorrection = true
+        if let language {
+            let primary = Locale.Language(identifier: language).languageCode?.identifier(.alpha2) ?? language
+            if primary.lowercased() != "und" {
+                guard let supported = try? request.supportedRecognitionLanguages(),
+                      let match = supported.first(where: {
+                          $0.caseInsensitiveCompare(primary) == .orderedSame
+                              || $0.lowercased().hasPrefix(primary.lowercased() + "-")
+                      }) else { return nil }
+                request.recognitionLanguages = [match]
+            }
+        }
+        do {
+            try VNImageRequestHandler(cgImage: flattened).perform([request])
+        } catch {
+            return nil
+        }
+        let lines = (request.results ?? []).sorted { $0.boundingBox.midY > $1.boundingBox.midY }
+            .compactMap { $0.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 }
 

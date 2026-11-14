@@ -132,22 +132,13 @@ project = replace_once(project,
 ''', '')
 
 entrypoint = "tvosApp/NuvioTV/Sources/NuvioTVApp.swift"
-original_entry = upstream(entrypoint).decode()
-app_source = replace_once(original_entry, '@main\nstruct NuvioTVApp: App {', 'struct NuvioTVApp: App {')
-
-player_controls_path = "tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift"
-player_controls = (checkout / player_controls_path).read_text()
-original_finish_time = "        if status == .playing || status == .paused {\n            TimelineView"
-playing_finish_time = "        if status == .playing {\n            TimelineView"
-paused_finish_time = '''                        if status == .paused {
-                            return L10n.format("player_ends_if_resumed", fallback: "If resumed now, ends at %@", time)
-                        }
-'''
-if original_finish_time in player_controls:
-    player_controls = replace_once(player_controls, original_finish_time, playing_finish_time)
-    player_controls = replace_once(player_controls, paused_finish_time, "")
-elif player_controls.count(playing_finish_time) != 1 or paused_finish_time in player_controls:
-    raise SystemExit("Unexpected player finish-time display in the upstream checkout.")
+app_source = (checkout / entrypoint).read_text()
+original_entry_marker = '@main\nstruct NuvioTVApp: App {'
+cinema_entry_marker = 'struct NuvioTVApp: App {'
+if original_entry_marker in app_source:
+    app_source = replace_once(app_source, original_entry_marker, cinema_entry_marker)
+elif app_source.count(cinema_entry_marker) != 1:
+    raise SystemExit("Unexpected app entry point in the upstream checkout.")
 
 info = plistlib.loads(upstream("tvosApp/NuvioTV/Info.plist"))
 for key in ("NSBonjourServices", "BGTaskSchedulerPermittedIdentifiers"):
@@ -258,7 +249,6 @@ shutil.copy2(ffmpeg / "BUILD-INFO.txt", notices / "FFmpegBuild" / "BUILD-INFO.tx
 
 (checkout / "tvosApp/Project.swift").write_text(project)
 (checkout / entrypoint).write_text(app_source)
-(checkout / player_controls_path).write_text(player_controls)
 (checkout / top_shelf_feed_path).write_text(top_shelf_feed)
 (checkout / catalog_models_path).write_text(catalog_models)
 (app / "Info.plist").write_bytes(plistlib.dumps(info))

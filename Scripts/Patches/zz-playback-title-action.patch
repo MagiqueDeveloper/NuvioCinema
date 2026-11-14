@@ -1,0 +1,26 @@
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerView.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerView.swift
+@@ -70,6 +70,7 @@
+     var onWatchPartyEpisodeResolved: (@MainActor (NuvioVideo, PreparedNextStream) async -> Bool)? = nil
+     var onWatchPartySourceChanged: (@MainActor () async -> Void)? = nil
+     var onRequestSources: (() -> Void)? = nil
++    var onOpenPlaybackTitle: (() -> Void)? = nil
+     var onFinished: (() -> Void)? = nil
+     var onPlaybackStarted: (() -> Void)? = nil
+     var onPlayRecommendation: ((_ meta: NuvioMeta, _ playManually: Bool) -> Void)? = nil
+@@ -118,6 +119,7 @@
+         onWatchPartyEpisodeResolved: (@MainActor (NuvioVideo, PreparedNextStream) async -> Bool)? = nil,
+         onWatchPartySourceChanged: (@MainActor () async -> Void)? = nil,
+         onRequestSources: (() -> Void)? = nil,
++        onOpenPlaybackTitle: (() -> Void)? = nil,
+         onFinished: (() -> Void)? = nil,
+         onPlaybackStarted: (() -> Void)? = nil,
+         onPlayRecommendation: ((NuvioMeta, Bool) -> Void)? = nil,
+@@ -168,6 +170,7 @@
+         self.onWatchPartyEpisodeResolved = onWatchPartyEpisodeResolved
+         self.onWatchPartySourceChanged = onWatchPartySourceChanged
+         self.onRequestSources = onRequestSources
++        self.onOpenPlaybackTitle = onOpenPlaybackTitle
+         self.onFinished = onFinished
+         self.onPlaybackStarted = onPlaybackStarted
+         self.onPlayRecommendation = onPlayRecommendation

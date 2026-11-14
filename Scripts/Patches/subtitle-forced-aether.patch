@@ -49,13 +49,14 @@
          }
      }
  
-@@ -75,88 +49,47 @@
+@@ -75,88 +49,50 @@
                  mode: aspectMode
              )
              ZStack {
 -                ForEach(activeBitmapCues) { cue in
+-                    if case .image(let image) = cue.body {
 +                ForEach(activeCues) { cue in
-                     if case .image(let image) = cue.body {
++                    if case .image(let image) = cue.body, playback.bitmapCaption(for: cue, image: image) == nil {
                          bitmapCue(image, videoRect: videoRect)
                      }
                  }
@@ -81,6 +82,9 @@
 +                    ForEach(activeCues) { cue in
 +                        if let original = cue.text {
 +                            caption(translation.translatedText(for: cue) ?? original)
++                        } else if case .image(let image) = cue.body,
++                                  let text = playback.bitmapCaption(for: cue, image: image) {
++                            caption(text)
                          }
                      }
 -                    .frame(
@@ -170,7 +174,7 @@
              }
              .frame(width: geo.size.width, height: geo.size.height)
          }
-@@ -167,39 +100,11 @@
+@@ -167,39 +103,11 @@
      }
  
      @ViewBuilder
@@ -215,6 +219,16 @@
          }
      }
  
+@@ -215,8 +123,7 @@
+             width: image.position.width * videoRect.width,
+             height: image.position.height * mappedHeight
+         )
+-        return Image(decorative: image.cgImage, scale: 1, orientation: .up)
+-            .resizable()
++        return BitmapSubtitleFallback(image: image.cgImage)
+             .frame(width: frame.width, height: frame.height)
+             .position(x: frame.midX, y: frame.midY)
+     }
 --- a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
 +++ b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
 @@ -7,7 +7,6 @@
@@ -225,7 +239,7 @@
  
  @MainActor
  private final class SceneFrameAnalysisResultBox {
-@@ -62,10 +61,7 @@
+@@ -62,17 +61,106 @@
      @Published private(set) var cues: [SubtitleCue] = []
      @Published private(set) var sourceTime: Double = 0
      @Published private(set) var nativeVideoRect: CGRect?
@@ -234,10 +248,112 @@
 -    let assReloadSignal = PassthroughSubject<ASSRenderCoordinator.ReloadEvent, Never>()
 -    var onASSCanvasSizeChanged: ((AssSubtitlesRenderer) -> Void)?
 +    @Published var nativeSubtitleText: String?
++
++    private struct BitmapKey: Hashable {
++        let cueID: Int
++        let startTime: Double
++        let image: ObjectIdentifier
++
++        init(cue: SubtitleCue, image: SubtitleImage) {
++            cueID = cue.id
++            startTime = cue.startTime
++            self.image = ObjectIdentifier(image.cgImage)
++        }
++    }
++
++    private struct BitmapCue {
++        let key: BitmapKey
++        let endTime: Double
++        let image: SubtitleImage
++
++        func isNear(_ time: Double) -> Bool {
++            key.startTime <= time + 8 && endTime > time
++        }
++    }
++
++    private enum BitmapCaption {
++        case text(String)
++        case unreadable
++    }
++
++    @Published private var bitmapCaptions: [BitmapKey: BitmapCaption] = [:]
++    private var bitmapCues: [BitmapCue] = []
++    private var bitmapTask: Task<Void, Never>?
++    private var pendingBitmap: BitmapCue?
++    private var bitmapTrackID: Int?
++    private var bitmapTrackLanguage: String?
++    private var subtitleTime: Double = 0
  
      func updateCues(_ cues: [SubtitleCue]) {
          self.cues = cues
-@@ -81,17 +77,11 @@
+-    }
+-
+-    func updateSourceTime(_ seconds: Double) {
++        bitmapCues = cues.compactMap { cue in
++            guard case let .image(image) = cue.body else { return nil }
++            return BitmapCue(key: BitmapKey(cue: cue, image: image), endTime: cue.endTime, image: image)
++        }
++        if let pendingBitmap, !bitmapCues.contains(where: { $0.key == pendingBitmap.key }) {
++            cancelBitmapRecognition()
++        }
++        recognizeNextBitmap()
++    }
++
++    func updateSourceTime(_ seconds: Double, subtitleDelay: Double) {
+         sourceTime = seconds.isFinite ? max(0, seconds) : 0
++        updateSubtitleDelay(subtitleDelay)
++    }
++
++    func updateSubtitleDelay(_ seconds: Double) {
++        subtitleTime = sourceTime - (seconds.isFinite ? seconds : 0)
++        if let pendingBitmap, !pendingBitmap.isNear(subtitleTime) {
++            cancelBitmapRecognition()
++        }
++        recognizeNextBitmap()
++    }
++
++    func updateBitmapTrack(id: Int?, language: String?) {
++        guard bitmapTrackID != id || bitmapTrackLanguage != language else { return }
++        bitmapTrackID = id
++        bitmapTrackLanguage = language
++        cancelBitmapRecognition()
++        bitmapCaptions.removeAll()
++        recognizeNextBitmap()
++    }
++
++    func bitmapCaption(for cue: SubtitleCue, image: SubtitleImage) -> String? {
++        guard case let .text(text)? = bitmapCaptions[BitmapKey(cue: cue, image: image)] else { return nil }
++        return text
++    }
++
++    private func recognizeNextBitmap() {
++        guard bitmapTask == nil,
++              let cue = bitmapCues.first(where: { $0.isNear(subtitleTime) && bitmapCaptions[$0.key] == nil }) else { return }
++        let language = bitmapTrackLanguage
++        pendingBitmap = cue
++        bitmapTask = Task { [weak self] in
++            let text = await cue.image.recognizedPlaybackText(trackLanguage: language)
++            guard !Task.isCancelled, let self else { return }
++            bitmapTask = nil
++            pendingBitmap = nil
++            if bitmapCaptions.count >= 128, let farthest = bitmapCaptions.keys.max(by: {
++                abs($0.startTime - self.subtitleTime) < abs($1.startTime - self.subtitleTime)
++            }) {
++                bitmapCaptions.removeValue(forKey: farthest)
++            }
++            bitmapCaptions[cue.key] = text.map(BitmapCaption.text) ?? .unreadable
++            recognizeNextBitmap()
++        }
++    }
++
++    private func cancelBitmapRecognition() {
++        bitmapTask?.cancel()
++        bitmapTask = nil
++        pendingBitmap = nil
+     }
+ 
+     func updateNativeVideoRect(_ rect: CGRect?) {
+@@ -81,17 +169,17 @@
          nativeVideoRect = validRect
      }
  
@@ -253,10 +369,16 @@
 -        assRenderer = nil
 -        isASSActive = false
 +        nativeSubtitleText = nil
++        cancelBitmapRecognition()
++        bitmapCues.removeAll()
++        bitmapCaptions.removeAll()
++        bitmapTrackID = nil
++        bitmapTrackLanguage = nil
++        subtitleTime = 0
      }
  }
  
-@@ -2673,7 +2663,7 @@
+@@ -2673,7 +2761,7 @@
  }
  
  @MainActor
@@ -265,7 +387,7 @@
      private struct StartupBenchmarkLoadOwner {
          let loadGeneration: UInt64
          let engineGenerationFloor: UInt64
-@@ -2691,9 +2681,8 @@
+@@ -2691,9 +2779,8 @@
      let playerView = AetherPlayerView()
      let subtitleOverlayState = AetherSubtitleOverlayState()
      let subtitleTranslationState = AISubtitleTranslationState()
@@ -277,7 +399,7 @@
  
      private var cancellables = Set<AnyCancellable>()
      private var loadGeneration: UInt64 = 0
-@@ -4181,16 +4170,6 @@
+@@ -4181,16 +4268,6 @@
          }
          self.engine = resolvedEngine
          super.init(nibName: nil, bundle: nil)
@@ -294,9 +416,12 @@
          #if os(tvOS) || os(iOS)
          self.engine.ownsVideoNowPlayingSession = true
          #endif
-@@ -4545,16 +4524,15 @@
+@@ -4543,18 +4620,17 @@
+             .receive(on: DispatchQueue.main)
+             .sink { [weak self] sourceTime in
                  guard let self else { return }
-                 self.subtitleOverlayState.updateSourceTime(sourceTime)
+-                self.subtitleOverlayState.updateSourceTime(sourceTime)
++                self.subtitleOverlayState.updateSourceTime(sourceTime, subtitleDelay: self.subtitleDelaySeconds)
                  self.subtitleOverlayState.updateNativeVideoRect(self.engine.nativePlayerLayer?.videoRect)
 -                if self.activeASSTrackID == nil {
 -                    self.subtitleTranslationState.update(
@@ -320,7 +445,7 @@
                  self.recordPassivePlaybackThumbnailIfNeeded(atSeconds: sourceTime)
              }
              .store(in: &cancellables)
-@@ -4586,14 +4564,6 @@
+@@ -4586,14 +4662,6 @@
              .sink { [weak self] _ in
                  guard let self else { return }
                  self.mapSubtitleTracks(self.engine.subtitleTracks)
@@ -335,7 +460,7 @@
              }
              .store(in: &cancellables)
  
-@@ -4603,16 +4573,14 @@
+@@ -4603,16 +4671,14 @@
                  guard let self else { return }
                  self.subtitleCues = cues
                  self.subtitleOverlayState.updateCues(cues)
@@ -360,7 +485,15 @@
              }
              .store(in: &cancellables)
  
-@@ -4883,77 +4851,60 @@
+@@ -4868,6 +4934,7 @@
+ 
+     private func mapSubtitleTracks(_ tracks: [TrackInfo]) {
+         let active = engine.activeSubtitleTrackIndex
++        subtitleOverlayState.updateBitmapTrack(id: active, language: tracks.first { $0.id == active }?.language)
+         subtitleTracks = tracks.enumerated().map { offset, t in
+             PlaybackTrackInfo(
+                 index: offset,
+@@ -4883,77 +4950,60 @@
                  detail: t.codec
              )
          }
@@ -489,7 +622,7 @@
      }
  
      static func dolbyVisionRouteDescription(
-@@ -5145,7 +5096,6 @@
+@@ -5145,7 +5195,6 @@
              }
          }
          subtitleDelaySeconds = request.subtitleDelaySeconds
@@ -497,7 +630,7 @@
          setAspectMode(request.aspectMode)
          didReportTerminalError = false
          isAwaitingEngineLoad = true
-@@ -5210,9 +5160,7 @@
+@@ -5210,9 +5259,7 @@
          audioTracks = []
          subtitleTracks = []
          subtitleCues = []
@@ -508,10 +641,11 @@
          subtitleOverlayState.reset()
          subtitleTranslationState.reset()
          videoFrameSize = .zero
-@@ -5278,9 +5226,7 @@
+@@ -5278,9 +5325,8 @@
              liveEdgeCushionSeconds: isLive ? 3.0 : nil,
              liveJoinStartsImmediately: true,
              nativeRemoteHLS: isRemoteHLS,
++            disablesAutomaticRemoteHLSSubtitles: request.startsWithSubtitlesOff,
 -            // AetherEngine honors this for ASS/SSA codec tracks only; other text
 -            // subtitle decoders keep their normal styled/plain cue path.
 -            preserveASSMarkup: true,
@@ -519,7 +653,7 @@
              prepareNativeSubtitles: false,
              generatesBackgroundScrubPreviews: generatesBackgroundScrubPreviews,
              sequentialOrigin: forceSequentialOrigin || request.forceSequentialOrigin,
-@@ -5449,13 +5395,10 @@
+@@ -5449,13 +5494,11 @@
          // Host overlay evaluates cues at sourceTime - delay; use the same clock
          // for prefetching so negative subtitle delays do not miss their cue.
          subtitleDelaySeconds = seconds
@@ -530,6 +664,7 @@
 -                at: engine.clock.sourceTime - subtitleDelaySeconds
 -            )
 -        }
++        subtitleOverlayState.updateSubtitleDelay(seconds)
 +        subtitleTranslationState.update(
 +            cues: subtitleCues,
 +            at: engine.clock.sourceTime - subtitleDelaySeconds
@@ -537,7 +672,7 @@
      }
  
      func setAudioDelay(_ seconds: Double) {
-@@ -5484,6 +5427,7 @@
+@@ -5484,6 +5527,7 @@
      }
  
      func selectSubtitle(_ trackId: Int) {
@@ -545,7 +680,7 @@
          if trackId < 0 {
              engine.clearSubtitle()
          } else {
-@@ -5563,9 +5507,7 @@
+@@ -5563,9 +5607,7 @@
              retainedEngine.stop(resetDisplayCriteria: true)
          }
          subtitleCues = []

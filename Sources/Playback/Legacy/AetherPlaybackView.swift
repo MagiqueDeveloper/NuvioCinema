@@ -83,7 +83,12 @@ struct AetherPlaybackView: View {
                     .onReceive(engine.$startupProgress) { startupProgress = $0; updateStarted() }
                     .onReceive(engine.$isAwaitingDisplaySwitch) { isAwaitingDisplaySwitch = $0 }
                     .onReceive(engine.$subtitleTracks) { availableSubtitleTracks = $0 }
+                    .onChange(of: availableSubtitleTracks) { _, _ in restoreTrackChoices(in: engine) }
                     .onReceive(engine.$activeSubtitleTrackIndex, perform: subtitleSelectionChanged)
+                    .onChange(of: selectedSubtitleID) { _, id in
+                        guard id != nil, (PlaybackTrackPreferences.subtitle(for: trackPreferenceKey) ?? .off) == .off else { return }
+                        engine.clearSubtitle()
+                    }
                     .onReceive(engine.clock.$currentTime) { time in
                         if hasStarted, playbackState == .playing, !engine.isSeeking {
                             onProgress(time, engine.duration, .periodic)
@@ -370,6 +375,7 @@ struct AetherPlaybackView: View {
             try Task.checkCancellation()
             guard !isClosing else { return }
             let seconds = playAttempt == 0 ? Double(max(0, position)) / 1_000 : 0
+            restoredSubtitles = false
             let initialTracks = externalTracks()
             registeredSubtitleURLs = Set(initialTracks.map(\.url))
             try await player.load(url: url, startPosition: seconds,
@@ -599,13 +605,14 @@ struct AetherPlaybackView: View {
                 return
             }
         }
-        guard !restoredSubtitles, let preference = PlaybackTrackPreferences.subtitle(for: trackPreferenceKey) else { return }
+        guard !restoredSubtitles else { return }
+        let preference = PlaybackTrackPreferences.subtitle(for: trackPreferenceKey) ?? .off
         switch preference {
         case .off:
             restoredSubtitles = true
             engine.clearSubtitle()
         case .embedded(let track), .addon(let track):
-            if let match = track.match(in: engine.subtitleTracks) {
+            if let match = track.matchSubtitle(in: engine.subtitleTracks) {
                 restoredSubtitles = true
                 if engine.activeSubtitleTrackIndex != match.id { engine.selectSubtitleTrack(index: match.id) }
             }

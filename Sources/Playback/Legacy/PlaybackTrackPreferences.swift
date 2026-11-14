@@ -59,6 +59,21 @@ enum PlaybackTrackPreferences {
             return matches.count == 1 ? matches.first?.0 : nil
         }
 
+        func matchSubtitle(in tracks: [TrackInfo]) -> TrackInfo? {
+            if let exact = match(in: tracks) { return exact }
+            let candidates = tracks.compactMap { track -> (TrackInfo, Int)? in
+                let candidate = TrackPreference(track)
+                let languageScore = Self.languageScore(language, candidate.language)
+                let sameName = nameFingerprint != nil && nameFingerprint == candidate.nameFingerprint
+                guard languageScore >= 0, sameName || languageScore > 0 else { return nil }
+                let score = languageScore * 8 + (sameName ? 4 : 0)
+                    + (candidate.isForced == isForced ? 2 : 0)
+                    + (candidate.isHearingImpaired == isHearingImpaired ? 1 : 0)
+                return (track, score)
+            }
+            return candidates.max(by: { $0.1 < $1.1 })?.0
+        }
+
         private func score(for track: TrackPreference) -> Int? {
             guard track.isExternal == isExternal, track.isForced == isForced,
                   track.isHearingImpaired == isHearingImpaired, track.isCommentary == isCommentary,

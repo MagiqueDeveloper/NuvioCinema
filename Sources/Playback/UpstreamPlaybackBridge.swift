@@ -7,14 +7,37 @@ struct UpstreamPlaybackBridge: View {
     let stream: AddonStream
     let account: NuvioAccount
     let onClose: (TitlePlaybackRequest, String?) -> Void
+    let onOpenPlaybackTitle: () -> Void
     var onRestorePlayer: ((AddonStream, TitlePlaybackRequest) -> Bool)? = nil
 
     @Environment(\.scenePhase) private var scenePhase
-    @StateObject private var viewModel = PlayerViewModel()
+    @StateObject private var viewModel: PlayerViewModel
     @State private var recorder = PlaybackProgressRecorder()
     @State private var recordingEpisode: NuvioVideo?
     @State private var isMounted = false
     @State private var restoreID = UUID()
+
+    init(url: URL, request: TitlePlaybackRequest, stream: AddonStream, account: NuvioAccount,
+         onClose: @escaping (TitlePlaybackRequest, String?) -> Void,
+         onOpenPlaybackTitle: @escaping () -> Void,
+         onRestorePlayer: ((AddonStream, TitlePlaybackRequest) -> Bool)? = nil) {
+        self.url = url
+        self.request = request
+        self.stream = stream
+        self.account = account
+        self.onClose = onClose
+        self.onOpenPlaybackTitle = onOpenPlaybackTitle
+        self.onRestorePlayer = onRestorePlayer
+        _viewModel = StateObject(wrappedValue: Self.makeViewModel(for: request))
+    }
+
+    private static func makeViewModel(for request: TitlePlaybackRequest) -> PlayerViewModel {
+        let viewModel = PlayerViewModel()
+        let accountID = request.accountID ?? ""
+        let profileID = request.profileID.map(String.init) ?? "guest"
+        viewModel.configureTitleSubtitlePreferences(profileScope: "\(accountID.utf8.count):\(accountID):\(profileID)")
+        return viewModel
+    }
 
     private var currentEpisode: NuvioVideo? {
         if let episode = request.selectedEpisode { return Self.video(episode) }
@@ -69,6 +92,7 @@ struct UpstreamPlaybackBridge: View {
             fetchPlaybackSources: fetchPlaybackSources,
             resolvePlaybackStream: resolvePlaybackStream,
             onRequestSources: returnToSources,
+            onOpenPlaybackTitle: openPlaybackTitle,
             viewModel: viewModel,
             onBack: close,
             onRemoteBack: close
@@ -144,6 +168,11 @@ struct UpstreamPlaybackBridge: View {
         } else {
             onClose(sourceRequest(), nil)
         }
+    }
+
+    private func openPlaybackTitle() {
+        flushProgress()
+        onOpenPlaybackTitle()
     }
 
     private func sourceRequest() -> TitlePlaybackRequest {

@@ -1,0 +1,483 @@
+--- a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+@@ -575,6 +575,15 @@
+     private var pendingSelectedExternalSubtitleURL: String?
+     private var subtitleFetchTask: Task<Void, Never>?
+     private var activeTrackSelectionKey: String?
++    private var titleSubtitleProfileScope: String?
++    private var titleSubtitleKey: String?
++    private var titleSubtitleSelection: PlayerTrackSelection.Subtitle?
++    private var usesTitleSubtitleSelection: Bool { titleSubtitleProfileScope != nil }
++
++    func configureTitleSubtitlePreferences(profileScope: String) {
++        titleSubtitleProfileScope = profileScope
++    }
++
+     private var pendingTrackSelection: PlayerTrackSelection?
+     /// The latest explicit audio/subtitle choice for this player session. Unlike
+     /// the persistent per-episode entry, this follows seamless episode advances.
+@@ -957,7 +966,8 @@
+                 )
+                 self.rememberSessionAudio(saved)
+             }
+-            if let currentSubtitle = self.subtitles.first(where: { $0.isSelected }) {
++            if !self.usesTitleSubtitleSelection,
++               let currentSubtitle = self.subtitles.first(where: { $0.isSelected }) {
+                 let saved = Self.trackSelection(for: currentSubtitle)
+                 self.rememberSessionSubtitle(saved)
+             }
+@@ -969,7 +979,7 @@
+                     allSubs.append(sub)
+                 }
+             }
+-            req.externalSubtitles = allSubs
++            req.externalSubtitles = self.usesTitleSubtitleSelection ? [] : allSubs
+         }
+         sessionCoordinator.onHandoffToast = { [weak self] message in
+             guard let self else { return }
+@@ -995,8 +1005,16 @@
+             self.didApplySavedSubtitleSelection = false
+             self.didApplyAudioPreference = false
+             self.didApplySubtitlePreference = false
+-            self.addedExternalSubtitleURLs = Set(self.sessionCoordinator.lastRequest?.externalSubtitles.map(\.url) ?? [])
+-            self.didAddExternalSubtitles = true
++            if self.usesTitleSubtitleSelection {
++                self.pendingSelectedExternalSubtitleURL = nil
++                self.pendingExternalSubtitles = []
++                self.addedExternalSubtitleURLs = []
++                self.hasExplicitSubtitleSelection = false
++                self.didAddExternalSubtitles = true
++            } else {
++                self.addedExternalSubtitleURLs = Set(self.sessionCoordinator.lastRequest?.externalSubtitles.map(\.url) ?? [])
++                self.didAddExternalSubtitles = true
++            }
+             self.audioTracks = []
+             self.chapters = []
+             self.chapterSkipIntervals = []
+@@ -1385,6 +1403,7 @@
+             externalSubtitles: pendingExternalSubtitles,
+             preferredAudioLanguages: preferredAudioLanguageCodes(),
+             preferredSubtitleLanguages: preferredSubtitleLanguageCodes(),
++            startsWithSubtitlesOff: usesTitleSubtitleSelection,
+             matchContentEnabled: matchContent,
+             cacheProfile: PlaybackCacheProfile.fromSettings(
+                 ProfileSettings.current.string(forKey: SettingsKey.networkCache)
+@@ -1479,7 +1498,7 @@
+     }
+ 
+     private func preferredSubtitleLanguageCodes() -> [String] {
+-        guard SubtitleLanguagePreferences.smartMatchingEnabled() else { return [] }
++        guard !usesTitleSubtitleSelection, SubtitleLanguagePreferences.smartMatchingEnabled() else { return [] }
+         return SubtitleLanguagePreferences.orderedFromDefaults()
+     }
+ 
+@@ -1703,6 +1722,13 @@
+             externalSubtitles: externalSubtitles
+         )
+         self.activeTrackSelectionKey = selectionKey
++        if usesTitleSubtitleSelection {
++            titleSubtitleKey = isStandalonePlaybackSession || isLiveStream ? nil : titleSubtitleProfileScope.map {
++                let titleID = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? meta.id) ?? meta.id
++                return "\($0.utf8.count):\($0):\(meta.type.lowercased()):\(titleID)"
++            }
++            titleSubtitleSelection = titleSubtitleKey.flatMap { TitleSubtitleSelectionStore.selection(for: $0) }
++        }
+         self.pendingTrackSelection = effectiveSelection
+         self.pendingResumeSeconds = isActionPlaybackSession || isLiveStream ? nil : resumeFrom
+         self.didApplyResume = false
+@@ -1718,10 +1744,10 @@
+         // The full list stays browsable in the subtitle panel; only smart-matched
+         // ones are eagerly loaded into mpv (loading all would fetch dozens of files).
+         self.availableExternalSubtitles = isStandalonePlaybackSession ? [] : externalSubtitles
+-        let smartMatched = isStandalonePlaybackSession || effectiveSelection?.subtitle != nil
++        let smartMatched = usesTitleSubtitleSelection || isStandalonePlaybackSession || effectiveSelection?.subtitle != nil
+             ? []
+             : Self.smartMatchedSubtitles(in: externalSubtitles)
+-        self.pendingExternalSubtitles = Self.subtitlesToPreload(
++        self.pendingExternalSubtitles = usesTitleSubtitleSelection ? [] : Self.subtitlesToPreload(
+             smartMatched: smartMatched,
+             savedSelection: effectiveSelection,
+             availableExternalSubtitles: externalSubtitles
+@@ -1754,7 +1780,7 @@
+         self.nextEpisodeAutoPlayDeadline = nil
+         self.skipIntervalLoadTask?.cancel()
+         self.didApplySavedAudioSelection = effectiveSelection?.audio == nil
+-        self.didApplySavedSubtitleSelection = effectiveSelection?.subtitle == nil
++        self.didApplySavedSubtitleSelection = !usesTitleSubtitleSelection && effectiveSelection?.subtitle == nil
+         self.didApplyAudioPreference = false
+         self.didApplySubtitlePreference = false
+         self.hasExplicitSubtitleSelection = false
+@@ -1878,6 +1904,11 @@
+ 
+         if isSceneEnabled {
+             sceneCoordinator.updateAvailableSubtitles(availableExternalSubtitles)
++        }
++
++        if usesTitleSubtitleSelection {
++            applyTitleSubtitleSelection()
++            return
+         }
+ 
+         if let targetURL = pendingSelectedExternalSubtitleURL ?? pendingTrackSelection?.subtitle?.externalURL,
+@@ -4255,7 +4286,11 @@
+         applySavedTrackSelectionsIfNeeded()
+         guard c === engine else { return }
+         applyAudioPreferenceIfNeeded()
+-        applySubtitlePreferenceIfNeeded()
++        if usesTitleSubtitleSelection {
++            applyTitleSubtitleSelection()
++        } else {
++            applySubtitlePreferenceIfNeeded()
++        }
+     }
+ 
+     // MARK: - Transport
+@@ -6743,6 +6778,7 @@
+     // MARK: - Track selection
+ 
+     func selectSubtitle(_ track: SubtitleTrack, persist: Bool = true) {
++        if usesTitleSubtitleSelection && persist { hasExplicitSubtitleSelection = true }
+         PlaybackTimelineRecorder.record(.subtitleSelectionRequested, engine: activeEngineKind)
+         pendingSelectedExternalSubtitleURL = nil
+         if track.id == "off" {
+@@ -6790,16 +6826,19 @@
+     /// Selects an external subtitle from the panel: if mpv already loaded this
+     /// URL (eagerly or from an earlier pick) just switch to that track,
+     /// otherwise `sub-add` it now and explicitly select that requested track.
+-    func selectExternalSubtitle(_ subtitle: NuvioSubtitle) {
++    func selectExternalSubtitle(_ subtitle: NuvioSubtitle, persist: Bool = true) {
++        if usesTitleSubtitleSelection && persist { hasExplicitSubtitleSelection = true }
+         PlaybackTimelineRecorder.record(.externalSubtitleRequested, engine: activeEngineKind)
+         startSubtitleAutoSyncIfNeeded(for: subtitle)
+         if let track = subtitles.first(where: { $0.externalFilename == subtitle.url }) {
+-            selectSubtitle(track)
++            selectSubtitle(track, persist: persist)
+         } else {
+-            saveSubtitleSelection(subtitle)
+-            didApplySavedSubtitleSelection = true
+-            didApplySubtitlePreference = true
+-            hasExplicitSubtitleSelection = true
++            if persist {
++                saveSubtitleSelection(subtitle)
++                didApplySavedSubtitleSelection = true
++                didApplySubtitlePreference = true
++                hasExplicitSubtitleSelection = true
++            }
+             pendingSelectedExternalSubtitleURL = subtitle.url
+             if !pendingExternalSubtitles.contains(where: { $0.url == subtitle.url }) {
+                 pendingExternalSubtitles.append(subtitle)
+@@ -6890,7 +6929,8 @@
+             }
+         }
+ 
+-        guard !didApplySavedSubtitleSelection, let subtitle = selection.subtitle else { return }
++        guard !usesTitleSubtitleSelection,
++              !didApplySavedSubtitleSelection, let subtitle = selection.subtitle else { return }
+         switch subtitle.kind {
+         case .off:
+             if let off = subtitles.first(where: { $0.id == "off" }) {
+@@ -7140,7 +7180,7 @@
+     }
+ 
+     private func reapplyAutomaticSubtitlePreferenceAfterAudioSelection() {
+-        guard !hasExplicitSubtitleSelection,
++        guard !usesTitleSubtitleSelection, !hasExplicitSubtitleSelection,
+               pendingTrackSelection?.subtitle == nil,
+               sessionTrackSelection?.subtitle == nil else { return }
+         didApplySubtitlePreference = false
+@@ -7213,6 +7253,10 @@
+ 
+     private func saveSubtitleSelection(_ track: SubtitleTrack) {
+         let subtitle = Self.trackSelection(for: track)
++        if usesTitleSubtitleSelection {
++            saveTitleSubtitleSelection(subtitle)
++            return
++        }
+         rememberSessionSubtitle(subtitle)
+         guard let activeTrackSelectionKey else { return }
+         PlayerTrackSelectionStore.saveSubtitle(subtitle, for: activeTrackSelectionKey)
+@@ -7246,9 +7290,77 @@
+             language: subtitle.language,
+             externalURL: subtitle.url
+         )
++        if usesTitleSubtitleSelection {
++            saveTitleSubtitleSelection(selection)
++            return
++        }
+         rememberSessionSubtitle(selection)
+         guard let activeTrackSelectionKey else { return }
+         PlayerTrackSelectionStore.saveSubtitle(selection, for: activeTrackSelectionKey)
++    }
++
++    private func saveTitleSubtitleSelection(_ selection: PlayerTrackSelection.Subtitle) {
++        titleSubtitleSelection = selection
++        if let titleSubtitleKey { TitleSubtitleSelectionStore.save(selection, for: titleSubtitleKey) }
++    }
++
++    private func applyTitleSubtitleSelection() {
++        guard !engine.isPlayerLoading, pendingSelectedExternalSubtitleURL == nil,
++              !hasExplicitSubtitleSelection, !didApplySavedSubtitleSelection else { return }
++        guard let saved = titleSubtitleSelection, saved.kind != .off else {
++            if let off = subtitles.first(where: { $0.id == "off" }), !off.isSelected {
++                selectSubtitle(off, persist: false)
++            }
++            return
++        }
++        let tracks = subtitles.filter { $0.id != "off" }
++        let matches = availableExternalSubtitles.compactMap { subtitle -> (NuvioSubtitle, Int)? in
++            guard let score = Self.subtitleMatchScore(
++                language: subtitle.language, label: subtitle.label, external: true,
++                forced: Self.isForcedSubtitleLabel(subtitle.label), saved: saved
++            ) else { return nil }
++            return (subtitle, score + (subtitle.url == saved.externalURL ? 8 : 0))
++        }
++        let loadedMatches = tracks.compactMap { track -> (SubtitleTrack, Int)? in
++            guard let score = Self.subtitleMatchScore(
++                language: track.language, label: track.name, external: !track.externalFilename.isEmpty,
++                forced: Self.isForcedSubtitle(track), saved: saved
++            ) else { return nil }
++            return (track, score + (!track.externalFilename.isEmpty && track.externalFilename == saved.externalURL ? 8 : 0))
++        }
++
++        let preferredExternal = matches.max { $0.1 < $1.1 }
++        let preferredTrack = loadedMatches.max { $0.1 < $1.1 }
++        if let (subtitle, score) = preferredExternal, score > (preferredTrack?.1 ?? -1) {
++            didApplySavedSubtitleSelection = true
++            selectExternalSubtitle(subtitle, persist: false)
++        } else if let (track, _) = preferredTrack {
++            didApplySavedSubtitleSelection = true
++            if !track.isSelected { selectSubtitle(track, persist: false) }
++        }
++    }
++
++    private static func subtitleMatchScore(
++        language: String?, label: String?, external: Bool, forced: Bool, saved: PlayerTrackSelection.Subtitle
++    ) -> Int? {
++        let sameLabel = sameTrackText(label, saved.name)
++        let savedLanguage = subtitleLanguage(saved.language, label: saved.name)
++        let trackLanguage = subtitleLanguage(language, label: label)
++        if let savedLanguage, let trackLanguage, !sameTrackText(trackLanguage, savedLanguage) { return nil }
++        if savedLanguage != nil && trackLanguage == nil && !sameLabel { return nil }
++        let preferredKind = (saved.kind == .external) == external
++        let preferredForced = forced == isForcedSubtitleLabel(saved.name)
++        return (sameLabel ? 16 : 0) + (preferredForced ? 4 : 0) + (preferredKind ? 2 : 0)
++    }
++
++    private static func subtitleLanguage(_ language: String?, label: String?) -> String? {
++        let tag = language?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
++        if !tag.isEmpty && tag != "und" && tag != "unknown" {
++            return SubtitleLanguagePreferences.humanLanguageName(from: tag)
++        }
++        return SubtitleLanguagePreferences.supportedLanguages.first {
++            SubtitleLanguagePreferences.matches(label, target: $0)
++        }
+     }
+ 
+     private func rememberSessionAudio(_ audio: PlayerTrackSelection.Audio) {
+@@ -9223,6 +9335,34 @@
+     var updatedAt: Date = Date()
+ }
+ 
++/// Cinema choices are isolated by account/profile and apply to the entire title.
++private enum TitleSubtitleSelectionStore {
++    private static let key = "cinema.player.titleSubtitleSelections"
++
++    private struct Entry: Codable {
++        let subtitle: PlayerTrackSelection.Subtitle
++        let updatedAt: Date
++    }
++
++    static func selection(for title: String) -> PlayerTrackSelection.Subtitle? {
++        entries()[title]?.subtitle
++    }
++
++    static func save(_ subtitle: PlayerTrackSelection.Subtitle, for title: String) {
++        var all = entries()
++        all[title] = Entry(subtitle: subtitle, updatedAt: Date())
++        let recent = all.sorted { $0.value.updatedAt > $1.value.updatedAt }.prefix(500)
++        let trimmed = Dictionary(uniqueKeysWithValues: recent.map { ($0.key, $0.value) })
++        guard let data = try? JSONEncoder().encode(trimmed) else { return }
++        UserDefaults.standard.set(data, forKey: key)
++    }
++
++    private static func entries() -> [String: Entry] {
++        guard let data = UserDefaults.standard.data(forKey: key) else { return [:] }
++        return (try? JSONDecoder().decode([String: Entry].self, from: data)) ?? [:]
++    }
++}
++
+ private enum PlayerTrackSelectionStore {
+     private static let maxItems = 300
+ 
+--- a/tvosApp/NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift
+@@ -30,6 +30,7 @@
+     var externalSubtitles: [NuvioSubtitle]
+     var preferredAudioLanguages: [String]
+     var preferredSubtitleLanguages: [String]
++    var startsWithSubtitlesOff: Bool
+     /// Settings → Frame Rate Matching / Match Content. `false` when Off.
+     var matchContentEnabled: Bool
+     var cacheProfile: PlaybackCacheProfile
+@@ -106,6 +108,7 @@
+         self.externalSubtitles = externalSubtitles
+         self.preferredAudioLanguages = preferredAudioLanguages
+         self.preferredSubtitleLanguages = preferredSubtitleLanguages
++        self.startsWithSubtitlesOff = startsWithSubtitlesOff
+         self.matchContentEnabled = matchContentEnabled
+         self.cacheProfile = cacheProfile
+         self.assMode = assMode
+--- a/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift
+@@ -428,6 +428,7 @@
+     let audioGainDB: Double
+     let autoplay: Bool
+     let preferredAudioLanguages: [String]
++    let startsWithSubtitlesOff: Bool
+ 
+     init(request: PlaybackLoadRequest) {
+         resumePositionMs = request.resumePositionSeconds.map { Int64(max(0, $0) * 1_000) }
+@@ -438,6 +439,7 @@
+         audioGainDB = request.audioGainDB
+         autoplay = request.autoplay
+         preferredAudioLanguages = request.preferredAudioLanguages
++        startsWithSubtitlesOff = request.startsWithSubtitlesOff
+     }
+ }
+ 
+@@ -1731,6 +1733,12 @@
+ #endif
+ 
+         // Commit seek, tracks, controls and autoplay together at FILE_LOADED.
++        if pendingLoadConfiguration?.startsWithSubtitlesOff == true {
++            selectSubtitle(-1)
++        } else {
++            desiredSubtitleSelection = nil
++            setStringProperty("sid", "auto")
++        }
+         if let langs = pendingLoadConfiguration?.preferredAudioLanguages,
+            !langs.isEmpty,
+            let alang = SubtitleLanguagePreferences.mpvLanguageList(for: langs) {
+--- a/Vendor/AetherEngine/Sources/AetherEngine/PlayerState.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/PlayerState.swift
+@@ -826,6 +826,9 @@
+     /// it along with the watchdog.
+     public var nativeRemoteHLSIngestFallback: Bool
+ 
++    /// Keep AVPlayer's remote-HLS subtitle group off until the host picks a track.
++    public var disablesAutomaticRemoteHLSSubtitles: Bool
++
+     /// Emit raw ASS event lines (`ReadOrder,Layer,Style,...,Text` including override tags) instead of plain-text extraction. Opt-in for hosts that render ASS styling themselves; pair with `TrackInfo.assHeader`. Only affects ASS / SSA codecs, on embedded and sidecar tracks alike: libavcodec normalises SubRip, WebVTT and mov_text through `ff_ass_add_rect` as well, so those carry an ASS payload the engine could emit but never does, and a session that mixes an ASS track with a SubRip one needs no reload to cross between them (AE#587). Default `false` (AetherEngine#30).
+     public var preserveASSMarkup: Bool
+ 
+@@ -1165,6 +1168,7 @@
+         clampsLiveResumeToWindow: Bool = true,
+         nativeRemoteHLS: Bool = false,
+         nativeRemoteHLSIngestFallback: Bool = true,
++        disablesAutomaticRemoteHLSSubtitles: Bool = false,
+         preserveASSMarkup: Bool = false,
+         prepareNativeSubtitles: Bool = false,
+         eagerNativeSubtitleReaders: Bool = false,
+@@ -1231,6 +1235,7 @@
+         self.clampsLiveResumeToWindow = clampsLiveResumeToWindow
+         self.nativeRemoteHLS = nativeRemoteHLS
+         self.nativeRemoteHLSIngestFallback = nativeRemoteHLSIngestFallback
++        self.disablesAutomaticRemoteHLSSubtitles = disablesAutomaticRemoteHLSSubtitles
+         self.preserveASSMarkup = preserveASSMarkup
+         self.prepareNativeSubtitles = prepareNativeSubtitles
+         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Subtitles.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Subtitles.swift
+@@ -1934,6 +1934,9 @@
+     public func clearSubtitle() {
+         externalSubtitleIntentGeneration &+= 1
+         hostExplicitSubtitleAction = true
++        if loadedOptions.nativeRemoteHLS && loadedOptions.disablesAutomaticRemoteHLSSubtitles {
++            forceNativeLegibleDeselectedUntilHostSelects()
++        }
+         // AE#359: subtitles off ends the rendition poll. The renditions themselves stay listed, only
+         // the fetching stops, so re-selecting the track starts fresh from the current window.
+         liveSubtitleFetchTask?.cancel()
+@@ -2828,7 +2831,7 @@
+                   let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
+                   !group.options.isEmpty else { return }
+             var attempts = 0
+-            while attempts < 25,
++            while !Task.isCancelled, attempts < 25,
+                   self.nativeSubtitleReapplyOrdinal == nil,
+                   self.currentAVPlayer?.currentItem === item {
+                 if attempts == 0 || item.currentMediaSelection.selectedMediaOption(in: group) != nil {
+@@ -2838,7 +2841,7 @@
+                 attempts += 1
+                 try? await Task.sleep(nanoseconds: 40_000_000)
+             }
+-            guard self.nativeSubtitleReapplyOrdinal == nil,
++            guard !Task.isCancelled, self.nativeSubtitleReapplyOrdinal == nil,
+                   self.currentAVPlayer?.currentItem === item else { return }
+             self.armNativeLegibleReselectionObserver(item: item, group: group)
+         }
+@@ -2957,7 +2960,8 @@
+             // later than the group load above.
+             for await ready in host.$isReady.values where ready { break }
+             guard !Task.isCancelled, self.currentAVPlayer?.currentItem === item,
+-                  !self.hostExplicitSubtitleAction else { return }
++                  !self.hostExplicitSubtitleAction,
++                  !self.loadedOptions.disablesAutomaticRemoteHLSSubtitles else { return }
+             if let selected = item.currentMediaSelection.selectedMediaOption(in: group),
+                let ordinal = group.options.firstIndex(of: selected) {
+                 // #316: an auto-selected injected rendition mirrors back as the EXTERNAL id it was
+@@ -2985,6 +2989,7 @@
+     /// A miss leaves the previous selection alone and says so rather than silently reporting success.
+     func selectInjectedSubtitleRendition(id: Int, name: String) {
+         guard let item = currentAVPlayer?.currentItem else { return }
++        if loadedOptions.disablesAutomaticRemoteHLSSubtitles { cancelNativeLegibleDeselectPin() }
+         cancelSidecarTask()
+         clearSubtitleDrainTarget(channel: .primary, reason: .injectedRenditionSelected)
+         activeEmbeddedSubtitleStreamIndex = -1
+@@ -3012,6 +3017,7 @@
+                     category: .engine)
+                 return
+             }
++            guard self.activeSubtitleTrackIndex == id, self.currentAVPlayer?.currentItem === item else { return }
+             item.select(group.options[index], in: group)
+             EngineLog.emit("[AetherEngine] #316: selected injected rendition \"\(name)\" for external id=\(id)",
+                            category: .engine)
+@@ -3024,6 +3030,7 @@
+     func selectRemoteHLSSubtitleTrack(id: Int) {
+         guard let ordinal = RemoteHLSMediaSelection.ordinal(forTrackID: id),
+               let item = currentAVPlayer?.currentItem else { return }
++        if loadedOptions.disablesAutomaticRemoteHLSSubtitles { cancelNativeLegibleDeselectPin() }
+         cancelSidecarTask()
+         subtitleCues = []
+         isSubtitleActive = true
+@@ -3033,6 +3040,7 @@
+             self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
+             guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible),
+                   ordinal < group.options.count else { return }
++            guard self.activeSubtitleTrackIndex == id, self.currentAVPlayer?.currentItem === item else { return }
+             item.select(group.options[ordinal], in: group)
+             EngineLog.emit(
+                 "[AetherEngine] AE#154: remote-HLS legible select ordinal=\(ordinal) (\(group.options[ordinal].displayName))",
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Loading.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Loading.swift
+@@ -671,6 +671,9 @@
+         // AE#154: surface the item's legible AVMediaSelectionGroup as `subtitleTracks` so hosts with
+         // their own picker see the external WebVTT renditions AVPlayer renders on this bypass.
+         // Selection routes back through `selectSubtitleTrack(index:)` / `clearSubtitle()`.
++        if options.disablesAutomaticRemoteHLSSubtitles {
++            forceNativeLegibleDeselectedUntilHostSelects()
++        }
+         publishRemoteHLSSubtitleTracks(host: host)
+ 
+         // VOD path triggers play() at the tail of load(); this lean path early-returns, so self-start here. AVKit drives match-content; automaticallyWaitsToMinimizeStalling handles play-before-ready. Without this call the item reaches readyToPlay but timeControlStatus stays .paused.
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+ReloadWithOptions.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+ReloadWithOptions.swift
+@@ -489,7 +489,7 @@
+         "dvrWindowSeconds",
+         "softwareDVRRetention",
+         "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveEdgeCushionSeconds", "liveJoinStartsImmediately",
+-        "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
++        "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback", "disablesAutomaticRemoteHLSSubtitles",
+         "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "generatesBackgroundScrubPreviews", "confirmAtmos",
+         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
+         "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "skipsContainerAttachments", "preferredAudioLanguages",

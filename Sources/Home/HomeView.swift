@@ -7,6 +7,11 @@ enum CinemaStyle {
 private enum HomeFocusTarget: Hashable {
     case hero, nextFeatured
     case poster(HomeCollection.ID, CinemetaSearchResult.ID)
+
+    var isPoster: Bool {
+        if case .poster = self { return true }
+        return false
+    }
 }
 
 struct HomeHeroScrollPosition: Equatable {
@@ -31,10 +36,15 @@ final class HomeHeroScroll {
 private struct HomeHeroScrollBehavior: ScrollTargetBehavior {
     let shelfOffset: CGFloat
     let isBelowHero: Bool
+    let prefersShelfPosition: Bool
 
     func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
         guard shelfOffset > 0 else { return }
         let offset = target.rect.minY
+        if prefersShelfPosition {
+            target.rect.origin.y = max(offset, shelfOffset)
+            return
+        }
         if isBelowHero {
             guard offset <= shelfOffset else { return }
             target.rect.origin.y = offset < shelfOffset * 0.7 ? 0 : shelfOffset
@@ -120,6 +130,7 @@ struct HomeView: View {
     let heroScroll: HomeHeroScroll
 
     @Environment(\.scenePhase) private var scenePhase
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(NuvioAccount.self) private var account
     @Environment(CinemaTitleNavigation.self) private var titles
     @Environment(\.resetFocus) private var resetFocus
@@ -176,6 +187,10 @@ struct HomeView: View {
         default:
             return detailOrigin.target
         }
+    }
+
+    private var prefersShelfPosition: Bool {
+        isAvailable && (preferredReturnFocus ?? focusedItem)?.isPoster == true
     }
 
     var body: some View {
@@ -263,8 +278,25 @@ struct HomeView: View {
             }
         }
         .scrollPosition($verticalPosition)
-        .scrollTargetBehavior(HomeHeroScrollBehavior(shelfOffset: shelfOffset, isBelowHero: isBelowHero))
+        .scrollTargetBehavior(HomeHeroScrollBehavior(
+            shelfOffset: shelfOffset,
+            isBelowHero: isBelowHero,
+            prefersShelfPosition: prefersShelfPosition
+        ))
         .scrollIndicators(.hidden)
+        .onChange(of: focusedItem?.isPoster) { wasPoster, isPoster in
+            guard isAvailable, detailOrigin == nil else { return }
+            if isPoster == true, heroScroll.position.distance < shelfOffset - 1 {
+                scrollHome(to: shelfOffset, animated: true)
+            } else if wasPoster == true, isPoster == false {
+                scrollHome(to: 0, animated: true)
+            }
+        }
+        .onScrollPhaseChange { _, phase, context in
+            guard phase == .idle, prefersShelfPosition,
+                  context.geometry.contentOffset.y + context.geometry.contentInsets.top < shelfOffset - 1 else { return }
+            scrollHome(to: shelfOffset, animated: false)
+        }
         .onScrollGeometryChange(for: HomeHeroScrollPosition.self) { geometry in
             HomeHeroScrollPosition(
                 distance: max(0, geometry.contentOffset.y + geometry.contentInsets.top),
@@ -299,12 +331,7 @@ struct HomeView: View {
             detailOrigin = nil
             return
         }
-        let offset = target == .hero ? 0 : origin.verticalOffset
-        if abs(heroScroll.position.distance - offset) > 1 {
-            var transaction = Transaction(animation: nil)
-            transaction.disablesAnimations = true
-            withTransaction(transaction) { verticalPosition.scrollTo(y: offset) }
-        }
+        restoreScroll(for: target, from: origin)
         // Both scroll views need to lay out the preferred card after Home becomes available.
         do {
             try await Task.sleep(for: .milliseconds(50))
@@ -313,10 +340,26 @@ struct HomeView: View {
                 focusedItem = target
             }
             try await Task.sleep(for: .milliseconds(150))
+            if focusedItem == target { restoreScroll(for: target, from: origin) }
             detailOrigin = nil
         } catch {
             // A new title or a change of tab invalidates this focus update.
         }
+    }
+
+    private func restoreScroll(for target: HomeFocusTarget, from origin: DetailOrigin) {
+        // The selected card can be visible at the bottom before the hero has finished scrolling away.
+        let offset = target.isPoster ? max(origin.verticalOffset, heroScroll.position.shelfOffset) : 0
+        if abs(heroScroll.position.distance - offset) > 1 {
+            scrollHome(to: offset, animated: false)
+        }
+    }
+
+    private func scrollHome(to offset: CGFloat, animated: Bool) {
+        let animation: Animation? = animated && !reduceMotion ? .smooth(duration: 0.42) : nil
+        var transaction = Transaction(animation: animation)
+        transaction.disablesAnimations = animation == nil
+        withTransaction(transaction) { verticalPosition.scrollTo(y: offset) }
     }
 
     private func retry() {

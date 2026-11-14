@@ -1,0 +1,81 @@
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
+@@ -5,9 +5,27 @@
+ /// Phase D: on-device recognition of bitmap subtitle images (PGS / DVB / DVD) into plain-text
+ /// cues for the native WebVTT rendition (PiP / AirPlay / external display). Lossy by design;
+ /// a failed or empty recognition drops that cue and the rendition just misses the line, the
+-/// fullscreen overlay keeps the pixel-accurate bitmaps.
++/// fullscreen overlay can use a separate executor for subtitle recognition near the playhead.
+ enum SubtitleImageOCR {
+     private static let executor = Executor()
++    private static let playbackExecutor = Executor()
++
++    nonisolated static func recognizeForPlayback(_ image: CGImage, trackLanguage: String?) async -> String? {
++        let language = recognitionLanguage(forTrackLanguage: trackLanguage)
++        return await playbackExecutor.run {
++            guard let flat = flattenedOntoBlack(image) else { return nil }
++            if let observations = recognize(flat, at: .fast, language: language, requireLanguageMatch: true) {
++                return assembleLines(observations)
++            }
++            // The fast model only supports a subset of languages. Prefer the bitmap
++            // fallback to guessing in a different language if accurate recognition fails.
++            guard !accurateIsUnavailable else { return nil }
++            guard let observations = recognize(flat, at: .accurate, language: language, requireLanguageMatch: true) else {
++                return nil
++            }
++            return assembleLines(observations)
++        }
++    }
+ 
+     /// Vision bounding boxes are normalized with a bottom-left origin; reading order is
+     /// descending midY. Blank fragments are dropped; nil when nothing readable remains.
+@@ -24,7 +42,7 @@
+     /// Track tags are ISO 639-1/2 ("ger"), Vision wants BCP-47 primary codes ("de"). The engine's
+     /// synonym classes resolve the bibliographic 639-2/B forms Foundation cannot ("ger", "fre").
+     nonisolated static func recognitionLanguage(forTrackLanguage tag: String?) -> String? {
+-        guard let raw = tag?.trimmingCharacters(in: .whitespaces).lowercased(), !raw.isEmpty else { return nil }
++        guard let raw = tag?.trimmingCharacters(in: .whitespaces).lowercased(), !raw.isEmpty, raw != "und" else { return nil }
+         if let set = AetherEngine.languageSynonyms.first(where: { $0.contains(raw) }),
+            let twoLetter = set.first(where: { $0.count == 2 }) {
+             return twoLetter
+@@ -94,17 +112,21 @@
+     /// recognition of a line beats no line.
+     private nonisolated static func recognize(_ image: CGImage,
+                                               at level: VNRequestTextRecognitionLevel,
+-                                              language: String?) -> [(text: String, midY: CGFloat)]? {
++                                              language: String?,
++                                              requireLanguageMatch: Bool = false) -> [(text: String, midY: CGFloat)]? {
+         let request = VNRecognizeTextRequest()
+         request.recognitionLevel = level
+         request.usesLanguageCorrection = true
+-        if let language,
+-           let supported = try? request.supportedRecognitionLanguages(),
+-           let match = supported.first(where: {
+-               let s = $0.lowercased()
+-               return s == language || s.hasPrefix(language + "-")
+-           }) {
+-            request.recognitionLanguages = [match]
++        if let language {
++            let supported = (try? request.supportedRecognitionLanguages()) ?? []
++            if let match = supported.first(where: {
++                let s = $0.lowercased()
++                return s == language || s.hasPrefix(language + "-")
++            }) {
++                request.recognitionLanguages = [match]
++            } else if requireLanguageMatch {
++                return nil
++            }
+         }
+         do {
+             try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
+@@ -236,3 +258,10 @@
+         if first { EngineLog.emit("[SubtitleOCR] degraded: \(reason)", category: .engine) }
+     }
+ }
++
++public extension SubtitleImage {
++    /// Returns plain text for a decoded bitmap so the playback host can style it consistently.
++    nonisolated func recognizedPlaybackText(trackLanguage: String?) async -> String? {
++        await SubtitleImageOCR.recognizeForPlayback(cgImage, trackLanguage: trackLanguage)
++    }
++}

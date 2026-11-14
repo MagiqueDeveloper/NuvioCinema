@@ -179,7 +179,8 @@ struct TitlePlaybackView: View {
         if case let .video(url) = stream.destination {
             #if NUVIO_UPSTREAM_PLAYER
             UpstreamPlaybackBridge(url: url, request: request, stream: stream, account: account,
-                                   onClose: returnFromUpstreamPlayer, onRestorePlayer: restoreUpstreamPlayer)
+                                   onClose: returnFromUpstreamPlayer, onOpenPlaybackTitle: onDismiss,
+                                   onRestorePlayer: restoreUpstreamPlayer)
             #else
             StreamPlaybackScreen(url: url, request: request, stream: stream, account: account,
                                  onNext: nextEpisodeAction, onFailure: playbackFailed)

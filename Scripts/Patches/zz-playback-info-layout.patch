@@ -1,0 +1,383 @@
+--- a/tvosApp/NuvioTV/Sources/UI/Player/Scene/ScenePanelView.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/Scene/ScenePanelView.swift
+@@ -14,6 +14,12 @@
+     @ObservedObject var viewModel: SceneViewModel
+     var isAdvancing: Bool = false
+     let onDismiss: () -> Void
++    let infoMeta: NuvioMeta?
++    let infoEpisode: NuvioVideo?
++    let infoDuration: Double
++    let infoVideoSize: CGSize
++    let onPlayFromBeginning: (() -> Void)?
++    let onGoToTitle: (() -> Void)?
+     let onPlayNextEpisode: (() -> Void)?
+     let watchPartyContent: ((
+         FocusState<String?>.Binding,
+@@ -54,6 +60,12 @@
+         viewModel: SceneViewModel,
+         isAdvancing: Bool = false,
+         onDismiss: @escaping () -> Void,
++        infoMeta: NuvioMeta? = nil,
++        infoEpisode: NuvioVideo? = nil,
++        infoDuration: Double = 0,
++        infoVideoSize: CGSize = .zero,
++        onPlayFromBeginning: (() -> Void)? = nil,
++        onGoToTitle: (() -> Void)? = nil,
+         onPlayNextEpisode: (() -> Void)? = nil,
+         watchPartyContent: ((
+             FocusState<String?>.Binding,
+@@ -74,6 +86,12 @@
+         self.viewModel = viewModel
+         self.isAdvancing = isAdvancing
+         self.onDismiss = onDismiss
++        self.infoMeta = infoMeta
++        self.infoEpisode = infoEpisode
++        self.infoDuration = infoDuration
++        self.infoVideoSize = infoVideoSize
++        self.onPlayFromBeginning = onPlayFromBeginning
++        self.onGoToTitle = onGoToTitle
+         self.onPlayNextEpisode = onPlayNextEpisode
+         self.watchPartyContent = watchPartyContent
+         self.watchPartyFocusTarget = watchPartyFocusTarget
+@@ -506,103 +524,177 @@
+         .modifier(TvCardGlassBackground(isFocused: false, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)))
+     }
+     
+-    // MARK: - Info Tab Content (Horizontal Playback Telemetry)
+-    
++    // MARK: - Info Tab Content
++
+     private var infoTabContent: some View {
+-        let info = viewModel.playbackInfo ?? ScenePlaybackInfo()
+-        
+-        return ScrollView(.horizontal, showsIndicators: false) {
+-            HStack(alignment: .top, spacing: 20) {
+-                // Section 1: PLAYBACK ENGINE
+-                telemetryCard(title: "PLAYBACK ENGINE", width: 340, height: 256) {
+-                    VStack(alignment: .leading, spacing: 6) {
+-                        infoRow(label: "Engine", value: info.engine)
+-                        infoRow(label: "Version", value: info.version)
+-                    }
+-                }
+-                
+-                // Section 2: VIDEO STREAM
+-                telemetryCard(title: "VIDEO STREAM", width: 560, height: 256) {
+-                    VStack(alignment: .leading, spacing: 4) {
+-                        infoRow(label: "Codec", value: info.videoCodec)
+-                        infoRow(label: "Resolution", value: info.resolution)
+-                        infoRow(label: "Frame Rate", value: info.frameRate)
+-                        infoRow(label: "Dynamic Range", value: info.dynamicRange)
+-                        if let profile = info.dolbyVisionProfile, !profile.isEmpty {
+-                            infoRow(label: "Dolby Vision Profile", value: profile)
+-                        }
+-                        infoRow(label: "Bitrate", value: info.videoBitrate)
+-                        infoRow(label: "Container", value: info.container)
+-                        infoRow(label: "Decoder", value: info.videoDecoder)
+-                    }
+-                }
+-                
+-                // Section 3: AUDIO STREAM
+-                telemetryCard(title: "AUDIO STREAM", width: 540, height: 256) {
+-                    VStack(alignment: .leading, spacing: 6) {
+-                        infoRow(label: "Codec", value: info.audioCodec)
+-                        infoRow(label: "Channels", value: info.audioChannels)
+-                        infoRow(label: "Language", value: info.audioLanguage)
+-                        infoRow(label: "Bitrate", value: info.audioBitrate)
+-                        infoRow(label: "A/V producer gap", value: formattedAVSyncGap(info.avSyncGapMs))
+-                        infoRow(label: "Spatial format", value: info.audioSpatialFormat)
+-                        infoRow(label: "Audio pipeline", value: info.audioDecoder, lineLimit: 2)
+-                    }
+-                }
+-            }
+-            .padding(.horizontal, 60)
+-            .padding(.top, 16)
+-            .padding(.bottom, 24)
+-        }
+-        .scrollClipDisabled()
+-    }
+-    
+-    private func telemetryCard<Content: View>(
+-        title: String,
+-        width: CGFloat,
+-        height: CGFloat = 236,
+-        @ViewBuilder content: () -> Content
++        let artworkURL = infoEpisode?.thumbnail ?? infoMeta?.backdropUrl
++        let artworkFallback = infoEpisode?.thumbnail == nil ? nil : infoMeta?.backdropUrl
++        let shape = RoundedRectangle(cornerRadius: 40, style: .continuous)
++
++        return HStack(alignment: .center, spacing: 36) {
++            CachedPosterArtwork(
++                urlString: artworkURL,
++                fallbackURLString: artworkFallback,
++                width: 356,
++                height: 200
++            ) {
++                ArtworkPlaceholder(hasArtworkURL: artworkURL != nil, cornerRadius: 24)
++            }
++            .frame(width: 356, height: 200)
++            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
++            .accessibilityHidden(true)
++
++            VStack(alignment: .leading, spacing: 8) {
++                Text(infoTitle)
++                    .font(.system(size: 32, weight: .bold))
++                    .foregroundStyle(.white)
++                    .lineLimit(1)
++                    .accessibilityAddTraits(.isHeader)
++
++                if let overview = infoOverview {
++                    Text(overview)
++                        .font(.system(size: 24, weight: .medium))
++                        .foregroundStyle(.white.opacity(0.94))
++                        .lineLimit(2)
++                }
++
++                Spacer(minLength: 8)
++
++                HStack(spacing: 9) {
++                    if !infoDetails.isEmpty {
++                        Text(infoDetails.joined(separator: " • "))
++                            .font(.system(size: 22, weight: .semibold))
++                            .foregroundStyle(.white.opacity(0.95))
++                            .lineLimit(1)
++                    }
++                    if let quality = infoVideoQuality {
++                        Text(quality)
++                            .font(.system(size: 15, weight: .bold))
++                            .foregroundStyle(.white)
++                            .padding(.horizontal, 5)
++                            .padding(.vertical, 1)
++                            .overlay {
++                                RoundedRectangle(cornerRadius: 3)
++                                    .strokeBorder(.white.opacity(0.85), lineWidth: 1.5)
++                            }
++                            .accessibilityLabel(quality == "4K" ? Text("4K video") : Text("High definition video"))
++                    }
++                }
++            }
++            .frame(maxWidth: .infinity, maxHeight: 180, alignment: .leading)
++            .accessibilityElement(children: .combine)
++
++            if !infoActionFocusIDs.isEmpty {
++                VStack(spacing: 12) {
++                    if let onPlayFromBeginning {
++                        infoAction(
++                            L10n.string("cinema_player_from_beginning", fallback: "From Beginning"),
++                            systemImage: "play.fill",
++                            id: "info.restart",
++                            isPrimary: true,
++                            action: onPlayFromBeginning
++                        )
++                    }
++                    if let onGoToTitle {
++                        infoAction(
++                            infoMeta?.isSeries == true || infoEpisode != nil
++                                ? L10n.string("cinema_player_go_to_show", fallback: "Go to Show")
++                                : L10n.string("cinema_player_go_to_movie", fallback: "Go to Movie"),
++                            systemImage: "info.circle",
++                            id: "info.title",
++                            action: onGoToTitle
++                        )
++                    }
++                }
++                .frame(width: 384)
++            }
++        }
++        .padding(24)
++        .frame(maxWidth: .infinity, alignment: .leading)
++        .modifier(TvDetailsGlassBackground(filled: false, shape: shape))
++        .overlay {
++            shape.strokeBorder(.white.opacity(0.24), lineWidth: 1)
++                .allowsHitTesting(false)
++        }
++        .padding(.horizontal, 60)
++        .padding(.top, 16)
++    }
++
++    private var infoTitle: String {
++        infoEpisode?.title.playbackInfoNonBlank ?? infoMeta?.name.playbackInfoNonBlank ?? viewModel.infoTitle
++    }
++
++    private var infoOverview: String? {
++        infoEpisode?.overview?.playbackInfoNonBlank ?? infoMeta?.description?.playbackInfoNonBlank ?? viewModel.infoOverview.playbackInfoNonBlank
++    }
++
++    private var infoDetails: [String] {
++        let position: String?
++        if let episode = infoEpisode, episode.episode > 0 {
++            position = episode.season > 0
++                ? String(localized: "S\(episode.season), E\(episode.episode)")
++                : String(localized: "E\(episode.episode)")
++        } else {
++            position = infoMeta?.year.map(String.init) ?? viewModel.infoYear
++        }
++        let runtime = infoDuration.isFinite && infoDuration >= 60
++            ? Duration.seconds(infoDuration).formatted(.units(allowed: [.hours, .minutes], width: .abbreviated, maximumUnitCount: 2))
++            : NuvioRuntimeDisplay.formatted(infoMeta?.runtime ?? viewModel.infoRuntime)
++        return [
++            infoMeta?.genres?.compactMap(\.playbackInfoNonBlank).first,
++            position,
++            runtime,
++            infoMeta?.certification?.playbackInfoNonBlank
++        ].compactMap { $0 }
++    }
++
++    private var infoVideoQuality: String? {
++        if infoVideoSize.width >= 3800 || infoVideoSize.height >= 2160 { return "4K" }
++        if infoVideoSize.width >= 1280 || infoVideoSize.height >= 720 { return "HD" }
++        return nil
++    }
++
++    private var infoActionFocusIDs: [String] {
++        [onPlayFromBeginning == nil ? nil : "info.restart", onGoToTitle == nil ? nil : "info.title"]
++            .compactMap { $0 }
++    }
++
++    private func infoAction(
++        _ title: String,
++        systemImage: String,
++        id: String,
++        isPrimary: Bool = false,
++        action: @escaping () -> Void
+     ) -> some View {
+-        VStack(alignment: .leading, spacing: 8) {
+-            Text(title)
+-                .font(.system(size: 15, weight: .heavy))
+-                .foregroundColor(.white)
+-                .tracking(1.2)
+-            
+-            Rectangle()
+-                .fill(Color.white.opacity(0.14))
+-                .frame(height: 1)
+-                .padding(.bottom, 2)
+-            
+-            content()
+-            
+-            Spacer(minLength: 0)
+-        }
+-        .padding(.horizontal, 22)
+-        .padding(.vertical, 14)
+-        .frame(width: width, height: height, alignment: .topLeading)
+-        .modifier(TvCardGlassBackground(isFocused: false, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)))
+-    }
+-    
+-    private func infoRow(label: String, value: String, lineLimit: Int = 1) -> some View {
+-        HStack(alignment: .firstTextBaseline, spacing: 14) {
+-            Text(label)
+-                .font(.system(size: 15, weight: .regular))
+-                .foregroundColor(Color.white.opacity(0.65))
++        let isFocused = focusedCardID == id
++        let usesLightFill = isFocused || (isPrimary && focusedCardID == nil)
++        return Button(action: action) {
++            Label(title, systemImage: systemImage)
++                .font(.system(size: 25, weight: isFocused ? .bold : .semibold))
++                .foregroundStyle(usesLightFill ? .black : .white)
+                 .lineLimit(1)
+-                .frame(minWidth: 90, alignment: .leading)
+-            
+-            Spacer(minLength: 12)
+-            
+-            Text(value)
+-                .font(.system(size: 15, weight: .semibold))
+-                .foregroundColor(.white)
+-                .lineLimit(lineLimit)
+-                .truncationMode(.tail)
+-                .multilineTextAlignment(.trailing)
+-        }
+-    }
+-    
++                .minimumScaleFactor(0.77)
++                .padding(.horizontal, 18)
++                .frame(maxWidth: .infinity)
++                .frame(height: 70)
++                .modifier(TvDetailsGlassBackground(filled: usesLightFill, shape: Capsule()))
++        }
++        .buttonStyle(PosterCardButtonStyle())
++        .focused($focusedCardID, equals: id)
++        .disabled(isContentEntryLocked(id))
++        .focusEffectDisabledIfAvailable()
++        .onExitCommand(perform: onDismiss)
++        .onMoveCommand { direction in
++            if direction == .up {
++                if let first = infoActionFocusIDs.first, first != id {
++                    focusedCardID = first
++                } else {
++                    focusSelectedTabFromContent()
++                }
++            }
++        }
++    }
++
+     // MARK: - Up Next Tab Content
+     
+     @ViewBuilder
+@@ -925,7 +1017,7 @@
+             let song = viewModel.snapshot.song.map { "song-\($0.id)" }
+             anchors = actors.isEmpty ? (song.map { [$0] } ?? []) : actors + (song.map { [$0] } ?? [])
+         case .info:
+-            anchors = []
++            anchors = infoActionFocusIDs
+         case .upNext:
+             anchors = viewModel.nextEpisode == nil ? [] : ["upNext"]
+         case .watchParty:
+@@ -946,7 +1038,7 @@
+         case .scene:
+             return contentFocusAnchorCandidates(for: tab).contains(id)
+         case .info:
+-            return false
++            return infoActionFocusIDs.contains(id)
+         case .upNext:
+             return id == "upNext" && viewModel.nextEpisode != nil
+         case .watchParty:
+@@ -1016,3 +1108,10 @@
+         focusedCardID = target
+     }
+ }
++
++private extension String {
++    var playbackInfoNonBlank: String? {
++        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
++        return trimmed.isEmpty ? nil : trimmed
++    }
++}
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+Layers.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+Layers.swift
+@@ -555,6 +555,14 @@
+     @ViewBuilder
+     var scenePanelLayer: some View {
+         if viewModel.showScenePanel {
++            let infoMeta = viewModel.activeMeta ?? meta
++            let infoEpisode = viewModel.panelCurrentEpisodeId.flatMap { id in
++                viewModel.spoilerEpisodeGuide.first { $0.id == id }
++                    ?? infoMeta.videos?.first { $0.id == id }
++                    ?? episodes.first { $0.id == id }
++                    ?? (currentEpisode?.id == id ? currentEpisode : nil)
++            }
++
+             ScenePanelView(
+                 viewModel: viewModel.sceneViewModel,
+                 isAdvancing: viewModel.isAdvancingEpisode,
+@@ -562,6 +570,23 @@
+                     withAnimation(.playerControls) {
+                         viewModel.closeScene()
+                         focusRemoteInput()
++                    }
++                },
++                infoMeta: infoMeta,
++                infoEpisode: infoEpisode,
++                infoDuration: viewModel.time.duration,
++                infoVideoSize: viewModel.videoNaturalSize,
++                onPlayFromBeginning: !viewModel.isLiveStream && didReportPlaybackStarted ? {
++                    guard !isWakingFromBackground else { return }
++                    viewModel.seek(to: 0, exact: true)
++                    viewModel.closeScene()
++                    viewModel.play()
++                    focusRemoteInput()
++                } : nil,
++                onGoToTitle: onOpenPlaybackTitle.map { action in
++                    {
++                        guard !isWakingFromBackground else { return }
++                        action()
+                     }
+                 },
+                 onPlayNextEpisode: {
