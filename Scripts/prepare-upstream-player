@@ -99,7 +99,7 @@ def replace_once(source, original, modified):
 
 project = upstream("tvosApp/Project.swift").decode()
 project = replace_once(project, 'let bundleID = "com.pyksel.nuviotvos"', 'let bundleID = "com.nuviocinema.app"')
-project = replace_once(project, 'let marketingVersion = "3.5.1"', 'let marketingVersion = "0.1.1"')
+project = replace_once(project, 'let marketingVersion = "3.5.1"', 'let marketingVersion = "0.1.2"')
 project = replace_once(project, 'let projectVersion = "82"', 'let projectVersion = "1"')
 project = replace_once(project, '    productName: "NuvioTV",', '    productName: "NuvioCinema",')
 project = replace_once(project, '    sources: ["NuvioTV/Sources/**/*.swift"],',
