@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 enum CinemaStyle {
     static let background = Color(white: 0.105)
@@ -462,6 +463,16 @@ private struct FeaturedHero: View {
             featuredActions(index: carousel.index)
         }
         .focusSection()
+        .onReceive(NotificationCenter.default.publisher(for: UIFocusSystem.movementDidFailNotification)) { notification in
+            // Let tvOS move between the buttons and play its navigation click. An outward move pages the carousel.
+            guard isActive,
+                  let context = notification.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext else { return }
+            switch (focus.wrappedValue, context.focusHeading) {
+            case (.hero?, .left): move(-1)
+            case (.nextFeatured?, .right): move(1)
+            default: break
+            }
+        }
         .onScrollVisibilityChange(threshold: 0.45) { isVisible = $0 }
         .onChange(of: isActive) { _, active in
             if !active { pendingStep = nil }
@@ -583,10 +594,6 @@ private struct FeaturedHero: View {
                 }
                 .focused(focus, equals: .hero)
                 .prefersDefaultFocus(prefersFocus, in: focusScope)
-                .onMoveCommand { direction in
-                    if direction == .left { move(-1) }
-                    if direction == .right && entries.count > 1 { focus.wrappedValue = .nextFeatured }
-                }
                 .accessibilityLabel("View details for \(entry.title.name)")
                 .accessibilityValue(entries.count > 1 ? Text("\(index + 1) of \(entries.count)") : Text(""))
                 .accessibilityActions {
@@ -603,10 +610,6 @@ private struct FeaturedHero: View {
                     }
                     .buttonBorderShape(.circle)
                     .focused(focus, equals: .nextFeatured)
-                    .onMoveCommand { direction in
-                        if direction == .left { focus.wrappedValue = .hero }
-                        if direction == .right { move(1) }
-                    }
                     .accessibilityLabel("Next featured title")
                 }
             }
