@@ -39,6 +39,20 @@ struct NuvioSettingsView: View {
                         linkAccount
                         accountMessages
                     }
+
+                    #if NUVIO_UPSTREAM_PLAYER
+                    if let issue = TopShelfSigningCheck.installedIssue {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Label("Top Shelf Unavailable", systemImage: "exclamationmark.triangle")
+                                .font(.system(size: 26, weight: .semibold))
+                                .accessibilityAddTraits(.isHeader)
+                            Text(issue.message)
+                                .font(.system(size: 23))
+                                .foregroundStyle(.secondary)
+                        }
+                        .settingsPanel()
+                    }
+                    #endif
                 }
                 .padding(.vertical, 36)
                 .padding(.horizontal, 34)
@@ -516,11 +530,6 @@ private struct NuvioAccountSettings: View {
                     Text(message)
                         .foregroundStyle(.secondary)
                 }
-                #if NUVIO_UPSTREAM_PLAYER
-                if !TopShelfFeedStore.isAvailable {
-                    LabeledContent("Top Shelf", value: "Shared app group unavailable")
-                }
-                #endif
             }
 
             Button("Sign Out", role: .destructive) {

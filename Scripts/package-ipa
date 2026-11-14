@@ -1,0 +1,52 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 2 ]; then
+    printf 'Usage: %s PATH_TO_BUILT_APP OUTPUT_IPA\n' "$0" >&2
+    exit 2
+fi
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+source_app=$1
+output_dir=$(CDPATH= cd -- "$(dirname -- "$2")" && pwd)
+output="$output_dir/$(basename -- "$2")"
+entitlements="$root/.upstream-player/tvosApp/TopShelf/TopShelf.entitlements"
+
+staging=$(mktemp -d)
+trap 'rm -rf "$staging"' EXIT
+mkdir "$staging/Payload"
+app="$staging/Payload/NuvioCinema.app"
+extension="$app/PlugIns/TopShelf.appex"
+ditto --norsrc --noextattr "$source_app" "$app"
+
+if [ ! -f "$extension/Info.plist" ] || [ ! -f "$entitlements" ]; then
+    printf '%s\n' 'The generated app must include the Top Shelf extension and its App Group entitlements.' >&2
+    exit 1
+fi
+
+if [ -e "$app/embedded.mobileprovision" ] || [ -e "$extension/embedded.mobileprovision" ]; then
+    printf '%s\n' 'Use a device build made with code signing disabled.' >&2
+    exit 1
+fi
+
+expected_group=$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups:0' "$entitlements")
+
+# Carry the App Group in both binaries so the sideloader can provision it when signing.
+# Sign the extension first so the host signature seals the embedded extension.
+for bundle in "$extension" "$app"; do
+    platform=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleSupportedPlatforms:0' "$bundle/Info.plist")
+    if [ "$platform" != AppleTVOS ]; then
+        printf '%s\n' 'Use a build for Apple TV hardware.' >&2
+        exit 1
+    fi
+    codesign --force --sign - --entitlements "$entitlements" "$bundle"
+    codesign -d --entitlements - --xml "$bundle" > "$staging/entitlements.plist" 2>/dev/null
+    actual_group=$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.application-groups:0' "$staging/entitlements.plist")
+    [ "$actual_group" = "$expected_group" ]
+done
+codesign --verify --deep --strict "$app"
+
+ditto -c -k --norsrc --noextattr --keepParent "$staging/Payload" "$staging/NuvioCinema.ipa"
+unzip -tq "$staging/NuvioCinema.ipa"
+cp "$staging/NuvioCinema.ipa" "$output"
+printf '%s\n' "$output"

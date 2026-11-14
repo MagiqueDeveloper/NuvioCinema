@@ -99,7 +99,7 @@ def replace_once(source, original, modified):
 
 project = upstream("tvosApp/Project.swift").decode()
 project = replace_once(project, 'let bundleID = "com.pyksel.nuviotvos"', 'let bundleID = "com.nuviocinema.app"')
-project = replace_once(project, 'let marketingVersion = "3.5.1"', 'let marketingVersion = "0.1.2"')
+project = replace_once(project, 'let marketingVersion = "3.5.1"', 'let marketingVersion = "0.1.3"')
 project = replace_once(project, 'let projectVersion = "82"', 'let projectVersion = "1"')
 project = replace_once(project, '    productName: "NuvioTV",', '    productName: "NuvioCinema",')
 project = replace_once(project, '    sources: ["NuvioTV/Sources/**/*.swift"],',
@@ -175,6 +175,38 @@ top_shelf_feed_path = "tvosApp/NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift"
 top_shelf_feed = upstream(top_shelf_feed_path).decode()
 top_shelf_feed = replace_once(top_shelf_feed, "import Foundation\n", "import Foundation\nimport OSLog\n")
 top_shelf_feed = replace_once(top_shelf_feed, 'components.scheme = "nuvio-tv"', 'components.scheme = "nuvio-cinema"')
+top_shelf_feed = replace_once(top_shelf_feed, '''        + topShelfProvisioningProfileGroupIdentifiers(at: appBundleURL)
+''', '''        + (topShelfProvisioningProfileGroupIdentifiers(at: appBundleURL) ?? [])
+''')
+top_shelf_feed = replace_once(top_shelf_feed, '''private func topShelfProvisioningProfileGroupIdentifiers(at appBundleURL: URL) -> [String] {
+    let profileURL = appBundleURL.appendingPathComponent("embedded.mobileprovision")
+''', '''// A missing or unreadable profile is distinct from a profile that permits no App Groups.
+func topShelfProvisioningProfileGroupIdentifiers(at bundleURL: URL) -> [String]? {
+    let profileURL = bundleURL.appendingPathComponent("embedded.mobileprovision")
+''')
+top_shelf_feed = replace_once(top_shelf_feed, '''          ) else {
+        return []
+    }
+
+    let plistData = profileData.subdata(in: xmlStart.lowerBound..<plistEnd.upperBound)
+''', '''          ) else {
+        return nil
+    }
+
+    let plistData = profileData.subdata(in: xmlStart.lowerBound..<plistEnd.upperBound)
+''')
+top_shelf_feed = replace_once(top_shelf_feed, '''    let profile = plistObject as? [String: Any],
+    let entitlements = profile["Entitlements"] as? [String: Any],
+    let groupIDs = entitlements["com.apple.security.application-groups"] as? [String] else {
+        return []
+    }
+    return groupIDs
+''', '''    let profile = plistObject as? [String: Any] else {
+        return nil
+    }
+    let entitlements = profile["Entitlements"] as? [String: Any]
+    return entitlements?["com.apple.security.application-groups"] as? [String] ?? []
+''')
 top_shelf_feed = replace_once(top_shelf_feed, '''    /// Mirrors every Home catalog row; Settings chooses which the shelf shows.
 ''', '''    static let homeFeaturedRowID = "home-featured"
 

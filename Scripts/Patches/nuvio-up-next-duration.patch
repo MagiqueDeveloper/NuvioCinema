@@ -1,0 +1,18 @@
+NuvioTVOS Up Next duration backport
+
+https://github.com/bobsupra/NuvioTVOS/commit/608035b800a3ef02b4e355bec55d678ee8058d2e
+
+diff --git a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+--- a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+@@ -9088,7 +9088,8 @@ class PlayerViewModel: ObservableObject {
+ 
+     private static func expectedDuration(for meta: NuvioMeta) -> Double? {
+-        if let stored = (ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id))?.duration, stored >= 60 {
+-            return stored
++        let progressItem = ContinueWatchingStore.item(for: meta) ?? ContinueWatchingStore.item(for: meta.id)
++        if let progressItem, !progressItem.isUpNextEntry, progressItem.duration >= 60 {
++            return progressItem.duration
+         }
+         return runtimeSeconds(from: meta.runtime)
+     }

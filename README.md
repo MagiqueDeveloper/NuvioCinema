@@ -21,7 +21,7 @@ On the Siri Remote, press and hold a **Continue Watching** card to start from th
 
 Move Nuvio Cinema to the top row of the Apple TV Home Screen to see the movies and series featured in the app’s Home carousel. Top Shelf shows each title’s artwork and synopsis. **More Info** opens the title’s details. Open Nuvio Cinema once to populate Top Shelf. Device signing must provision `group.com.nuviocinema.app` for both `com.nuviocinema.app` and `com.nuviocinema.app.TopShelf`.
 
-When signing an unsigned release IPA, keep the embedded `TopShelf.appex` and sign both targets with profiles that authorize the same registered App Group. If the signer changes bundle IDs, keep the extension ID under the app’s bundle ID and use the same authorized group in both signatures. **Settings → Nuvio Account** reports when the app cannot open its shared group. See [Apple’s App Group documentation](https://developer.apple.com/documentation/xcode/configuring-app-groups) and [entitlement diagnostics](https://developer.apple.com/documentation/bundleresources/diagnosing-issues-with-entitlements).
+When sideloading, keep the embedded `TopShelf.appex`. The app and extension both need provisioning profiles that authorize the same registered App Group. If the signer changes bundle IDs, keep the extension ID under the app’s bundle ID and use the same authorized group in both signatures. **Settings** reports when the extension is missing, the app cannot open its shared group, or the extension’s provisioning profile lacks that group. See [Apple’s App Group documentation](https://developer.apple.com/documentation/xcode/configuring-app-groups) and [entitlement diagnostics](https://developer.apple.com/documentation/bundleresources/diagnosing-issues-with-entitlements).
 
 On a movie or episode, choose **Play** or **Resume**, then choose a source from your enabled add-ons. Direct HTTPS streams open in the original [NuvioTVOS player](https://github.com/bobsupra/NuvioTVOS/tree/735adf8859462b5beb47dbc96a51c75ded15c685), with its AetherEngine and MPVKit playback, Siri Remote seeking and previews, subtitle controls and timing, and next-episode controls. IntroDB provides skip controls when it has matching markers for the movie or episode. HTTPS provider links can open a compatible installed app. Trailers can open in YouTube.
 
@@ -48,6 +48,8 @@ To compile for a generic Apple TV without code signing, run this from the projec
 xcodebuild -workspace .upstream-player/tvosApp/NuvioTV.xcworkspace -scheme NuvioTV \
   -destination 'generic/platform=tvOS' CODE_SIGNING_ALLOWED=NO build
 ```
+
+Package the resulting device build with `Scripts/package-ipa PATH_TO_BUILT_APP OUTPUT_IPA`. The script adds an ad hoc signature to the app and Top Shelf extension so the sideloader can read their App Group entitlement. The sideloader still needs to sign the IPA for your Apple TV.
 
 ## Contributing
 

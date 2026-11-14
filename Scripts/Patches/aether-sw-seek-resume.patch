@@ -1,0 +1,535 @@
+Keep software seek preroll and rebuffer holds from canceling one another
+
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Audio/AudioOutput.swift b/Vendor/AetherEngine/Sources/AetherEngine/Audio/AudioOutput.swift
+index d15adb5..68175bc 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Audio/AudioOutput.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Audio/AudioOutput.swift
+@@ -297,7 +297,23 @@ final class AudioOutput: @unchecked Sendable {
+ 
+     /// Pause audio (and the master clock). Hosts resume via setRate (pausedByHost pattern); deliberately no resume() here.
+     func pause() {
++        pauseClock()
++    }
++
++    /// Starvation must not supersede a seek, explicit transport command or video preroll.
++    func pauseForRebuffer(ifRevision revision: UInt64) -> Bool {
++        pauseClock {
++            playbackEnabled && prerollRate == nil && revision == _clockCommandRevision
++        }
++    }
++
++    @discardableResult
++    private func pauseClock(when condition: () -> Bool = { true }) -> Bool {
+         lock.lock()
++        guard condition() else {
++            lock.unlock()
++            return false
++        }
+         _clockCommandRevision &+= 1
+         endPreroll()
+         let at = synchronizer.currentTime()
+@@ -305,6 +321,7 @@ final class AudioOutput: @unchecked Sendable {
+         commandRate(0.0, time: at)
+         lock.unlock()
+         EngineLog.emit("[AudioOutput] pause at t=\(String(format: "%.3f", sourceSeconds))", category: .swPlayback)
++        return true
+     }
+ 
+     /// Pause the master clock, at `latest` if it has already run past it. A park deferred to the last
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift b/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
+index 59bc8a3..d86173a 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
+@@ -2163,8 +2163,7 @@ final class SoftwarePlaybackHost {
+     func enterBackgroundAudioOnly() {
+         guard !backgroundAudioOnly else { return }
+         backgroundAudioOnly = true
+-        if demuxDiag.snapshot.rebuffering {
+-            _ = demuxDiag.setRebuffering(false, generation: seekGeneration)
++        demuxDiag.endRebuffering(generation: seekGeneration) {
+             if isPlaying {
+                 audioOutput?.setRate(lastRate)
+             } else {
+@@ -2429,11 +2428,11 @@ final class SoftwarePlaybackHost {
+         audioOutput?.seekClock(to: CMTime(seconds: seconds, preferredTimescale: 90000), rate: 0)
+     }
+     func setAudioFedUntilForTesting(_ pts: Double) {
+-        demuxDiag.update(lastAudioPts: pts, parked: 0, rebuffering: false, generation: .max)
++        demuxDiag.update(lastAudioPts: pts, parked: 0, generation: .max)
+     }
+     /// A feed marker written under the current generation, as the demux loop writes it on every iteration.
+     func setAudioFedUntilUnderCurrentGenerationForTesting(_ pts: Double) {
+-        demuxDiag.update(lastAudioPts: pts, parked: 0, rebuffering: false, generation: seekGeneration)
++        demuxDiag.update(lastAudioPts: pts, parked: 0, generation: seekGeneration)
+     }
+     var audioFedUntilForTesting: Double { demuxDiag.snapshot.lastAudioPts }
+     /// Reads the consumer's published queue depth without accessing its thread-owned packets.
+@@ -3410,8 +3409,7 @@ final class SoftwarePlaybackHost {
+                 subtitleTapSink: getSubtitleTapSink,
+                 recordingTap: recordingTap,
+                 playedMedia: playedMediaLedger,
+-                keyframeLedger: keyframeLedger,
+-                noteRebuffering: noteRebuffering
++                keyframeLedger: keyframeLedger
+             )
+         }
+     }
+@@ -4147,7 +4145,7 @@ final class SoftwarePlaybackHost {
+         condition: NSCondition,
+         initialClockTime: CMTime,
+         currentRate: @Sendable () -> Float,
+-        diag: SWPlaybackDiagState? = nil,
++        diag: SWPlaybackDiagState,
+         ring: PacketRingBuffer?,
+         videoTimeBaseSeconds: Double,
+         audioTimeBaseSeconds: Double,
+@@ -4175,8 +4173,7 @@ final class SoftwarePlaybackHost {
+         subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil },
+         recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in },
+         playedMedia: PlayedMediaLedger? = nil,
+-        keyframeLedger: SWKeyframeLedger? = nil,
+-        noteRebuffering: @Sendable (Bool) -> Void = { _ in }
++        keyframeLedger: SWKeyframeLedger? = nil
+     ) {
+         // The video packet's time on the clock's axis and whether it is a keyframe, for `keyframeLedger`.
+         func keyframeTime(of packet: UnsafeMutablePointer<AVPacket>) -> (pts: Double, isKey: Bool)? {
+@@ -4257,7 +4254,6 @@ final class SoftwarePlaybackHost {
+         var parkedVideoBytes = 0
+         var terminalGeneration = SoftwareTerminalGeneration()
+         var lastEnqueuedAudioPtsSec = Double.nan
+-        var rebuffering = false
+         // The pause/rebuffer arm stays off until the source has proven it can deliver a real
+         // lead once: an exactly-realtime origin whose lead never leaves the start offset must
+         // not eat a rebuffer pause at every session start.
+@@ -4335,25 +4331,15 @@ final class SoftwarePlaybackHost {
+             }
+         }
+ 
+-        func syncRebufferingState() {
+-            if let diag { rebuffering = diag.snapshot.rebuffering }
+-        }
+-
+-        func setRebuffering(_ value: Bool) {
+-            rebuffering = value
+-            noteRebuffering(value)
+-            _ = diag?.setRebuffering(value, generation: parkedSeekGeneration)
+-        }
+-
+         func releaseRebufferHold(_ why: String) {
+-            syncRebufferingState()
+-            guard rebuffering else { return }
+-            setRebuffering(false)
+-            EngineLog.emit("[SWHost] releasing rebuffer hold: \(why)", category: .swPlayback)
+-            if isPlaying() {
+-                audioOutput?.setRate(currentRate())
+-            } else {
+-                audioOutput?.pause()
++            guard let aOut = audioOutput else { return }
++            guard admitsRead(parkedSeekGeneration) else { return }
++            diag.endRebuffering(generation: parkedSeekGeneration) {
++                let revision = aOut.clockCommandRevision
++                if admitsRead(parkedSeekGeneration), isPlaying() {
++                    aOut.setRate(currentRate(), ifRevision: revision)
++                }
++                EngineLog.emit("[SWHost] releasing rebuffer hold: \(why)", category: .swPlayback)
+             }
+         }
+ 
+@@ -4427,9 +4413,8 @@ final class SoftwarePlaybackHost {
+                 releaseRebufferHold("the renderer needs a running clock to take parked video")
+                 armFromParkedVideoIfStuck()
+                 drainParkedVideoNonblocking()
+-                diag?.update(lastAudioPts: diagAudioPtsSec,
+-                             parked: parkedVideo.count, rebuffering: rebuffering,
+-                             generation: diagAudioPtsGeneration)
++                diag.update(lastAudioPts: diagAudioPtsSec, parked: parkedVideo.count,
++                            generation: diagAudioPtsGeneration)
+                 if stillWaiting() {
+                     let wait = Self.parkedRendererWaitSeconds(
+                         clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
+@@ -4450,7 +4435,9 @@ final class SoftwarePlaybackHost {
+         // a lead to lose.
+         func applyAudioClockAction() {
+             guard !isLive, decoupleAudio, !backgroundAudioOnly(), clockArmed(), let aOut = audioOutput else { return }
+-            syncRebufferingState()
++            let revision = aOut.clockCommandRevision
++            guard admitsRead(parkedSeekGeneration), !aOut.prerollPending else { return }
++            let rebuffering = diag.snapshot.rebuffering
+             let lead = lastEnqueuedAudioPtsSec.isFinite
+                 ? lastEnqueuedAudioPtsSec - aOut.currentTimeSeconds : 0
+             if lead >= AudioLookaheadPolicy.rebufferResumeLeadSeconds { everHadLead = true }
+@@ -4466,21 +4453,24 @@ final class SoftwarePlaybackHost {
+                 sourceEnded: false
+             ) {
+             case .pauseForRebuffer:
+-                setRebuffering(true)
++                guard diag.beginRebuffering(generation: parkedSeekGeneration, pauseClock: {
++                    aOut.pauseForRebuffer(ifRevision: revision)
++                }) else { return }
+                 EngineLog.emit(
+                     "[SWHost] audio lead exhausted (\(String(format: "%.2f", lead))s); "
+                     + "pausing clock for rebuffer",
+                     category: .swPlayback
+                 )
+-                aOut.pause()
+             case .resume:
+-                setRebuffering(false)
+-                EngineLog.emit(
+-                    "[SWHost] rebuffered to \(String(format: "%.2f", lead))s audio lead; "
+-                    + "resuming clock",
+-                    category: .swPlayback
+-                )
+-                aOut.setRate(currentRate())
++                diag.endRebuffering(generation: parkedSeekGeneration) {
++                    let revision = aOut.clockCommandRevision
++                    guard admitsRead(parkedSeekGeneration) else { return }
++                    aOut.setRate(currentRate(), ifRevision: revision)
++                    EngineLog.emit(
++                        "[SWHost] rebuffered to \(String(format: "%.2f", lead))s audio lead; resuming clock",
++                        category: .swPlayback
++                    )
++                }
+             case .none:
+                 break
+             }
+@@ -4539,10 +4529,8 @@ final class SoftwarePlaybackHost {
+                     parkedSeekGeneration = gen
+                     freeParkedVideo()
+                     lastEnqueuedAudioPtsSec = .nan
+-diagAudioPtsSec = .nan
++                    diagAudioPtsSec = .nan
+                     diagAudioPtsGeneration = gen
+-                    if rebuffering { noteRebuffering(false) }
+-                    rebuffering = false
+                     // The lead is zero again after a seek, so the latch has to earn itself back:
+                     // keeping it set pauses the clock for a rebuffer on the first post-seek check.
+                     everHadLead = false
+@@ -4588,8 +4576,8 @@ diagAudioPtsSec = .nan
+                     if directLiveSource != nil {
+                         // The empty-source wait may last indefinitely; publish the final drain
+                         // before sleeping so SWDiag does not retain an already-consumed packet.
+-                        diag?.update(lastAudioPts: diagAudioPtsSec, parked: parkedVideo.count,
+-                                     rebuffering: false, generation: diagAudioPtsGeneration)
++                        diag.update(lastAudioPts: diagAudioPtsSec, parked: parkedVideo.count,
++                                     generation: diagAudioPtsGeneration)
+                     }
+                     packet = try readAhead.read(
+                         isCurrent: { admitsRead(genBeforeRead) },
+@@ -4616,8 +4604,8 @@ diagAudioPtsSec = .nan
+                 guard admitsRead(genBeforeRead) else { return !stopRequested() }
+                 if case SoftwarePacketReadAhead.ReadError.interrupted = error { return true }
+                 if case SoftwarePacketReadAhead.ReadError.idle = error {
+-                    diag?.update(lastAudioPts: diagAudioPtsSec, parked: parkedVideo.count,
+-                                 rebuffering: false, generation: diagAudioPtsGeneration)
++                    diag.update(lastAudioPts: diagAudioPtsSec, parked: parkedVideo.count,
++                                 generation: diagAudioPtsGeneration)
+                     return true
+                 }
+                 EngineLog.emit("[SWHost] demux read failed: \(error)", category: .swPlayback)
+@@ -5017,7 +5005,7 @@ diagAudioPtsSec = .nan
+                     }
+                 }
+                 if !buffers.isEmpty {
+-                    diag?.noteAudioProgress(generation: genBeforeRead)
++                    diag.noteAudioProgress(generation: genBeforeRead)
+                 }
+                 if let last = buffers.last {
+                     let pts = CMSampleBufferGetPresentationTimeStamp(last)
+@@ -5057,10 +5045,8 @@ diagAudioPtsSec = .nan
+             let keepGoing: Bool = autoreleasepool {
+                 demuxIteration()
+             }
+-            diag?.update(lastAudioPts: diagAudioPtsSec,
+-                         parked: parkedVideo.count,
+-rebuffering: rebuffering,
+-                         generation: diagAudioPtsGeneration)
++            diag.update(lastAudioPts: diagAudioPtsSec, parked: parkedVideo.count,
++                        generation: diagAudioPtsGeneration)
+             if !keepGoing { break }
+         }
+         freeParkedVideo()
+@@ -5113,6 +5099,10 @@ rebuffering: rebuffering,
+                 guard !self.seekInFlight, self.failure == nil else { return }
+                 let raw = aOut.currentTimeSeconds
+                 self.updateSoftwareClockStarvation(clock: raw)
++                if !self.isLive {
++                    let rebuffering = self.demuxDiag.snapshot.rebuffering
++                    if self.isRebuffering != rebuffering { self.isRebuffering = rebuffering }
++                }
+                 self.emitDiagIfDue(clock: raw)
+                 // AE#724: until the first sample arms it, the synchronizer still reads 0, and a paused
+                 // resume would publish that over the anchor load() set.
+@@ -5150,12 +5140,14 @@ rebuffering: rebuffering,
+         guard !isLive, audioDecoder != nil, !backgroundAudioOnly,
+               clockArmed, isPlaying, !didReachEnd,
+               clock.isFinite, let aOut = audioOutput else { return }
++        let revision = aOut.clockCommandRevision
+         let diag = demuxDiag.snapshot
+         let audioLead = diag.lastAudioPts.isFinite ? diag.lastAudioPts - clock : .nan
+         let action = SWSoftwareClockStarvationPolicy.action(
+             clockArmed: clockArmed,
+             isPlaying: isPlaying,
+             seekInFlight: seekInFlight,
++            prerollPending: aOut.prerollPending,
+             sourceExhausted: diag.sourceExhausted,
+             hasAudio: audioDecoder != nil,
+             rebuffering: diag.rebuffering,
+@@ -5167,19 +5159,21 @@ rebuffering: rebuffering,
+         )
+         switch action {
+         case .pauseForRebuffer:
+-            guard demuxDiag.setRebuffering(true, generation: seekGeneration) else { return }
+-            aOut.pause()
++            guard demuxDiag.beginRebuffering(generation: seekGeneration, pauseClock: {
++                aOut.pauseForRebuffer(ifRevision: revision)
++            }) else { return }
+             EngineLog.emit(
+                 "[SWHost] decoded media stalled; pausing clock for rebuffer",
+                 category: .swPlayback
+             )
+         case .resume:
+-            guard demuxDiag.setRebuffering(false, generation: seekGeneration) else { return }
+-            aOut.setRate(lastRate)
+-            EngineLog.emit(
+-                "[SWHost] decoded media resumed; releasing rebuffer hold",
+-                category: .swPlayback
+-            )
++            demuxDiag.endRebuffering(generation: seekGeneration) {
++                aOut.setRate(lastRate, ifRevision: aOut.clockCommandRevision)
++                EngineLog.emit(
++                    "[SWHost] decoded media resumed; releasing rebuffer hold",
++                    category: .swPlayback
++                )
++            }
+         case .none:
+             break
+         }
+@@ -5348,6 +5342,7 @@ func av_packet_free_safe(_ packet: UnsafeMutablePointer<AVPacket>) {
+ /// clock leaps and layer-drop bursts a stuttering session is made of. Lock-guarded.
+ final class SWPlaybackDiagState: @unchecked Sendable {
+     private let lock = NSLock()
++    private let rebufferTransitionLock = NSLock()
+     private var _lastAudioPts = Double.nan
+     private var _audioFlushGeneration: UInt64 = 0
+     /// The newest PTS that described a queue a recovery has since emptied; a write that does not go
+@@ -5365,16 +5360,16 @@ final class SWPlaybackDiagState: @unchecked Sendable {
+     /// generation, so its next write (one more after a playing seek, none at all while a paused
+     /// landing parks it until `play()`) republished a PTS the queue no longer held, and the line read
+     /// `aLead` as old PTS minus re-anchored clock (475 s in the field). The write carries the
+-    /// generation the pump produced it under and is refused for the marker when the flush is newer;
+-    /// `parked` belongs to the pump; clock hold is shared with the host's time-tick monitor.
+-    func update(lastAudioPts: Double, parked: Int, rebuffering: Bool, generation: UInt64) {
++    /// generation the pump produced it under. A packet update is observational and cannot change
++    /// a clock hold set by the timer or demux loop while a read was blocked.
++    func update(lastAudioPts: Double, parked: Int, generation: UInt64) {
+         lock.lock()
+-        if generation >= _audioFlushGeneration, !(lastAudioPts.isFinite && lastAudioPts <= _emptiedAudioPts) {
++        defer { lock.unlock() }
++        guard generation >= _audioFlushGeneration else { return }
++        if !(lastAudioPts.isFinite && lastAudioPts <= _emptiedAudioPts) {
+             _lastAudioPts = lastAudioPts
+         }
+         _parked = parked
+-        _rebuffering = rebuffering
+-        lock.unlock()
+     }
+ 
+     /// Audio samples and decoded video frames are usable post-seek progress. The generation check
+@@ -5396,16 +5391,39 @@ final class SWPlaybackDiagState: @unchecked Sendable {
+         lock.unlock()
+     }
+ 
+-    /// The timer and demux loop share the hold. Returns true only for a state transition, so only
+-    /// its owner changes the synchronizer rate and duplicate pause/resume calls are avoided.
++    /// The output may reject the pause if a newer transport command or preroll owns the clock.
++    /// Publish a hold only when the output actually stopped, and only for the current seek.
+     @discardableResult
+-    func setRebuffering(_ value: Bool, generation: UInt64? = nil) -> Bool {
++    func beginRebuffering(generation: UInt64, pauseClock: () -> Bool) -> Bool {
++        rebufferTransitionLock.lock()
++        defer { rebufferTransitionLock.unlock() }
++        lock.lock()
++        let canPause = generation >= _audioFlushGeneration && !_rebuffering
++        let videoFrameGeneration = _videoFrameGeneration
++        lock.unlock()
++        guard canPause, pauseClock() else { return false }
+         lock.lock()
+         defer { lock.unlock() }
+-        if let generation, generation < _audioFlushGeneration { return false }
+-        guard _rebuffering != value else { return false }
+-        _rebuffering = value
+-        if value { _rebufferVideoFrameGeneration = _videoFrameGeneration }
++        guard generation >= _audioFlushGeneration else { return false }
++        _rebuffering = true
++        _rebufferVideoFrameGeneration = videoFrameGeneration
++        return true
++    }
++
++    /// Serialize the timer and demux loop's clock writes with their hold transitions. Do not
++    /// hold the diagnostics lock over a renderer call, since media callbacks update the snapshot.
++    @discardableResult
++    func endRebuffering(generation: UInt64, resumeClock: () -> Void = {}) -> Bool {
++        rebufferTransitionLock.lock()
++        defer { rebufferTransitionLock.unlock() }
++        lock.lock()
++        guard generation >= _audioFlushGeneration, _rebuffering else {
++            lock.unlock()
++            return false
++        }
++        _rebuffering = false
++        lock.unlock()
++        resumeClock()
+         return true
+     }
+ 
+@@ -5418,6 +5436,7 @@ final class SWPlaybackDiagState: @unchecked Sendable {
+             _lastAudioPts = .nan
+             _emptiedAudioPts = -.infinity
+             _lastMediaProgressAt = ProcessInfo.processInfo.systemUptime
++            _parked = 0
+             _rebuffering = false
+             _rebufferVideoFrameGeneration = _videoFrameGeneration
+             _sourceExhausted = false
+@@ -5464,6 +5483,7 @@ enum SWSoftwareClockStarvationPolicy {
+         clockArmed: Bool,
+         isPlaying: Bool,
+         seekInFlight: Bool,
++        prerollPending: Bool,
+         sourceExhausted: Bool,
+         hasAudio: Bool,
+         rebuffering: Bool,
+@@ -5473,7 +5493,9 @@ enum SWSoftwareClockStarvationPolicy {
+         rebufferVideoFrameGeneration: UInt64,
+         audioLead: Double
+     ) -> AudioLookaheadPolicy.ClockAction {
+-        guard clockArmed, !seekInFlight, !sourceExhausted, hasAudio else { return .none }
++        // A seek can legitimately hold the clock at zero until its video preroll finishes.
++        // Pausing it for starvation at that point cancels the start the preroll still owes.
++        guard clockArmed, !seekInFlight, !prerollPending, !sourceExhausted, hasAudio else { return .none }
+         if rebuffering {
+             guard isPlaying else { return .none }
+             let audioRecovered = audioLead.isFinite
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/SWPlaybackDiagStateTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/SWPlaybackDiagStateTests.swift
+index 21d4b78..a5e61b8 100644
+--- a/Vendor/AetherEngine/Tests/AetherEngineTests/SWPlaybackDiagStateTests.swift
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/SWPlaybackDiagStateTests.swift
+@@ -16,32 +16,61 @@ struct SWPlaybackDiagStateTests {
+     @Test("A write from before the flush cannot republish the flushed queue's PTS")
+     func staleWriteIsRefusedForTheMarker() {
+         let diag = SWPlaybackDiagState()
+-        diag.update(lastAudioPts: 16.11, parked: 95, rebuffering: false, generation: 0)
++        diag.update(lastAudioPts: 16.11, parked: 95, generation: 0)
+         // The seek path: bump to generation 1, flush, tell the box.
+         diag.audioFlushed(generation: 1)
+         #expect(diag.snapshot.lastAudioPts.isNaN)
+         // The pump's one late write from the iteration that was in flight when the seek arrived.
+-        diag.update(lastAudioPts: 16.11, parked: 95, rebuffering: false, generation: 0)
++        diag.update(lastAudioPts: 16.11, parked: 95, generation: 0)
+         #expect(diag.snapshot.lastAudioPts.isNaN)
+     }
+ 
+-    @Test("parked and rebuffering are the pump's own state and land regardless of generation")
+-    func pumpStateStaysUnconditional() {
++    @Test("A pre-seek demux update cannot restore the old packet queue or clear a new hold")
++    func staleUpdateCannotOverrideSeek() {
+         let diag = SWPlaybackDiagState()
++        diag.update(lastAudioPts: 16.11, parked: 42, generation: 1)
+         diag.audioFlushed(generation: 3)
+-        diag.update(lastAudioPts: 16.11, parked: 42, rebuffering: true, generation: 1)
+-        let s = diag.snapshot
+-        #expect(s.lastAudioPts.isNaN)
+-        #expect(s.parked == 42)
+-        #expect(s.rebuffering)
++        #expect(diag.snapshot.parked == 0)
++        #expect(diag.beginRebuffering(generation: 3) { true })
++
++        diag.update(lastAudioPts: 16.11, parked: 42, generation: 1)
++        #expect(!diag.endRebuffering(generation: 1))
++        #expect(diag.snapshot.lastAudioPts.isNaN)
++        #expect(diag.snapshot.parked == 0)
++        #expect(diag.snapshot.rebuffering)
++    }
++
++    @Test("A demux read that began before a hold does not erase it when new media arrives")
++    func packetUpdatePreservesClockHold() {
++        let diag = SWPlaybackDiagState()
++        diag.audioFlushed(generation: 2)
++        #expect(diag.beginRebuffering(generation: 2) { true })
++        diag.update(lastAudioPts: 44.01, parked: 12, generation: 2)
++        #expect(diag.snapshot.lastAudioPts == 44.01)
++        #expect(diag.snapshot.rebuffering)
++        #expect(diag.endRebuffering(generation: 2))
++        #expect(!diag.snapshot.rebuffering)
++    }
++
++    @Test("A pause rejected by the audio clock cannot publish a rebuffer hold")
++    func rejectedPauseDoesNotPublishHold() {
++        let diag = SWPlaybackDiagState()
++        diag.audioFlushed(generation: 2)
++        #expect(!diag.beginRebuffering(generation: 2) { false })
++        #expect(!diag.snapshot.rebuffering)
++        #expect(!diag.beginRebuffering(generation: 2) {
++            diag.audioFlushed(generation: 3)
++            return true
++        })
++        #expect(!diag.snapshot.rebuffering)
+     }
+ 
+     @Test("The first write on the post-seek generation publishes the fresh marker")
+     func freshWriteLands() {
+         let diag = SWPlaybackDiagState()
+-        diag.update(lastAudioPts: 16.11, parked: 95, rebuffering: false, generation: 0)
++        diag.update(lastAudioPts: 16.11, parked: 95, generation: 0)
+         diag.audioFlushed(generation: 1)
+-        diag.update(lastAudioPts: 44.01, parked: 12, rebuffering: false, generation: 1)
++        diag.update(lastAudioPts: 44.01, parked: 12, generation: 1)
+         #expect(diag.snapshot.lastAudioPts == 44.01)
+     }
+ 
+@@ -49,7 +78,7 @@ struct SWPlaybackDiagStateTests {
+     func olderFlushDoesNotRegress() {
+         let diag = SWPlaybackDiagState()
+         diag.audioFlushed(generation: 2)
+-        diag.update(lastAudioPts: 44.01, parked: 12, rebuffering: false, generation: 2)
++        diag.update(lastAudioPts: 44.01, parked: 12, generation: 2)
+         // A seek from generation 1 finishing its main-actor prologue late.
+         diag.audioFlushed(generation: 1)
+         #expect(diag.snapshot.lastAudioPts == 44.01)
+@@ -60,7 +89,7 @@ struct SWPlaybackDiagStateTests {
+         // A host seeks before its pump is up: the pump captures the current generation on entry and
+         // must not be refused by a box that has never seen a flush.
+         let diag = SWPlaybackDiagState()
+-        diag.update(lastAudioPts: 4.0, parked: 1, rebuffering: false, generation: 7)
++        diag.update(lastAudioPts: 4.0, parked: 1, generation: 7)
+         #expect(diag.snapshot.lastAudioPts == 4.0)
+     }
+ }
+@@ -83,3 +112,28 @@ struct SWDiagAudioMarkerSourceTests {
+         #expect(marker == 16.11)
+     }
+ }
++
++@Suite("Software seek clock recovery")
++struct SoftwareSeekClockRecoveryTests {
++    private func action(prerollPending: Bool = false, isPlaying: Bool = true,
++                        rebuffering: Bool = false, audioLead: Double = .nan) -> AudioLookaheadPolicy.ClockAction {
++        SWSoftwareClockStarvationPolicy.action(
++            clockArmed: true, isPlaying: isPlaying, seekInFlight: false,
++            prerollPending: prerollPending, sourceExhausted: false, hasAudio: true,
++            rebuffering: rebuffering, now: 1.25, lastMediaProgressAt: 0,
++            videoFrameGeneration: 2, rebufferVideoFrameGeneration: 2, audioLead: audioLead
++        )
++    }
++
++    @Test("A slow landing cannot cancel its own preroll")
++    func starvationDoesNotInterruptPreroll() {
++        #expect(action(prerollPending: true) == .none)
++        #expect(action() == .pauseForRebuffer)
++    }
++
++    @Test("Newly buffered audio releases the hold if the user still intends to play")
++    func bufferedAudioResumesPlayingOnly() {
++        #expect(action(rebuffering: true, audioLead: 4) == .resume)
++        #expect(action(isPlaying: false, rebuffering: true, audioLead: 4) == .none)
++    }
++}

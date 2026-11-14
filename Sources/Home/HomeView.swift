@@ -35,23 +35,11 @@ final class HomeHeroScroll {
 }
 
 private struct HomeHeroScrollBehavior: ScrollTargetBehavior {
-    let shelfOffset: CGFloat
-    let isBelowHero: Bool
-    let prefersShelfPosition: Bool
+    let restoredShelfOffset: CGFloat?
 
     func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
-        guard shelfOffset > 0 else { return }
-        let offset = target.rect.minY
-        if prefersShelfPosition {
-            target.rect.origin.y = max(offset, shelfOffset)
-            return
-        }
-        if isBelowHero {
-            guard offset <= shelfOffset else { return }
-            target.rect.origin.y = offset < shelfOffset * 0.7 ? 0 : shelfOffset
-        } else if offset >= shelfOffset * 0.3 {
-            target.rect.origin.y = shelfOffset
-        }
+        guard let restoredShelfOffset else { return }
+        target.rect.origin.y = max(target.rect.minY, restoredShelfOffset)
     }
 }
 
@@ -192,7 +180,7 @@ struct HomeView: View {
     @State private var completedRequest: Int?
     @State private var detailOrigin: DetailOrigin?
     @State private var verticalPosition = ScrollPosition()
-    @State private var isBelowHero = false
+    @State private var homeScrollRequest: HomeScrollRequest?
     @FocusState private var focusedItem: HomeFocusTarget?
 
     private struct DetailOrigin: Equatable {
@@ -203,6 +191,11 @@ struct HomeView: View {
     private struct LoadRequest: Equatable {
         let isAvailable: Bool
         let retryCount: Int
+    }
+
+    private struct HomeScrollRequest: Equatable {
+        let id = UUID()
+        let offset: CGFloat
     }
 
     private let heroGap: CGFloat = 22
@@ -241,10 +234,6 @@ struct HomeView: View {
             return .poster(firstRow.id, first.id)
         }
         return carousel.entries.isEmpty ? nil : .hero
-    }
-
-    private var prefersShelfPosition: Bool {
-        isAvailable && (preferredReturnFocus ?? focusedItem)?.isPoster == true
     }
 
     var body: some View {
@@ -297,6 +286,7 @@ struct HomeView: View {
         let heroHeight = hasHero ? placeholderHeroHeight : 0
         let shelfOffset = max(0, heroHeight - heroControlsHeight)
         let artworkBottom = hasHero ? viewport.frame(in: .global).minY + heroHeight + heroGap / 2 : nil
+        let restoresShelf = isAvailable && preferredReturnFocus?.isPoster == true && shelfOffset > 0
 
         return ScrollView {
             VStack(alignment: .leading, spacing: heroGap) {
@@ -348,23 +338,26 @@ struct HomeView: View {
         }
         .scrollPosition($verticalPosition)
         .scrollTargetBehavior(HomeHeroScrollBehavior(
-            shelfOffset: shelfOffset,
-            isBelowHero: isBelowHero,
-            prefersShelfPosition: prefersShelfPosition
+            restoredShelfOffset: restoresShelf ? shelfOffset : nil
         ))
         .scrollIndicators(.hidden)
-        .onChange(of: focusedItem?.isPoster) { wasPoster, isPoster in
-            guard isAvailable, detailOrigin == nil else { return }
-            if isPoster == true, heroScroll.position.distance < shelfOffset - 1 {
-                scrollHome(to: shelfOffset, animated: true)
-            } else if wasPoster == true, isPoster == false {
-                scrollHome(to: 0, animated: true)
+        .onChange(of: focusedItem) { previous, current in
+            guard isAvailable, detailOrigin == nil, shelfOffset > 0, let current else { return }
+            let distance = heroScroll.position.distance
+            if !current.isPoster, previous?.isPoster != false,
+               distance > 1 || (homeScrollRequest?.offset ?? 0) > 1 {
+                animateHomeScroll(to: 0)
+            } else if current.isPoster, previous?.isPoster != true,
+                      distance < shelfOffset - 1 || (homeScrollRequest?.offset == 0 && distance <= shelfOffset + 1) {
+                // Down can reverse the upward request before the content visibly moves.
+                animateHomeScroll(to: shelfOffset)
             }
         }
         .onScrollPhaseChange { _, phase, context in
-            guard phase == .idle, prefersShelfPosition,
+            // Only Back restoration should snap the shelf into its saved position.
+            guard phase == .idle, restoresShelf,
                   context.geometry.contentOffset.y + context.geometry.contentInsets.top < shelfOffset - 1 else { return }
-            scrollHome(to: shelfOffset, animated: false)
+            restoreHomeScroll(to: shelfOffset)
         }
         .onScrollGeometryChange(for: HomeHeroScrollPosition.self) { geometry in
             HomeHeroScrollPosition(
@@ -374,11 +367,6 @@ struct HomeView: View {
             )
         } action: { _, position in
             heroScroll.update { heroScroll.position = position }
-        }
-        .onScrollGeometryChange(for: Bool.self) { geometry in
-            shelfOffset > 0 && geometry.contentOffset.y + geometry.contentInsets.top >= shelfOffset / 2
-        } action: { _, belowHero in
-            isBelowHero = belowHero
         }
     }
 
@@ -472,14 +460,25 @@ struct HomeView: View {
         // The selected card can be visible at the bottom before the hero has finished scrolling away.
         let offset = target.isPoster ? max(origin.verticalOffset, heroScroll.position.shelfOffset) : 0
         if abs(heroScroll.position.distance - offset) > 1 {
-            scrollHome(to: offset, animated: false)
+            restoreHomeScroll(to: offset)
         }
     }
 
-    private func scrollHome(to offset: CGFloat, animated: Bool) {
-        let animation: Animation? = animated && !reduceMotion ? .smooth(duration: 0.42) : nil
-        var transaction = Transaction(animation: animation)
-        transaction.disablesAnimations = animation == nil
+    private func animateHomeScroll(to offset: CGFloat) {
+        let animation = reduceMotion ? nil : Animation.smooth(duration: 0.42)
+        let request = HomeScrollRequest(offset: offset)
+        homeScrollRequest = request
+        withAnimation(animation, completionCriteria: .removed) {
+            verticalPosition.scrollTo(y: offset)
+        } completion: {
+            if homeScrollRequest == request { homeScrollRequest = nil }
+        }
+    }
+
+    private func restoreHomeScroll(to offset: CGFloat) {
+        homeScrollRequest = nil
+        var transaction = Transaction(animation: nil)
+        transaction.disablesAnimations = true
         withTransaction(transaction) { verticalPosition.scrollTo(y: offset) }
     }
 
