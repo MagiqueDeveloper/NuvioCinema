@@ -60,6 +60,7 @@ struct TitlePlaybackView: View {
     @State private var playbackError: String?
     @State private var playerFailure: String?
     @State private var lastSourceID: AddonStream.ID?
+    @State private var lastSourceKeys: [AddonStream.FocusKey] = []
     @State private var isOpen = false
     @State private var isClosing = false
     @State private var advancingEpisode = false
@@ -95,9 +96,12 @@ struct TitlePlaybackView: View {
                 if !isClosing && focusedItem == nil { focusedItem = preferredFocus }
             }
         }
-        .task(id: loadAttempt) {
+        .task(id: loadAttempt) { [loadAttempt, request] in
             let loaded = await AddonStreams().load(addons: request.addons, kind: request.kind, videoIDs: request.videoIDs)
-            guard !Task.isCancelled, !isClosing else { return }
+            guard !Task.isCancelled, !isClosing, self.loadAttempt == loadAttempt else { return }
+            if let stream = loaded.stream(matching: lastSourceKeys) {
+                rememberSource(stream, in: loaded)
+            }
             results = loaded
             if selected == nil { focusedItem = preferredFocus }
         }
@@ -195,19 +199,15 @@ struct TitlePlaybackView: View {
     #if NUVIO_UPSTREAM_PLAYER
     private func returnFromUpstreamPlayer(_ updatedRequest: TitlePlaybackRequest, _ failure: String?) {
         guard selected != nil else { return }
-        let episodeChanged = request.id != updatedRequest.id
-        request = updatedRequest
+        updateRequest(updatedRequest)
         playerFailure = failure
         selectSource(nil)
-        if episodeChanged { resultsReset() }
         restoreSourceFocus()
     }
 
     private func restoreUpstreamPlayer(_ stream: AddonStream, _ restoredRequest: TitlePlaybackRequest) -> Bool {
         guard isPresented(), !isClosing, selected == nil else { return false }
-        let needsSources = request.videoIDs != restoredRequest.videoIDs
-        request = restoredRequest
-        if needsSources { resultsReset() }
+        updateRequest(restoredRequest)
         selectSource(stream)
         return true
     }
@@ -270,7 +270,7 @@ struct TitlePlaybackView: View {
                 guard let lastSourceID, preferredFocus == .source(lastSourceID) else { return }
                 scroll.scrollTo(lastSourceID, anchor: .center)
                 await Task.yield()
-                guard !Task.isCancelled, !isClosing, selected == nil else { return }
+                guard !Task.isCancelled, !isClosing, selected == nil, preferredFocus == .source(lastSourceID) else { return }
                 focusedItem = .source(lastSourceID)
             }
         }
@@ -395,9 +395,9 @@ struct TitlePlaybackView: View {
 
     private func open(_ stream: AddonStream) {
         guard !isClosing else { return }
+        if let results { rememberSource(stream, in: results) }
         switch stream.destination {
         case .video:
-            lastSourceID = stream.id
             selectSource(stream)
         case .external(let url):
             Task {
@@ -415,8 +415,7 @@ struct TitlePlaybackView: View {
                                          season: episode.season, episode: episode.episode)
             let position = saved.flatMap { $0.fraction < 0.95 && NuvioAccount.hasStarted($0) ? $0.position : nil } ?? 0
             if let next = request.advancing(to: episode, position: position) {
-                request = next
-                resultsReset()
+                updateRequest(next)
                 return
             }
         }
@@ -433,6 +432,29 @@ struct TitlePlaybackView: View {
     }
 
     private func resultsReset() {
+        if case let .source(id) = focusedItem, let results, let stream = results.streams.first(where: { $0.id == id }) {
+            rememberSource(stream, in: results)
+        }
+        reloadSources()
+    }
+
+    private func rememberSource(_ stream: AddonStream, in results: AddonStreamResults) {
+        lastSourceID = stream.id
+        lastSourceKeys = results.focusKeys(for: stream)
+    }
+
+    private func updateRequest(_ updatedRequest: TitlePlaybackRequest) {
+        let needsSources = request.contentID != updatedRequest.contentID || request.kind != updatedRequest.kind
+            || request.season != updatedRequest.season || request.episodeNumber != updatedRequest.episodeNumber
+            || request.videoIDs != updatedRequest.videoIDs
+        request = updatedRequest
+        if needsSources {
+            lastSourceKeys = []
+            reloadSources()
+        }
+    }
+
+    private func reloadSources() {
         guard !isClosing else { return }
         lastSourceID = nil
         results = nil

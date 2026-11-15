@@ -1,6 +1,7 @@
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
 --- a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
 +++ b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
-@@ -5,9 +5,27 @@
+@@ -5,9 +5,74 @@ import Vision
  /// Phase D: on-device recognition of bitmap subtitle images (PGS / DVB / DVD) into plain-text
  /// cues for the native WebVTT rendition (PiP / AirPlay / external display). Lossy by design;
  /// a failed or empty recognition drops that cue and the rendition just misses the line, the
@@ -10,26 +11,73 @@
      private static let executor = Executor()
 +    private static let playbackExecutor = Executor()
 +
++    private enum RecognitionUse { case fullscreen, rendition }
++
++    typealias PlaybackLine = (candidates: [(text: String, confidence: Float)], midY: CGFloat)
++
++    struct PlaybackReading {
++        let text: String
++        let isUnambiguous: Bool
++
++        func acceptedText(verifiedBy verification: Self? = nil) -> String? {
++            if isUnambiguous { return text }
++            guard let verification, verification.isUnambiguous, verification.text == text else { return nil }
++            return text
++        }
++    }
++
 +    nonisolated static func recognizeForPlayback(_ image: CGImage, trackLanguage: String?) async -> String? {
 +        let language = recognitionLanguage(forTrackLanguage: trackLanguage)
 +        return await playbackExecutor.run {
 +            guard let flat = flattenedOntoBlack(image) else { return nil }
-+            if let observations = recognize(flat, at: .fast, language: language, requireLanguageMatch: true) {
-+                return assembleLines(observations)
++            if let text = recognizePlayback(flat, at: .fast, language: language)?.acceptedText() {
++                return text
 +            }
-+            // The fast model only supports a subset of languages. Prefer the bitmap
-+            // fallback to guessing in a different language if accurate recognition fails.
-+            guard !accurateIsUnavailable else { return nil }
-+            guard let observations = recognize(flat, at: .accurate, language: language, requireLanguageMatch: true) else {
++            guard !accurateIsUnavailable,
++                  let reading = recognizePlayback(flat, at: .accurate, language: language) else {
 +                return nil
 +            }
-+            return assembleLines(observations)
++            if let text = reading.acceptedText() { return text }
++
++            // Vision can assign the same confidence to several accurate candidates, including
++            // different glyphs. Verify the leading reading without language correction.
++            let verification = recognizePlayback(flat, at: .accurate, language: language, usesLanguageCorrection: false)
++            return reading.acceptedText(verifiedBy: verification)
 +        }
++    }
++
++    private nonisolated static func recognizePlayback(
++        _ image: CGImage,
++        at level: VNRequestTextRecognitionLevel,
++        language: String?,
++        usesLanguageCorrection: Bool = true
++    ) -> PlaybackReading? {
++        guard let observations = recognize(image, at: level, language: language, use: .fullscreen,
++                                           usesLanguageCorrection: usesLanguageCorrection) else { return nil }
++        return playbackReading(from: observations.map { observation in
++            (observation.topCandidates(3).map { ($0.string, $0.confidence) }, observation.boundingBox.midY)
++        })
++    }
++
++    nonisolated static func playbackReading(from observations: [PlaybackLine]) -> PlaybackReading? {
++        var lines: [(text: String, midY: CGFloat)] = []
++        var isUnambiguous = true
++        for (candidates, midY) in observations {
++            guard let top = candidates.first, top.confidence >= 0.70,
++                  !top.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
++            if let alternative = candidates.dropFirst().first(where: { $0.text != top.text }),
++               top.confidence - alternative.confidence < 0.08 {
++                isUnambiguous = false
++            }
++            lines.append((top.text, midY))
++        }
++        guard let text = assembleLines(lines) else { return nil }
++        return PlaybackReading(text: text, isUnambiguous: isUnambiguous)
 +    }
  
      /// Vision bounding boxes are normalized with a bottom-left origin; reading order is
      /// descending midY. Blank fragments are dropped; nil when nothing readable remains.
-@@ -24,7 +42,7 @@
+@@ -24,7 +89,7 @@ enum SubtitleImageOCR {
      /// Track tags are ISO 639-1/2 ("ger"), Vision wants BCP-47 primary codes ("de"). The engine's
      /// synonym classes resolve the bibliographic 639-2/B forms Foundation cannot ("ger", "fre").
      nonisolated static func recognitionLanguage(forTrackLanguage tag: String?) -> String? {
@@ -38,16 +86,42 @@
          if let set = AetherEngine.languageSynonyms.first(where: { $0.contains(raw) }),
             let twoLetter = set.first(where: { $0.count == 2 }) {
              return twoLetter
-@@ -94,17 +112,21 @@
-     /// recognition of a line beats no line.
+@@ -77,45 +142,43 @@ enum SubtitleImageOCR {
+     /// stall per cue to learn it again.
+     private nonisolated static func recognizeSynchronously(_ image: CGImage, language: String?) -> String? {
+         guard let flat = flattenedOntoBlack(image) else { return nil }
+-        if !accurateIsUnavailable, let observations = recognize(flat, at: .accurate, language: language) {
+-            return assembleLines(observations)
+-        }
+-        markAccurateUnavailable()
+-        guard let observations = recognize(flat, at: .fast, language: language) else { return nil }
+-        return assembleLines(observations)
++        let accurate = accurateIsUnavailable ? nil : recognize(flat, at: .accurate, language: language)
++        guard let observations = accurate ?? recognize(flat, at: .fast, language: language) else { return nil }
++        return assembleLines(observations.compactMap { observation in
++            guard let top = observation.topCandidates(1).first else { return nil }
++            return (top.string, observation.boundingBox.midY)
++        })
+     }
+ 
+-    /// nil when the REQUEST failed, which is what the fallback turns on. An empty array is a
+-    /// request that ran and read nothing, which is an ordinary outcome for a subtitle bitmap and
+-    /// says nothing about the model.
+-    ///
+-    /// The language is resolved per level on purpose: `.fast` supports six languages against the
+-    /// accurate model's thirty-three, so outside those six the pin is simply dropped. Unpinned
+-    /// recognition of a line beats no line.
++    /// Fullscreen can fall back to the bitmap if the requested language is unsupported.
++    /// Native renditions need text and can still try an unpinned language.
      private nonisolated static func recognize(_ image: CGImage,
                                                at level: VNRequestTextRecognitionLevel,
 -                                              language: String?) -> [(text: String, midY: CGFloat)]? {
 +                                              language: String?,
-+                                              requireLanguageMatch: Bool = false) -> [(text: String, midY: CGFloat)]? {
++                                              use: RecognitionUse = .rendition,
++                                              usesLanguageCorrection: Bool = true) -> [VNRecognizedTextObservation]? {
          let request = VNRecognizeTextRequest()
          request.recognitionLevel = level
-         request.usesLanguageCorrection = true
+-        request.usesLanguageCorrection = true
 -        if let language,
 -           let supported = try? request.supportedRecognitionLanguages(),
 -           let match = supported.first(where: {
@@ -55,6 +129,7 @@
 -               return s == language || s.hasPrefix(language + "-")
 -           }) {
 -            request.recognitionLanguages = [match]
++        request.usesLanguageCorrection = usesLanguageCorrection
 +        if let language {
 +            let supported = (try? request.supportedRecognitionLanguages()) ?? []
 +            if let match = supported.first(where: {
@@ -62,13 +137,26 @@
 +                return s == language || s.hasPrefix(language + "-")
 +            }) {
 +                request.recognitionLanguages = [match]
-+            } else if requireLanguageMatch {
++            } else if use == .fullscreen {
 +                return nil
 +            }
          }
          do {
              try VNImageRequestHandler(cgImage: image, options: [:]).perform([request])
-@@ -236,3 +258,10 @@
+         } catch {
++            if level == .accurate, usesLanguageCorrection { markAccurateUnavailable() }
+             logFailureOnce("Vision \(level == .accurate ? "accurate" : "fast") perform failed: \(error)")
+             return nil
+         }
+-        return (request.results ?? []).compactMap { obs -> (String, CGFloat)? in
+-            guard let top = obs.topCandidates(1).first else { return nil }
+-            return (top.string, obs.boundingBox.midY)
+-        }
++        return request.results ?? []
+     }
+ 
+     /// Recognize a batch of CLOSED cues and append the text results to a native store. Image
+@@ -236,3 +299,10 @@ enum SubtitleImageOCR {
          if first { EngineLog.emit("[SubtitleOCR] degraded: \(reason)", category: .engine) }
      }
  }
@@ -79,3 +167,50 @@
 +        await SubtitleImageOCR.recognizeForPlayback(cgImage, trackLanguage: trackLanguage)
 +    }
 +}
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/SubtitleOCRTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/SubtitleOCRTests.swift
+--- a/Vendor/AetherEngine/Tests/AetherEngineTests/SubtitleOCRTests.swift
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/SubtitleOCRTests.swift
+@@ -28,6 +28,43 @@ struct SubtitleOCRTests {
+         #expect(SubtitleImageOCR.recognitionLanguage(forTrackLanguage: "") == nil)
+     }
+ 
++    @Test("fullscreen OCR preserves Vision's confidently ranked text")
++    func preservesConfidentReading() {
++        let dialogue: [(String, Float)] = [("-I need an explainer", 0.95), ("-1 need an explainer", 0.72)]
++        let number: [(String, Float)] = [("-1 dB", 0.95), ("-I dB", 0.72)]
++        #expect(SubtitleImageOCR.playbackReading(from: [(dialogue, 0.5)])?.acceptedText() == "-I need an explainer")
++        #expect(SubtitleImageOCR.playbackReading(from: [(number, 0.5)])?.acceptedText() == "-1 dB")
++    }
++
++    @Test("fullscreen OCR falls back to the bitmap for uncertain readings")
++    func rejectsUncertainReading() {
++        let ambiguous: [(String, Float)] = [("-1 need an explainer", 0.92), ("-I need an explainer", 0.89)]
++        let lowConfidence: [(String, Float)] = [("[beeping]", 0.40)]
++        let reading = SubtitleImageOCR.playbackReading(from: [(ambiguous, 0.5)])
++        #expect(reading?.acceptedText() == nil)
++        #expect(reading?.acceptedText(verifiedBy: reading) == nil)
++        #expect(SubtitleImageOCR.playbackReading(from: [(lowConfidence, 0.5)]) == nil)
++        #expect(SubtitleImageOCR.playbackReading(from: []) == nil)
++    }
++
++    @Test("fullscreen OCR verifies tied accurate readings across all caption lines")
++    func verifiesTiedReading() {
++        let question = "-So, are you two dating?"
++        let response = "-Oh, um, we-- I--"
++        let reading = SubtitleImageOCR.playbackReading(from: [
++            ([(response, 1), ("-Oh, um, we-- l--", 1)], 0.25),
++            ([(question, 1), ("-So, are you two dating.", 1)], 0.75)
++        ])
++        let verified = SubtitleImageOCR.playbackReading(from: [([(question, 1)], 0.75), ([(response, 1)], 0.25)])
++        let different = SubtitleImageOCR.playbackReading(from: [
++            ([(question, 1)], 0.75), ([("-Oh, um, we-- 1--", 1)], 0.25)
++        ])
++        let incomplete = SubtitleImageOCR.playbackReading(from: [([(question, 1)], 0.75)])
++        #expect(reading?.acceptedText(verifiedBy: verified) == "\(question)\n\(response)")
++        #expect(reading?.acceptedText(verifiedBy: different) == nil)
++        #expect(reading?.acceptedText(verifiedBy: incomplete) == nil)
++    }
++
+     @Test("flatten produces an opaque black canvas with the source drawn on top")
+     func flatten() throws {
+         // 2x1 image: left pixel white opaque, right pixel fully transparent.

@@ -1,0 +1,1168 @@
+AetherEngine startup, HEVC, FEL and PGS compatibility backports
+
+AE#1061: wait for the load and release waiters when stop or a new load takes over.
+https://github.com/superuser404notfound/AetherEngine/commit/e382dfcbf66d50070f50011f90d632b36ada6b7b
+AE#1055: bound FEL shader pivots and stop using in-place compose after GPU failure.
+https://github.com/superuser404notfound/AetherEngine/commit/4f3a8fa18c20eb72f60294e0ed8cdb4c7d65fab8
+https://github.com/superuser404notfound/AetherEngine/commit/df014e1c48a2b4fa49f11b3a465df331b6a1957e
+AE#1064: retain the stream mapping until a dated FEL GOP can be fit.
+https://github.com/superuser404notfound/AetherEngine/commit/2ffe8e001ecae45665fc347982b705370b3da2a4
+AE#960: discard short HEVC NAL headers while preserving valid picture and RPU units.
+https://github.com/superuser404notfound/AetherEngine/commit/3f22cfd4137c4cf45ed69203f42c699a2097d827
+AE#1006: convert PQ PGS palettes for the compositor, including .sup sidecars.
+https://github.com/superuser404notfound/AetherEngine/commit/cf69be2cf46ae06b759919213816817346395c6f
+
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Loading.swift b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Loading.swift
+index 301f91c603d031db94c1c3ca17ae7d1d46d6176f..bc60f30fc64a67d65f5325dc82d6fcbe899a510c 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Loading.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Loading.swift
+@@ -2970,6 +2970,14 @@ host.audioShaping = loadedOptions.audioShaping
+                     attemptWhenUnproven: loadedOptions.attemptsHDRMasterOnUnprovenPanel,
+                     displayEligibleForHDR: sessionDisplayEligibleForHDR,
+                     panelRefusedHDRMaster: Self.panelRefusedHDRMaster)
++                // AE#1061: a rebuild that superseded its load before the handshake settled has no load-time
++                // answer, and without this line the media route it then takes reads like any other.
++                if sessionObservedDisplayCaps == nil, sourceVideoFormat != .sdr {
++                    EngineLog.emit(
++                        "[DisplayCriteria] reload found no load-time panel answer (the load it replaced never "
++                        + "settled its route): an HDR source routes as on an SDR panel (#1061)",
++                        category: .session)
++                }
+                 if reloadRoutingPanelHDR != loadedOptions.panelIsInHDRMode {
+                     EngineLog.emit(
+                         "[DisplayCriteria] AE#541 reload routes on the load's panel answer: panelIsHDR="
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Subtitles.swift b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Subtitles.swift
+index d3c13117cb2c7d48458d3867c18c3ab7dfb299f9..5c96ae96d4c7d38950bcdbf64c17539d86a09489 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Subtitles.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Subtitles.swift
+@@ -299,6 +299,11 @@ extension AetherEngine {
+         startSubtitleDrainer()
+     }
+ 
++    /// AE#1006: a `.sup` from a UHD disc carries the same PQ palette as the disc's own tracks.
++    var sourceIsPQForBitmapSubtitles: Bool {
++        sourceVideoStreamFormat?.transfer == av_color_transfer_name(AVCOL_TRC_SMPTE2084).map { String(cString: $0) }
++    }
++
+     /// Drop a channel's bitmap sidecar together with the drain target pointing at it.
+     func releaseSidecarBitmapSource(channel: SubtitleChannel) {
+         guard sidecarBitmapSources[channel] != nil else { return }
+@@ -307,7 +312,9 @@ extension AetherEngine {
+ 
+     /// Build a fresh overlay decoder for the stream on whichever host owns the session demuxer.
+     func makeSubtitleDrainDecoder(channel: SubtitleChannel, streamIndex: Int32) -> EmbeddedSubtitleDecoder? {
+-        if let source = sidecarBitmapSources[channel] { return source.makeDecoder() }
++        if let source = sidecarBitmapSources[channel] {
++            return source.makeDecoder(sourceIsPQ: sourceIsPQForBitmapSubtitles)
++        }
+         return makeSubtitleDrainDecoder(streamIndex: streamIndex)
+     }
+ 
+@@ -1976,6 +1983,7 @@ extension AetherEngine {
+         let formatHint = selectedExternal?.formatHint
+         let preserveASS = loadedOptions.preserveASSMarkup
+         let sessionGeneration = loadGeneration
++        let sourceIsPQ = sourceIsPQForBitmapSubtitles
+         #if DEBUG
+         let decoderFactory = secondarySidecarDecoderFactoryForTesting
+         #endif
+@@ -2002,7 +2010,7 @@ extension AetherEngine {
+                     #if DEBUG
+                     if let decoderFactory { return PreparedSidecarDecoder(decoder: decoderFactory(source)) }
+                     #endif
+-                    return PreparedSidecarDecoder(decoder: source.makeDecoder())
++                    return PreparedSidecarDecoder(decoder: source.makeDecoder(sourceIsPQ: sourceIsPQ))
+                 }.value
+                 bitmapDecoder = prepared.decoder
+             } else {
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift
+index 873d4a8e168d8b4affdc6d0c94c6434f7e8ce724..6e63286a063feeba1a92bd56e06f75c460a654bd 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift
+@@ -1361,7 +1361,11 @@ public final class AetherEngine: ObservableObject {
+     /// Audit LIF-101: the generation of the `load()` or `reloadWithAudioOverride` still running. A
+     /// load passes through `.paused` long before it returns (native readiness during the play gate),
+     /// so its state cannot say whether it settled; this can.
+-    private var loadInFlightGeneration: UInt64?
++    private var loadInFlightGeneration: UInt64? {
++        didSet { if loadInFlightGeneration != oldValue { resumeLoadSettleWaiters() } }
++    }
++    /// AE#1061: picks parked until the load in flight returns. See `awaitLoadInFlightSettled`.
++    private var loadSettleWaiters: [CheckedContinuation<Void, Never>] = []
+     /// Test seam for the owed background decision on a platform without an app lifecycle.
+     var owedBackgroundPolicyForTesting: (@MainActor (AetherEngine) async -> Void)?
+     #if os(iOS)
+@@ -2674,7 +2678,11 @@ public final class AetherEngine: ObservableObject {
+     /// every suspension point. Without it, a load suspended at the probe/criteria/session-start could resume
+     /// after a newer load, orphan the successor's producer+loopback server, and resurrect playback after
+     /// dismissal. A superseded load throws CancellationError at the first checkpoint.
+-    var loadGeneration: UInt64 = 0
++    var loadGeneration: UInt64 = 0 {
++        // AE#1061: a stop() or newer load releases a pick parked on the load it replaced at once, not
++        // only when that load gets round to unwinding.
++        didSet { resumeLoadSettleWaiters() }
++    }
+ 
+     /// Separates cache lifecycle callbacks from superseding sessions.
+     var sessionCacheStatusToken: UInt64 = 0
+@@ -8614,6 +8622,13 @@ resumeOverride: selection.resumePosition,
+             while let selected = self.pendingAudioSelection {
+                 self.pendingAudioSelection = nil
+                 guard !Task.isCancelled, self.audioSelectionEpoch == epoch else { return }
++                await self.awaitLoadInFlightSettled(pick: "selectAudioTrack(\(selected))")
++                // A load that failed has no session to rebuild; the next load owns the engine.
++                guard !Task.isCancelled, self.audioSelectionEpoch == epoch else { return }
++                if case .error = self.state { return }
++                // A pick that came in during the wait replaces this one.
++                let selected = self.pendingAudioSelection ?? selected
++                self.pendingAudioSelection = nil
+                 if self.activeAudioTrackIndex == selected { continue }
+                 let beforeReload = self.loadGeneration
+                 let failure = await self.reloadWithAudioOverride(
+@@ -8659,6 +8674,10 @@ resumeOverride: selection.resumePosition,
+         let custom = isCustomSource
+         Task { @MainActor [weak self] in
+             guard let self = self else { return }
++            // AE#1061: the custom branch rebuilds exactly as an audio pick does, the URL branch would
++            // unwind the host's load() with a CancellationError. Both wait for the load to return.
++            await self.awaitLoadInFlightSettled(pick: "selectTitle(\(id))")
++            if case .error = self.state { return }
+             if custom {
+                 // Custom readers (e.g. SMB ISO) have no URL to reopen; rebuild on the retained reader with the
+                 // title override, restarting at the new title's head.
+@@ -9350,6 +9369,36 @@ resumeOverride: selection.resumePosition,
+ 
+     var loadInFlight: Bool { loadInFlightGeneration == loadGeneration }
+ 
++    /// AE#1061: a track or title pick that lands while a load is still running waits for that load to
++    /// return before it rebuilds. The load publishes `audioTracks` before its display handshake, and a
++    /// rebuild that superseded it there found none of the load's panel answers (they are stored only
++    /// once the handshake settles), so it routed a Dolby Vision title media-direct onto a panel that
++    /// was mid-switch into DV, and left `videoFormat` at `.sdr` for the session. It also unwound the
++    /// host's `load()` with a `CancellationError`, which a host reads as a supersede (LIF-101). Waiting
++    /// costs the pick the rest of the load; a host that knows its track up front passes it to `load`
++    /// as `audioSourceStreamIndex` and pays nothing.
++    ///
++    /// Returns as soon as the load the caller saw is no longer the one in flight: it returned, or a
++    /// stop() or newer load took over (both move the generation), which the caller's own generation
++    /// guard then turns away.
++    func awaitLoadInFlightSettled(pick: String) async {
++        guard loadInFlight else { return }
++        let generation = loadGeneration
++        EngineLog.emit(
++            "[AetherEngine] \(pick) waits for the load in flight to settle its route before it rebuilds (#1061)",
++            category: .engine)
++        while loadInFlightGeneration == generation, loadGeneration == generation, !Task.isCancelled {
++            await withCheckedContinuation { loadSettleWaiters.append($0) }
++        }
++    }
++
++    private func resumeLoadSettleWaiters() {
++        guard !loadSettleWaiters.isEmpty else { return }
++        let waiters = loadSettleWaiters
++        loadSettleWaiters = []
++        for waiter in waiters { waiter.resume() }
++    }
++
+     func beginLoadInFlight(_ generation: UInt64) {
+         loadInFlightGeneration = generation
+     }
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/DualLayerVideoDecoder.swift b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/DualLayerVideoDecoder.swift
+index c9b715fcebf6f40f98cd07db5f65a3d5275f12d6..e0c3a4d6bffb181284cdf231b5d47cb1216011a5 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/DualLayerVideoDecoder.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/DualLayerVideoDecoder.swift
+@@ -520,6 +520,13 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+     /// Frames dropped because an in-place composition failed after the GPU had started writing into the
+     /// base-layer buffer. Guarded by `composeResultLock`.
+     private var summaryInPlaceDropped: Int = 0
++    /// Set by the first in-place composition that failed after the GPU started writing. From then on
++    /// every frame takes the pool path, whose failure leaves the base layer intact and shows it. Without
++    /// this one GPU fault cost every later frame: tvOS stops running a process's GPU work after a couple
++    /// of faults, each later in-place command buffer failed too, and each frame was dropped while the
++    /// sound played on (AE#1055, an Apple TV 4K 2nd generation). Kept for the decoder's life, `flush()`
++    /// included: the GPU that faulted is the same one after a seek. Guarded by `composeResultLock`.
++    private var inPlaceOffAfterFault = false
+     /// Frames sent out as the base layer, with its mapping-preserving RPU, because the compose queue was
+     /// in stall mode (`acquireSlotOrStall`). Guarded by `composeResultLock`; reset by the 1 Hz summary.
+     private var summaryBypassComposeStalled: Int = 0
+@@ -1527,7 +1534,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+         }
+         // A measurement run (`AETHER_FEL_MEASURE`) composes the base layer a second and third time from
+         // another queue, so the base buffer has to stay intact: those runs use the output pool.
+-        let inPlace = FelResidualMeasure.stride == 0 && req.composesIntoBase
++        let inPlace = FelResidualMeasure.stride == 0 && req.composesIntoBase && !isInPlaceOffAfterFault()
+             && composer.canComposeInPlace(baseBuffer: req.base, params: req.params)
+         if !inPlace, !isInStallMode(), let concrete = composer as? DoviFelComposer {
+             FelResidualMeasure.sampleIfDue(composer: concrete, base: req.base, enhancement: req.enhancement,
+@@ -1596,6 +1603,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+                 case .baseCorrupted:
+                     EngineLog.emit("[DualLayerVideoDecoder] compose failed after writing began (\(arrived)): pts=\(String(format: "%.3f", pts.seconds)); frame dropped", category: .swPlayback)
+                     self?.recordInPlaceDrop()
++                    self?.turnInPlaceOffAfterFault()
+                     delivery.skip(ticket: ticket, epoch: epoch)
+                 }
+                 self?.composeResultLock.lock(); self?.composeRequestsHandedOff += 1; self?.composeResultLock.unlock()
+@@ -1624,6 +1632,21 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+         composeResultLock.lock(); summaryInPlaceDropped += 1; composeResultLock.unlock()
+     }
+ 
++    private func isInPlaceOffAfterFault() -> Bool {
++        composeResultLock.lock(); defer { composeResultLock.unlock() }
++        return inPlaceOffAfterFault
++    }
++
++    private func turnInPlaceOffAfterFault() {
++        composeResultLock.lock()
++        let first = !inPlaceOffAfterFault
++        inPlaceOffAfterFault = true
++        composeResultLock.unlock()
++        if first {
++            EngineLog.emit("[DualLayerVideoDecoder] in-place compose failed on the GPU; composing into the output pool from here on, so a failed frame shows its base layer instead of being dropped", category: .swPlayback)
++        }
++    }
++
+     private func recordComposeResult(success: Bool) {
+         composeResultLock.lock()
+         if success { summaryComposedFrames += 1; totalComposedFrames += 1 } else { summaryComposeFailures += 1 }
+@@ -2598,6 +2621,7 @@ final class DualLayerVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+     }
+ 
+     var isComposeStalledForTesting: Bool { isInStallMode() }
++    var isInPlaceOffAfterFaultForTesting: Bool { isInPlaceOffAfterFault() }
+ 
+     /// Compositions and bypasses handed to the compose queue and not yet handed to `orderedDelivery` (or
+     /// dropped as retired): started minus handed off.
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/EmbeddedSubtitleDecoder.swift b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/EmbeddedSubtitleDecoder.swift
+index a034e4f4dbda142ad4781fb00b15f6a4fd02a9af..1d58eb4f464ef06891fa461fd6a2f947e9a92ec5 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/EmbeddedSubtitleDecoder.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/EmbeddedSubtitleDecoder.swift
+@@ -62,19 +62,22 @@ final class EmbeddedSubtitleDecoder {
+     /// for SRT, WebVTT or teletext uses the default 384x288 instead.
+     private let assPlayRes: CGSize
+ 
++    /// AE#1006: a PGS track of a PQ source carries a PQ palette, converted to sRGB per display set.
++    private let pqPalette: Bool
++
+     /// Open the subtitle decoder for `stream`. Returns `nil` if the codec couldn't be opened.
+-    convenience init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
++    convenience init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, sourceIsPQ: Bool = false, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
+         guard let codecpar = stream.pointee.codecpar else { return nil }
+         self.init(codecpar: codecpar, sourceVideoWidth: sourceVideoWidth,
+-                  sourceVideoHeight: sourceVideoHeight, preserveASSMarkup: preserveASSMarkup,
+-                  teletextPage: teletextPage)
++                  sourceVideoHeight: sourceVideoHeight, sourceIsPQ: sourceIsPQ,
++                  preserveASSMarkup: preserveASSMarkup, teletextPage: teletextPage)
+         // Some demuxers default to AVDISCARD_DEFAULT and swallow packets; force NONE so everything reaches av_read_frame.
+         stream.pointee.discard = AVDISCARD_NONE
+     }
+ 
+     /// Open the subtitle decoder for a stream's parameters alone. #921: a bitmap sidecar keeps a
+     /// copy of its parameters after its container is closed, and builds its drain decoders from it.
+-    init?(codecpar: UnsafePointer<AVCodecParameters>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
++    init?(codecpar: UnsafePointer<AVCodecParameters>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, sourceIsPQ: Bool = false, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
+         guard codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { return nil }
+         let id = codecpar.pointee.codec_id
+         guard let codec = avcodec_find_decoder(id),
+@@ -115,6 +118,7 @@ final class EmbeddedSubtitleDecoder {
+         self.emitsRawASSLines = preserveASSMarkup
+             && (id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA)
+         self.teletextPage = teletextPage
++        self.pqPalette = sourceIsPQ && id == AV_CODEC_ID_HDMV_PGS_SUBTITLE
+ 
+         var playRes = SubtitleRectText.defaultASSPlayRes
+         if let extra = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
+@@ -264,7 +268,8 @@ final class EmbeddedSubtitleDecoder {
+                     rect,
+                     videoWidth: Int(canvasW),
+                     videoHeight: Int(canvasH),
+-                    reportedCanvas: reportedCanvas
++                    reportedCanvas: reportedCanvas,
++                    pqPalette: pqPalette
+                 ) {
+                     bodies.append(.image(image))
+                 }
+@@ -670,12 +675,13 @@ final class EmbeddedSubtitleDecoder {
+     /// Palette from libavcodec is 32-bit with alpha in the high byte and BGR below ([B,G,R,A] on little-endian);
+     /// rewritten to RGBA for CGImage's premultipliedLast. Internal for unit tests (#146).
+     /// `reportedCanvas` replaces `canvasSize` when the plane's shape differs from its pixel grid (AE#971 DVB,
+-    /// AE#993 DVD).
++    /// AE#993 DVD). `pqPalette` converts a PQ palette to sRGB first (AE#1006).
+     static func imageForSubtitleRect(
+         _ rect: UnsafeMutablePointer<AVSubtitleRect>,
+         videoWidth: Int,
+         videoHeight: Int,
+-        reportedCanvas: CGSize? = nil
++        reportedCanvas: CGSize? = nil,
++        pqPalette: Bool = false
+     ) -> SubtitleImage? {
+         let r = rect.pointee
+         guard r.type == SUBTITLE_BITMAP,
+@@ -699,10 +705,14 @@ final class EmbeddedSubtitleDecoder {
+         var visible = [Bool](repeating: false, count: 256)
+         var premultiplied = [UInt32](repeating: 0, count: 256)
+         for i in 0..<256 {
+-            let b = UInt32(palettePtr[i * 4 + 0])
+-            let g = UInt32(palettePtr[i * 4 + 1])
+-            let red = UInt32(palettePtr[i * 4 + 2])
++            var b = UInt32(palettePtr[i * 4 + 0])
++            var g = UInt32(palettePtr[i * 4 + 1])
++            var red = UInt32(palettePtr[i * 4 + 2])
+             let a = UInt32(palettePtr[i * 4 + 3])
++            if pqPalette, a > 0 {
++                let rgb = PQSubtitlePalette.sRGB(fromPQ: UInt8(red), UInt8(g), UInt8(b))
++                (red, g, b) = (UInt32(rgb.r), UInt32(rgb.g), UInt32(rgb.b))
++            }
+             visible[i] = palettePtr[i * 4 + 3] >= alphaThreshold
+             premultiplied[i] = ((red * a + 127) / 255)
+                 | (((g * a + 127) / 255) << 8)
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift b/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
+index d86173a45dfedf20d39f17252c23c8d6f93b4c39..de6800131c95ecbd134dfad9acd0846b55cda889 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
+@@ -1987,6 +1987,7 @@ final class SoftwarePlaybackHost {
+         return EmbeddedSubtitleDecoder(stream: stream,
+                                        sourceVideoWidth: w > 0 ? w : 1920,
+                                        sourceVideoHeight: h > 0 ? h : 1080,
++                                       sourceIsPQ: vpar?.pointee.color_trc == AVCOL_TRC_SMPTE2084,
+                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                        teletextPage: teletextPageForSubtitleTap)
+     }
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/PQSubtitlePalette.swift b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/PQSubtitlePalette.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..c977c99471393f9e1fab3e432ead66438a264ff8
+--- /dev/null
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/PQSubtitlePalette.swift
+@@ -0,0 +1,44 @@
++import Foundation
++
++/// AE#1006: a UHD Blu-ray with HDR video codes its PGS palette in BT.2100 PQ with BT.2020 primaries,
++/// so read as sRGB its white (PQ 0.62, about 294 nits) came out as 62 % grey. A palette entry is
++/// taken back to Y'CbCr through the BT.709 matrix pgssubdec used on a 1080p canvas, rebuilt as
++/// BT.2020 R'G'B', decoded to nits, placed against the BT.2408 graphics white of 203 nits, moved to
++/// BT.709 primaries and clipped to SDR. An SDR-authored track in an HDR file only brightens a
++/// little: 255 stays white, black stays black.
++enum PQSubtitlePalette {
++    static let graphicsWhiteNits = 203.0
++
++    static func sRGB(fromPQ r: UInt8, _ g: UInt8, _ b: UInt8) -> (r: UInt8, g: UInt8, b: UInt8) {
++        let r709 = Double(r) / 255, g709 = Double(g) / 255, b709 = Double(b) / 255
++        let y = 0.2126 * r709 + 0.7152 * g709 + 0.0722 * b709
++        let cb = (b709 - y) / 1.8556
++        let cr = (r709 - y) / 1.5748
++
++        let r2020 = y + 1.4746 * cr
++        let b2020 = y + 1.8814 * cb
++        let g2020 = (y - 0.2627 * r2020 - 0.0593 * b2020) / 0.6780
++
++        let lr = nits(pq: r2020) / graphicsWhiteNits
++        let lg = nits(pq: g2020) / graphicsWhiteNits
++        let lb = nits(pq: b2020) / graphicsWhiteNits
++
++        return (encode(1.6605 * lr - 0.5876 * lg - 0.0728 * lb),
++                encode(-0.1246 * lr + 1.1329 * lg - 0.0083 * lb),
++                encode(-0.0182 * lr - 0.1006 * lg + 1.1187 * lb))
++    }
++
++    /// SMPTE ST 2084 EOTF.
++    static func nits(pq value: Double) -> Double {
++        let m1 = 2610.0 / 16384, m2 = 2523.0 / 4096 * 128
++        let c1 = 3424.0 / 4096, c2 = 2413.0 / 4096 * 32, c3 = 2392.0 / 4096 * 32
++        let p = pow(min(max(value, 0), 1), 1 / m2)
++        return 10000 * pow(max(p - c1, 0) / (c2 - c3 * p), 1 / m1)
++    }
++
++    private static func encode(_ linear: Double) -> UInt8 {
++        let v = min(max(linear, 0), 1)
++        let e = v <= 0.0031308 ? 12.92 * v : 1.055 * pow(v, 1 / 2.4) - 0.055
++        return UInt8((e * 255).rounded())
++    }
++}
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SidecarBitmapSource.swift b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SidecarBitmapSource.swift
+index b4e7f82e9b3857b2d11c8c6a445cde34e4ce18d8..c830b18be64efc26ef2eb0755dad4c5dc4b503e5 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SidecarBitmapSource.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SidecarBitmapSource.swift
+@@ -70,10 +70,11 @@ final class SidecarBitmapSource: @unchecked Sendable {
+     /// A fresh decoder for the sidecar's stream. PGS takes its canvas from each composition; the
+     /// video size is only the fallback for a codec that does not carry one.
+     func makeDecoder(sourceVideoWidth: Int32 = 1920,
+-                     sourceVideoHeight: Int32 = 1080) -> EmbeddedSubtitleDecoder? {
++                     sourceVideoHeight: Int32 = 1080,
++                     sourceIsPQ: Bool = false) -> EmbeddedSubtitleDecoder? {
+         guard let codecpar else { return nil }
+         return EmbeddedSubtitleDecoder(codecpar: codecpar, sourceVideoWidth: sourceVideoWidth,
+-                                       sourceVideoHeight: sourceVideoHeight)
++                                       sourceVideoHeight: sourceVideoHeight, sourceIsPQ: sourceIsPQ)
+     }
+ 
+     /// Every cue of the sidecar, decoded in file order and handed over in batches of `batchSize`,
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Video/FelCurves/FelCurveLookahead.swift b/Vendor/AetherEngine/Sources/AetherEngine/Video/FelCurves/FelCurveLookahead.swift
+index b8211fba753879a85fba8f76d93e68f09d30e6fe..96c4fb5de863d2f5587fc526d5d8039c3b54b284 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Video/FelCurves/FelCurveLookahead.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Video/FelCurves/FelCurveLookahead.swift
+@@ -173,6 +173,13 @@ final class FelCurveLookahead {
+     private func folds(for frames: [Frame]) -> [SceneFold?] {
+         guard !frames.isEmpty else { return [] }
+         let display = frames.indices.sorted { frames[$0].pts < frames[$1].pts }
++        // An undated picture can carry a scene change. Keep the stream's mapping for this GOP
++        // and start a fresh fit in the next one rather than carrying a curve across that boundary.
++        guard let spacing = Self.frameSpacing(forSortedTimestamps: display.map { frames[$0].pts }) else {
++            carried = nil
++            carriedValid = false
++            return Array(repeating: nil, count: frames.count)
++        }
+         // A scene starts at a frame whose RPU raises scene_refresh_flag, and at the first frame shown at all.
+         var starts: [Int] = display.filter { frames[$0].info?.sceneRefresh == true }
+         if !starts.isEmpty { streamMarksScenes = true }
+@@ -186,7 +193,7 @@ final class FelCurveLookahead {
+ 
+         var fitted: [Int: SceneFold?] = [:]
+         let needPictures = starts.filter { frames[$0].info?.carriesResidual == true && frames[$0].info?.luma != nil }
+-        let decoded = needPictures.isEmpty ? [:] : decode(frames, wanted: Set(needPictures.map { frames[$0].pts }))
++        let decoded = needPictures.isEmpty ? [:] : decode(frames, wanted: Set(needPictures.map { frames[$0].pts }), spacing: spacing)
+         for index in starts {
+             guard let info = frames[index].info else {
+                 fitted[index] = .some(nil)
+@@ -229,12 +236,21 @@ final class FelCurveLookahead {
+         let enhancement: CVPixelBuffer
+     }
+ 
++    /// A missing time or unrepresentable gap cannot identify a scene's decoded pictures.
++    static func frameSpacing(forSortedTimestamps timestamps: [Int64]) -> Int64? {
++        guard timestamps.first != Int64.min else { return nil } // AV_NOPTS_VALUE
++        var minimum: Int64?
++        for (earlier, later) in zip(timestamps, timestamps.dropFirst()) where later > earlier {
++            let (gap, overflow) = later.subtractingReportingOverflow(earlier)
++            guard !overflow else { return nil }
++            minimum = min(minimum ?? gap, gap)
++        }
++        return minimum ?? 1
++    }
++
+     /// Decodes both layers in decode order until every wanted picture has come out of both decoders.
+-    private func decode(_ frames: [Frame], wanted: Set<Int64>) -> [Int64: PicturePair] {
++    private func decode(_ frames: [Frame], wanted: Set<Int64>, spacing: Int64) -> [Int64: PicturePair] {
+         guard let base = openBaseDecoder() else { return [:] }
+-        let sorted = frames.map(\.pts).sorted()
+-        let gaps: [Int64] = zip(sorted, sorted.dropFirst()).map { $1 - $0 }.filter { $0 > 0 }
+-        let spacing: Int64 = gaps.min() ?? 1
+         pictures.begin(wanted: wanted, timeBase: timeBase, frameSpacing: spacing)
+         defer { pictures.end() }
+         let lastNeeded = frames.lastIndex { wanted.contains($0.pts) } ?? (frames.count - 1)
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Video/HLSVideoEngine.swift b/Vendor/AetherEngine/Sources/AetherEngine/Video/HLSVideoEngine.swift
+index 8a628aa92523bc09956d8b1242d7e100aaf4735d..d845c13dd8a345853c242c5f9eda81d588f66aad 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Video/HLSVideoEngine.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Video/HLSVideoEngine.swift
+@@ -437,12 +437,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
+         guard let dem = demuxer else { return nil }
+         let w = savedVideoConfig.map { Int32($0.codecpar.pointee.width) } ?? 1920
+         let h = savedVideoConfig.map { Int32($0.codecpar.pointee.height) } ?? 1080
++        let pq = savedVideoConfig?.codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
+         // Audit DMX-108: the decoder copies what it needs out of the stream inside the call, so a
+         // live reopen's close() cannot free the stream underneath it.
+         let made = dem.withStream(at: streamIndex) { stream in
+             EmbeddedSubtitleDecoder(stream: stream,
+                                     sourceVideoWidth: w > 0 ? w : 1920,
+                                     sourceVideoHeight: h > 0 ? h : 1080,
++                                    sourceIsPQ: pq,
+                                     preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                     teletextPage: teletextPageForSubtitleTap)
+         }
+@@ -523,6 +525,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
+         guard let dem = demuxer else { return }
+         let w = savedVideoConfig.map { Int32($0.codecpar.pointee.width) } ?? 1920
+         let h = savedVideoConfig.map { Int32($0.codecpar.pointee.height) } ?? 1080
++        let pq = savedVideoConfig?.codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
+         for (ordinal, sidx) in nativeSubtitleSourceStreamIndicesForSession.enumerated() {
+             guard let sidx, ordinal < nativeSubtitleCueStoresForSession.count else { continue }
+             // Audit DMX-108: see `makeOverlayDecoder`.
+@@ -530,6 +533,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
+                 EmbeddedSubtitleDecoder(stream: stream,
+                                         sourceVideoWidth: w > 0 ? w : 1920,
+                                         sourceVideoHeight: h > 0 ? h : 1080,
++                                        sourceIsPQ: pq,
+                                         preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                         teletextPage: teletextPageForSubtitleTap)
+             }
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Video/MP4SegmentMuxer.swift b/Vendor/AetherEngine/Sources/AetherEngine/Video/MP4SegmentMuxer.swift
+index 9844c2e83ab13da5242b18232e2c5a180ee93a39..8e0cb196ef394be2cea562cfe76ab48c29df2c40 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Video/MP4SegmentMuxer.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Video/MP4SegmentMuxer.swift
+@@ -204,6 +204,8 @@ final class MP4SegmentMuxer {
+     /// length-prefixed at all. Latched at init: it is a property of the configuration record that
+     /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
+     private let videoNALLengthPrefixSize: Int?
++    private let isHEVCVideo: Bool
++    private var shortHEVCHeadersRemoved = 0
+     /// Latched from `VideoConfig.convertsAnnexBSamples`.
+     private let convertsAnnexBVideoSamples: Bool
+     /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
+@@ -328,6 +330,7 @@ final class MP4SegmentMuxer {
+             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
+         self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
+         self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
++        self.isHEVCVideo = video.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
+         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
+         // only matters for a source whose own extradata is missing or Annex B.
+@@ -778,6 +781,46 @@ final class MP4SegmentMuxer {
+             av_shrink_packet(packet, Int32(complete))
+         }
+ 
++        if streamIndex == videoOutputStreamIndex, isHEVCVideo,
++            !Self.nalChainSanitizerDisabled, let width = videoNALLengthPrefixSize,
++            let data = packet.pointee.data, packet.pointee.size > 0
++        {
++            let ranges = NALUnitChain.shortHEVCHeaderRanges(
++                UnsafeRawBufferPointer(start: data, count: Int(packet.pointee.size)),
++                lengthPrefixSize: width,
++                framingConfirmed: convertsAnnexBVideoSamples || videoNALFraming.isConfirmed)
++            if !ranges.isEmpty {
++                let result = av_packet_make_writable(packet)
++                guard result >= 0, let writable = packet.pointee.data else { return (result, .none) }
++                let count = Int(packet.pointee.size)
++                var read = 0
++                var write = 0
++                for range in ranges {
++                    let kept = range.lowerBound - read
++                    if kept > 0 {
++                        memmove(writable + write, writable + read, kept)
++                        write += kept
++                    }
++                    read = range.upperBound
++                }
++                if read < count {
++                    memmove(writable + write, writable + read, count - read)
++                    write += count - read
++                }
++                shortHEVCHeadersRemoved += ranges.count
++                if shortHEVCHeadersRemoved <= 5 || shortHEVCHeadersRemoved % 100 == 0 {
++                    EngineLog.emit(
++                        "[MP4SegmentMuxer] removed \(ranges.count) incomplete HEVC NAL header(s) "
++                            + "at dts=\(packet.pointee.dts), preserving \(write) sample bytes", category: .session)
++                }
++                av_shrink_packet(packet, Int32(write))
++                if write == 0 {
++                    av_packet_unref(packet)
++                    return (0, .none)
++                }
++            }
++        }
++
+         // The packet is consumed by the write below.
+         let writtenDuration = max(packet.pointee.duration, 0)
+ 
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Video/Metal/DoviShaderSource.swift b/Vendor/AetherEngine/Sources/AetherEngine/Video/Metal/DoviShaderSource.swift
+index b3089530db5a401dc9d956687b13d05fefeb3f69..d687e45ef8ecd5fef747d2c50664cf5bbcbab552 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Video/Metal/DoviShaderSource.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Video/Metal/DoviShaderSource.swift
+@@ -205,11 +205,22 @@ static inline float dovi_dither(uint2 gid, uint frame_index, uint2 phase) {
+    Reshaping curve evaluation
+    ========================================================================= */
+ 
++// Index of a curve's last pivot, inside `pivots` for every num_pivots, 0 and anything above 9 included.
++// Callers read it only behind a `num_pivots < 2` check, but a GPU compiler may execute a guarded load anyway.
++// The A12 (Apple TV 4K, 2nd generation) does: with the identity fail-safe's num_pivots 0, an unclamped last
++// index (num_pivots minus one) is 0xFFFFFFFF, which the A12 turns into a read 4 GiB past `num_pivots` and a
++// GPU page fault. Measured: Apple TV GPU restart reports at exactly `&poly_cb.num_pivots + 2^32` in either
++// in-flight parameter buffer, on the frames where a rejected Cb curve meets an MMR Cr curve. The M4 forms the
++// same address in 64 bits (16 GiB past) and reads 0 without an error, so a Mac never shows it.
++static inline uint dovi_last_pivot(constant struct DoviPolynomialParams &curve) {
++    return clamp(curve.num_pivots, 1u, 9u) - 1u;
++}
++
+ // Index of the piece owning bl_val: the last pivot that bl_val reaches.
+ // Deliberately last-match-wins rather than first, because adjacent pivots can
+ // repeat (a zero-width piece) and the spec assigns the sample to the later one.
+ static inline int dovi_select_piece(constant struct DoviPolynomialParams &curve, int bl_val) {
+-    int last_piece = int(curve.num_pivots) - 2;
++    int last_piece = int(min(curve.num_pivots, 9u)) - 2;
+     int piece = 0;
+     for (int i = 0; i <= last_piece; ++i) {
+         if (bl_val >= int(curve.pivots[i])) {
+@@ -230,7 +241,7 @@ static inline float dovi_eval_poly(
+     uint bl_max)
+ {
+     int lo = int(curve.pivots[0]);
+-    int hi = int(curve.pivots[curve.num_pivots - 1]);
++    int hi = int(curve.pivots[dovi_last_pivot(curve)]);
+     float x = float(clamp(bl_val, lo, hi)) / float(bl_max);
+ 
+     float inv = ldexp(1.0f, -int(curve.coef_shift[piece]));
+@@ -253,7 +264,7 @@ static inline float dovi_clamp_mmr_input(constant struct DoviPolynomialParams &c
+         return norm;
+     }
+     float lo = float(curve.pivots[0]) / scale;
+-    float hi = float(curve.pivots[curve.num_pivots - 1u]) / scale;
++    float hi = float(curve.pivots[dovi_last_pivot(curve)]) / scale;
+     return clamp(norm, lo, hi);
+ }
+ 
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Video/NALUnitChain.swift b/Vendor/AetherEngine/Sources/AetherEngine/Video/NALUnitChain.swift
+index 24042142a02019e6cdeb2312794615e8b3748773..2cf6193c66720f9afcfb24ff2c6aa3bfa8ef40c9 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Video/NALUnitChain.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Video/NALUnitChain.swift
+@@ -92,4 +92,33 @@ enum NALUnitChain {
+         guard let base = bytes.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return false }
+         return VideoConfigRecord.walksAsLengthPrefixed(base, size: bytes.count, lengthSize: lengthPrefixSize)
+     }
++
++    /// HEVC's NAL header is two bytes, even for EOS/EOB. A one-byte EOS from a
++    /// truncated transport-stream tail can have a perfectly valid length prefix,
++    /// so the overrun guard above cannot catch it. Apple's parser refuses the
++    /// entire HLS segment, while libavcodec ignores the damaged delimiter.
++    /// Return only the malformed units, preserving valid pictures and RPUs after
++    /// them. Never treat an unconfirmed Annex-B start code as a length of one.
++    static func shortHEVCHeaderRanges(
++        _ bytes: UnsafeRawBufferPointer, lengthPrefixSize: Int, framingConfirmed: Bool
++    ) -> [Range<Int>] {
++        guard (1...4).contains(lengthPrefixSize), bytes.count >= lengthPrefixSize else { return [] }
++        if !framingConfirmed, bytes.count >= 3, bytes[0] == 0, bytes[1] == 0,
++            bytes[2] == 1 || (bytes.count >= 4 && bytes[2] == 0 && bytes[3] == 1)
++        {
++            return []
++        }
++        var ranges: [Range<Int>] = []
++        var offset = 0
++        while offset + lengthPrefixSize <= bytes.count {
++            var length = 0
++            for index in 0..<lengthPrefixSize { length = (length << 8) | Int(bytes[offset + index]) }
++            let payload = offset + lengthPrefixSize
++            guard length > 0, length <= bytes.count - payload else { return [] }
++            let end = payload + length
++            if length < 2 { ranges.append(offset..<end) }
++            offset = end
++        }
++        return offset == bytes.count ? ranges : []
++    }
+ }
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/DoviCurveIndexBoundsTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/DoviCurveIndexBoundsTests.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..639eda049157ba786e3933940eec90c4928e4383
+--- /dev/null
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/DoviCurveIndexBoundsTests.swift
+@@ -0,0 +1,115 @@
++// Only with the DualLayerDolbyVision trait: the composer is not built without it.
++#if DualLayerDolbyVision
++import Testing
++import Foundation
++import CoreVideo
++import Metal
++@testable import AetherEngine
++
++/// A pivot index the kernels form from `num_pivots` stays inside the parameter block for every pivot count,
++/// so a load a GPU compiler executes despite its guard cannot leave the buffer. The parser's identity
++/// fail-safe (`num_pivots` 0, for a curve it rejects) is the case that faulted: a rejected Cb curve next to an
++/// MMR Cr curve made the A12 read 4 GiB past `poly_cb.num_pivots` (`dovi_last_pivot` in `DoviShaderSource`).
++@Suite(.offCooperativePoolOneLane)
++struct DoviCurveIndexBoundsTests {
++
++    typealias H = DoviGpuCurveSweepTests
++
++    /// (num_pivots, the index the kernels must read).
++    static let lastPivotCases: [(UInt32, UInt32)] = [
++        (0, 0),                                // the parser's identity: the index that read 4 GiB past the block
++        (1, 0),
++        (2, 1),
++        (3, 2),
++        (9, 8),
++        (10, 8),                               // over capacity (clampToCapacity zeroes it; the shader holds anyway)
++        (UInt32.max, 8),
++    ]
++
++    /// Runs `dovi_last_pivot` on the GPU, compiled from the composer's own source, for one curve.
++    private static func lastPivotOnGpu(numPivots: UInt32) throws -> (index: UInt32, value: UInt32) {
++        let device = try #require(MTLCreateSystemDefaultDevice())
++        let probe = """
++        kernel void dovi_last_pivot_probe(constant struct DoviMetalParams& params [[buffer(0)]],
++                                          device uint* out [[buffer(1)]],
++                                          uint tid [[thread_position_in_grid]]) {
++            if (tid != 0u) { return; }
++            out[0] = dovi_last_pivot(params.poly_cb);
++            out[1] = params.poly_cb.pivots[dovi_last_pivot(params.poly_cb)];
++        }
++        """
++        let library = try device.makeLibrary(source: DoviShaderSource.poolSource + probe, options: nil)
++        let pipeline = try device.makeComputePipelineState(function: try #require(library.makeFunction(name: "dovi_last_pivot_probe")))
++        var curve = DoviPolynomialParams()
++        curve.numPivots = numPivots
++        curve.pivots = (0..<DoviPolynomialParams.maxPivots).map { UInt32(100 + $0) }
++        var params = DoviMetalParams()
++        params.polyCb = curve                  // the curve that faulted; serialized as is, without clampToCapacity
++        let bytes = params.serialize()
++        let block = try #require(device.makeBuffer(length: bytes.count, options: .storageModeShared))
++        bytes.withUnsafeBytes { block.contents().copyMemory(from: $0.baseAddress!, byteCount: bytes.count) }
++        let out = try #require(device.makeBuffer(length: 8, options: .storageModeShared))
++        let queue = try #require(device.makeCommandQueue())
++        let commandBuffer = try #require(queue.makeCommandBuffer())
++        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
++        encoder.setComputePipelineState(pipeline)
++        encoder.setBuffer(block, offset: 0, index: 0)
++        encoder.setBuffer(out, offset: 0, index: 1)
++        encoder.dispatchThreadgroups(MTLSize(width: 1, height: 1, depth: 1), threadsPerThreadgroup: MTLSize(width: 1, height: 1, depth: 1))
++        encoder.endEncoding()
++        commandBuffer.commit()
++        commandBuffer.waitUntilCompleted()
++        #expect(commandBuffer.error == nil)
++        let words = out.contents().bindMemory(to: UInt32.self, capacity: 2)
++        return (words[0], words[1])
++    }
++
++    @Test("the last-pivot index stays inside the pivots for every pivot count, the identity fail-safe's 0 included",
++          .enabled(if: DoviShaderSyncTests.metalAvailable, "needs a Metal device"),
++          arguments: lastPivotCases)
++    func lastPivotIndexIsBounded(numPivots: UInt32, expected: UInt32) throws {
++        let result = try Self.lastPivotOnGpu(numPivots: numPivots)
++        #expect(result.index == expected)
++        #expect(result.value == 100 + expected)
++    }
++
++    /// Every index the kernels form from `num_pivots` goes through a bound: `dovi_last_pivot` or the capped piece
++    /// count in `dovi_select_piece`. A plain `num_pivots - 1` in an index is exactly what faulted on the A12.
++    @Test("the kernels form no pivot index from num_pivots without a bound")
++    func noUnboundedPivotIndexInTheKernels() {
++        let source = DoviShaderSource.kernels + DoviShaderSource.inPlaceKernels
++        #expect(!source.contains("num_pivots - 1"))
++        #expect(!source.contains("int(curve.num_pivots) - 2"))
++    }
++
++    /// The shape that faulted, composed: Cb rejected by the parser (identity, `num_pivots` 0) and Cr an MMR curve
++    /// that reads the Cb term. Cb passes the base layer through; Cr's Cb input has no range to be clamped to.
++    @Test("a rejected Cb curve next to an MMR Cr curve composes as identity Cb and an unclamped Cb input to Cr",
++          .enabled(if: DoviShaderSyncTests.metalAvailable, "needs a Metal device"))
++    func rejectedCbNextToMmrCr() throws {
++        let composer = try #require(DoviFelComposer())
++        var p = DoviGpuEdgeCaseTests.params(flags: [.disableResidual])
++        p.ditherMode = .debugRawVDR
++        p.polyCb = .identity
++        p.mmrCb = DoviMmrParams()
++        var cr = DoviPolynomialParams()
++        cr.numPivots = 2
++        cr.pivots[0] = 0
++        cr.pivots[1] = 1023
++        cr.method[0] = DoviMapping.mmr.rawValue
++        cr.order[0] = 1
++        cr.coefShift[0] = 23
++        var crMmr = DoviMmrParams()
++        crMmr.coefShift = 23
++        crMmr.coef[0][1] = 1 << 23              // Cr = the Cb term (u)
++        p.polyCr = cr
++        p.mmrCr = crMmr
++        for bl in [(512, 30, 512), (512, 1000, 512)] {
++            let out = try DoviGpuEdgeCaseTests.composeConstant(composer, bl: bl, el: (512, 512, 512), params: p)
++            let vdr = DoviTestSupport.rawVDR(out)
++            #expect(Set(vdr[1]) == [bl.1 * 4])
++            #expect(Set(vdr[2]) == [bl.1 * 4])
++        }
++    }
++}
++#endif
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/DoviFelInPlaceComposeTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/DoviFelInPlaceComposeTests.swift
+index d37bfefa93b9279043d23bbb2960e0214f45205c..ef1760bceb33b8100a3783e18a65299471a1418e 100644
+--- a/Vendor/AetherEngine/Tests/AetherEngineTests/DoviFelInPlaceComposeTests.swift
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/DoviFelInPlaceComposeTests.swift
+@@ -429,23 +429,59 @@ struct DoviFelInPlaceComposeTests {
+     func decoderDropsCorruptFrame() async throws {
+         let ticks: Int64 = 3754
+         func pts(_ i: Int64) -> CMTime { CMTime(value: i * ticks, timescale: 90000) }
+-        let composer = ScriptedInPlaceComposer([.composed, .baseCorrupted, .baseIntact, .composed])
++        let composer = ScriptedInPlaceComposer([.composed, .baseIntact, .baseCorrupted])
+         let decoder = DualLayerVideoDecoder(composer: composer)
+         defer { decoder.close() }
+         let delivered = Delivered()
+         decoder.onFrame = { _, p, _ in delivered.add(p) }
+         decoder.primeForTesting(enhancementLayer: true)
+-        for i in 0..<4 { decoder.seedRPUForTesting(pts: pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil) }
+-        for i in 0..<4 {
++        for i in 0..<3 { decoder.seedRPUForTesting(pts: pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil) }
++        for i in 0..<3 {
+             let f = try #require(Self.makeBaseAndEnhancement(width: 64, height: 64, seed: i))
+             decoder.handleEnhancementLayerFrame(elBuffer: f.el, pts: pts(Int64(i)))
+             decoder.handleBaseLayerFrame(baseBuffer: f.bl, pts: pts(Int64(i)), hdr10Data: nil)
+         }
+         decoder.quiesceForTesting()
+-        // Frame 1 (corrupt) is gone; frame 2 (set-up failure, base layer intact) is delivered as its base layer.
+-        #expect(delivered.values == [0, 2 * ticks, 3 * ticks])
+-        #expect(decoder.composedFrameCount == 2)
++        // Frame 1 (set-up failure, base layer intact) goes out as its base layer; frame 2 (corrupt) is gone.
++        #expect(delivered.values == [0, ticks])
++        #expect(decoder.composedFrameCount == 1)
+         #expect(composer.poolCalls == 0, "an in-place frame went through the pool path")
+     }
++
++    /// AE#1055: on an Apple TV 4K (A12) one GPU fault was followed by tvOS refusing the process's GPU work, so
++    /// every later in-place command buffer failed and every frame was dropped while the sound played on. After
++    /// the first corrupt frame the decoder composes into the pool, whose failure shows the base layer.
++    @Test("after a failed in-place frame the decoder takes the pool path, so a later failure still shows the base layer")
++    func corruptFrameTurnsInPlaceOff() async throws {
++        let ticks: Int64 = 3754
++        func pts(_ i: Int64) -> CMTime { CMTime(value: i * ticks, timescale: 90000) }
++        let composer = ScriptedInPlaceComposer([.composed, .baseCorrupted, .composed, .composed])
++        let decoder = DualLayerVideoDecoder(composer: composer)
++        defer { decoder.close() }
++        let delivered = Delivered()
++        decoder.onFrame = { _, p, _ in delivered.add(p) }
++        decoder.primeForTesting(enhancementLayer: true)
++        for i in 0..<2 { decoder.seedRPUForTesting(pts: pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil) }
++        for i in 0..<2 {
++            let f = try #require(Self.makeBaseAndEnhancement(width: 64, height: 64, seed: i))
++            decoder.handleEnhancementLayerFrame(elBuffer: f.el, pts: pts(Int64(i)))
++            decoder.handleBaseLayerFrame(baseBuffer: f.bl, pts: pts(Int64(i)), hdr10Data: nil)
++        }
++        decoder.quiesceForTesting()
++        #expect(decoder.isInPlaceOffAfterFaultForTesting)
++        decoder.flush()
++        #expect(decoder.isInPlaceOffAfterFaultForTesting, "a seek turned in-place back on for the GPU that faulted")
++        for i in 2..<5 { decoder.seedRPUForTesting(pts: pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil) }
++        for i in 2..<5 {
++            let f = try #require(Self.makeBaseAndEnhancement(width: 64, height: 64, seed: i))
++            decoder.handleEnhancementLayerFrame(elBuffer: f.el, pts: pts(Int64(i)))
++            decoder.handleBaseLayerFrame(baseBuffer: f.bl, pts: pts(Int64(i)), hdr10Data: nil)
++        }
++        decoder.quiesceForTesting()
++        // Frames 2 to 4 took the pool, which the scripted composer fails: each goes out as its base layer.
++        #expect(composer.poolCalls == 3)
++        #expect(delivered.values == [0, 2 * ticks, 3 * ticks, 4 * ticks])
++        #expect(decoder.composedFrameCount == 1)
++    }
+ }
+ #endif
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/FelCurveTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/FelCurveTests.swift
+index 9f1de76d061602b5e00b35afdf8ea1ade144809b..5c81d47cac251c5810275f4d5de19182106df73a 100644
+--- a/Vendor/AetherEngine/Tests/AetherEngineTests/FelCurveTests.swift
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/FelCurveTests.swift
+@@ -25,6 +25,15 @@ struct FelCurveTests {
+         nal.withUnsafeBufferPointer { DoviRpuGuard.parse($0.baseAddress!, $0.count) }
+     }
+ 
++    @Test("FEL picture matching requires a usable GOP timeline")
++    func pictureTimestamps() {
++        // The first GOP of a stream-copy cut can have packets missing both PTS and DTS.
++        #expect(FelCurveLookahead.frameSpacing(forSortedTimestamps: [.min, .min, 0, 42, 125]) == nil)
++        #expect(FelCurveLookahead.frameSpacing(forSortedTimestamps: [.min + 1, .max]) == nil)
++        #expect(FelCurveLookahead.frameSpacing(forSortedTimestamps: [-41, 0, 0, 42]) == 41)
++        #expect(FelCurveLookahead.frameSpacing(forSortedTimestamps: [42, 42]) == 1)
++    }
++
+     @Test("uniform pivots match the split Profile 7 streams use for luma")
+     func uniformPivots() {
+         #expect(FelCurve.uniform(pieces: 8) == [0, 128, 256, 384, 512, 640, 768, 896, 1023])
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/Issue1006PGSPQPaletteTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/Issue1006PGSPQPaletteTests.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b273cff41d6236e837b02fe81a16f1e74397ac1
+--- /dev/null
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/Issue1006PGSPQPaletteTests.swift
+@@ -0,0 +1,71 @@
++import Foundation
++import CoreGraphics
++import Testing
++import AetherLibavcodec
++import AetherLibavutil
++@testable import AetherEngine
++
++/// AE#1006 (stehanOSX): on an HDR UHD Blu-ray the PGS palette is PQ-coded, and the engine published
++/// it as sRGB, so the disc's ~294-nit white (158 after pgssubdec) showed as 62 % grey.
++struct Issue1006PGSPQPaletteTests {
++
++    @Test("the PQ EOTF hits the reference points")
++    func eotf() {
++        #expect(PQSubtitlePalette.nits(pq: 0) == 0)
++        #expect(abs(PQSubtitlePalette.nits(pq: 1) - 10000) < 0.01)
++        #expect(abs(PQSubtitlePalette.nits(pq: 0.5081) - 100) < 1)
++        #expect(abs(PQSubtitlePalette.nits(pq: 158.0 / 255) - 294) < 5)
++    }
++
++    @Test("the reported grey ramp becomes a white glyph with a falling edge, neutral and ordered")
++    func reportedRamp() {
++        let fill = PQSubtitlePalette.sRGB(fromPQ: 158, 158, 158)
++        let edge = PQSubtitlePalette.sRGB(fromPQ: 140, 140, 140)
++        let aa = PQSubtitlePalette.sRGB(fromPQ: 115, 115, 115)
++        let outline = PQSubtitlePalette.sRGB(fromPQ: 0, 0, 0)
++        #expect(fill == (255, 255, 255))
++        #expect(outline == (0, 0, 0))
++        #expect(edge.r == edge.g && edge.g == edge.b)
++        #expect(aa.r == aa.g && aa.g == aa.b)
++        #expect(edge.r > 200 && edge.r < 255)
++        #expect(aa.r > 115 && aa.r < edge.r)
++    }
++
++    @Test("a coloured entry keeps its hue")
++    func yellowStaysYellow() {
++        // BT.709 full-range yellow at about the white's signal level.
++        let yellow = PQSubtitlePalette.sRGB(fromPQ: 160, 160, 40)
++        #expect(yellow.r > 200 && yellow.g > 200)
++        #expect(yellow.b < yellow.r / 2)
++    }
++
++    private static func firstPixel(palette: [UInt8], pqPalette: Bool) throws -> [UInt8] {
++        var pixels = [UInt8](repeating: 1, count: 8 * 2)
++        var palette = palette
++        let image = try pixels.withUnsafeMutableBufferPointer { px in
++            try palette.withUnsafeMutableBufferPointer { pal in
++                var rect = AVSubtitleRect()
++                rect.type = SUBTITLE_BITMAP
++                rect.w = 8; rect.h = 2; rect.linesize.0 = 8
++                rect.data.0 = px.baseAddress
++                rect.data.1 = pal.baseAddress
++                return try #require(withUnsafeMutablePointer(to: &rect) {
++                    EmbeddedSubtitleDecoder.imageForSubtitleRect($0, videoWidth: 1920, videoHeight: 1080,
++                                                                 pqPalette: pqPalette)
++                })
++            }
++        }
++        let data = try #require(image.cgImage.dataProvider?.data) as Data
++        return Array(data.prefix(4))
++    }
++
++    @Test("the blit converts the palette only when asked, and premultiplies after the conversion")
++    func blitHonoursFlag() throws {
++        var palette = [UInt8](repeating: 0, count: 256 * 4)
++        palette[4...7] = [158, 158, 158, 255]
++        #expect(try Self.firstPixel(palette: palette, pqPalette: false) == [158, 158, 158, 255])
++        #expect(try Self.firstPixel(palette: palette, pqPalette: true) == [255, 255, 255, 255])
++        palette[7] = 128
++        #expect(try Self.firstPixel(palette: palette, pqPalette: true) == [128, 128, 128, 128])
++    }
++}
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/Issue1061PickWaitsForLoadTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/Issue1061PickWaitsForLoadTests.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..6dee78c9762c999e15fdab1514966c5bc115e7c6
+--- /dev/null
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/Issue1061PickWaitsForLoadTests.swift
+@@ -0,0 +1,84 @@
++import Foundation
++import Testing
++@testable import AetherEngine
++
++/// AE#1061: an audio pick that landed while the load was still in its display handshake superseded
++/// it, and the rebuild found none of the load's panel answers, so a Dolby Vision title went
++/// media-direct. A pick now waits for the load in flight to return. These pin the wait itself:
++/// it holds across the load, and it lets go the moment that load is no longer the one running.
++@Suite("A track pick during a load waits for the load to return (AE#1061)", .serialized)
++@MainActor
++struct Issue1061PickWaitsForLoadTests {
++
++    final class Flag { var value = false }
++
++    @Test("no load in flight: the pick goes straight through")
++    func noLoadReturnsAtOnce() async throws {
++        let engine = try AetherEngine()
++        defer { engine.stop() }
++        await engine.awaitLoadInFlightSettled(pick: "test")
++    }
++
++    @Test("held until the load returns, released when it does")
++    func heldUntilLoadReturns() async throws {
++        let engine = try AetherEngine()
++        defer { engine.stop() }
++        engine.stopInternal(resetDisplayCriteria: false)
++        let generation = engine.loadGeneration
++        engine.beginLoadInFlight(generation)
++        let done = Flag()
++        let waiter = Task { @MainActor in
++            await engine.awaitLoadInFlightSettled(pick: "test")
++            done.value = true
++        }
++        try await Task.sleep(for: .milliseconds(200))
++        #expect(!done.value)
++        engine.endLoadInFlight(generation)
++        await waiter.value
++        #expect(done.value)
++        // The pick must not have moved the generation the load held.
++        #expect(engine.loadGeneration == generation)
++    }
++
++    @Test("released by a stop even while the replaced load has not unwound")
++    func releasedByStopAlone() async throws {
++        let engine = try AetherEngine()
++        defer { engine.stop() }
++        engine.stopInternal(resetDisplayCriteria: false)
++        let generation = engine.loadGeneration
++        engine.beginLoadInFlight(generation)
++        let waiter = Task { @MainActor in
++            await engine.awaitLoadInFlightSettled(pick: "test")
++        }
++        try await Task.sleep(for: .milliseconds(100))
++        engine.stopInternal(resetDisplayCriteria: false)
++        await waiter.value
++        #expect(engine.loadGeneration != generation)
++        engine.endLoadInFlight(generation)
++    }
++
++    @Test("released when a stop and a newer load take over")
++    func releasedBySupersede() async throws {
++        let engine = try AetherEngine()
++        defer { engine.stop() }
++        engine.stopInternal(resetDisplayCriteria: false)
++        let first = engine.loadGeneration
++        engine.beginLoadInFlight(first)
++        let done = Flag()
++        let waiter = Task { @MainActor in
++            await engine.awaitLoadInFlightSettled(pick: "test")
++            done.value = true
++        }
++        try await Task.sleep(for: .milliseconds(100))
++        #expect(!done.value)
++        engine.stopInternal(resetDisplayCriteria: false)
++        let second = engine.loadGeneration
++        engine.beginLoadInFlight(second)
++        await waiter.value
++        #expect(done.value)
++        // The superseded load's own exit must not end the newer one's flight.
++        engine.endLoadInFlight(first)
++        #expect(engine.loadInFlight)
++        engine.endLoadInFlight(second)
++    }
++}
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/ShortHEVCHeaderTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/ShortHEVCHeaderTests.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..714b36d60f84877c94d2f29b1948eb19e85e5ac4
+--- /dev/null
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/ShortHEVCHeaderTests.swift
+@@ -0,0 +1,147 @@
++import Foundation
++import Testing
++import AetherLibavcodec
++import AetherLibavutil
++
++@testable import AetherEngine
++
++@Suite("Truncated HEVC header at a transport-stream tail")
++struct ShortHEVCHeaderTests {
++    private func unit(_ bytes: [UInt8], width: Int = 4) -> [UInt8] {
++        (0..<width).reversed().map { UInt8((bytes.count >> ($0 * 8)) & 0xff) } + bytes
++    }
++    private func ranges(_ bytes: [UInt8], width: Int = 4, confirmed: Bool = true) -> [Range<Int>] {
++        bytes.withUnsafeBytes {
++            NALUnitChain.shortHEVCHeaderRanges($0, lengthPrefixSize: width, framingConfirmed: confirmed)
++        }
++    }
++
++    @Test("(#960) A complete length chain can still contain a truncated EOS header")
++    func damagedEOSIsRemovedWithoutLosingThePictureOrFollowingRPU() {
++        let picture = unit([0x26, 0x01, 0x80])
++        let eos = unit([0x48])
++        let rpu = unit([0x7c, 0x01, 0x80])
++        let sample = picture + eos + rpu
++        #expect(
++            sample.withUnsafeBytes { NALUnitChain.completeRunLength($0, lengthPrefixSize: 4, framingConfirmed: true) }
++                == nil)
++        #expect(ranges(sample) == [picture.count..<(picture.count + eos.count)])
++        let removed = ranges(sample)
++        let cleaned = sample.enumerated().filter { entry in
++            !removed.contains { $0.contains(entry.offset) }
++        }.map(\.element)
++        #expect(cleaned == picture + rpu)
++    }
++
++    @Test("(#960) Valid HEVC delimiters and pictures remain byte-for-byte unchanged")
++    func validUnitsSurvive() {
++        #expect(ranges(unit([0x26, 0x01, 0x80]) + unit([0x48, 0x01, 0x80])) == [])
++    }
++
++    @Test("(#960) Framing and bounds fail closed, and all prefix widths are supported")
++    func framingBoundsAndWidths() {
++        #expect(ranges([0, 0, 0, 1, 0x48], confirmed: false) == [])
++        #expect(ranges(unit([0x48]) + [0, 0, 2]) == [])
++        for width in 1...4 { #expect(ranges(unit([0x48], width: width), width: width) == [0..<(width + 1)]) }
++    }
++    private final class InitBytes: @unchecked Sendable {
++        private let lock = NSLock()
++        private var bytes = Data()
++        func set(_ data: Data) { lock.withLock { bytes = data } }
++        func get() -> Data { lock.withLock { bytes } }
++    }
++
++    @Test("(#960) The muxer compacts a shared packet and writes the correct picture/RPU size")
++    func muxerCompactsWithoutChangingTheSharedOriginal() throws {
++        try muxerRoundTrip(dropsFirstSample: false)
++    }
++
++    @Test("(#960) A packet containing only short headers is dropped before the next valid sample")
++    func muxerDropsAnAllShortSample() throws {
++        try muxerRoundTrip(dropsFirstSample: true)
++    }
++
++    private func muxerRoundTrip(dropsFirstSample: Bool) throws {
++        let fixture = try #require(Data(base64Encoded: Self.hevcFixture, options: .ignoreUnknownCharacters))
++        let demuxer = Demuxer()
++        defer { demuxer.close() }
++        try demuxer.open(reader: DataIOReader(data: fixture), formatHint: "mp4")
++        let stream = try #require(demuxer.stream(at: demuxer.videoStreamIndex))
++        #expect(stream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_HEVC)
++        var sourcePacket: UnsafeMutablePointer<AVPacket>? = try #require(try demuxer.readPacket())
++        defer { trackedPacketFree(&sourcePacket) }
++        let picture = Data(bytes: sourcePacket!.pointee.data!, count: Int(sourcePacket!.pointee.size))
++        let rpu = Data(unit([0x7c, 0x01, 0x80]))
++        let expected = picture + rpu
++        let damaged = dropsFirstSample ? Data(unit([0x48]) + unit([0x4a])) : picture + Data(unit([0x48])) + rpu
++        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("short-hevc-\(UUID().uuidString)")
++        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
++        defer { try? FileManager.default.removeItem(at: directory) }
++        let initial = InitBytes()
++        let muxer = try MP4SegmentMuxer(initialSegmentIndex: 0, sessionDir: directory,
++            video: .init(codecpar: UnsafePointer(stream.pointee.codecpar), timeBase: stream.pointee.time_base,
++                         codecTagOverride: nil, nalFramingLatch: NALFramingLatch(confirmed: true)),
++            audio: nil, onInitCaptured: { initial.set($0) })
++
++        var packet: UnsafeMutablePointer<AVPacket>? = try #require(trackedPacketAlloc())
++        var shared: UnsafeMutablePointer<AVPacket>? = try #require(trackedPacketAlloc())
++        defer { trackedPacketFree(&packet); trackedPacketFree(&shared) }
++        #expect(av_new_packet(packet!, Int32(damaged.count)) >= 0)
++        damaged.withUnsafeBytes { _ = memcpy(packet!.pointee.data!, $0.baseAddress!, $0.count) }
++        packet!.pointee.pts = 0; packet!.pointee.dts = 0; packet!.pointee.duration = 512
++        packet!.pointee.flags = AV_PKT_FLAG_KEY
++        packet!.pointee.stream_index = muxer.videoOutputStreamIndex
++        #expect(av_packet_ref(shared!, packet!) >= 0)
++        let outcome = muxer.writePacket(packet!)
++        #expect(outcome.rc >= 0)
++        #expect(Data(bytes: shared!.pointee.data!, count: Int(shared!.pointee.size)) == damaged)
++        if dropsFirstSample {
++            #expect(outcome.written.pts == Int64.min && packet!.pointee.size == 0)
++            #expect(muxer.writtenVideoEndPts == Int64.min)
++            #expect(av_new_packet(packet!, Int32(expected.count)) >= 0)
++            expected.withUnsafeBytes { _ = memcpy(packet!.pointee.data!, $0.baseAddress!, $0.count) }
++            packet!.pointee.pts = 512; packet!.pointee.dts = 512; packet!.pointee.duration = 512
++            packet!.pointee.flags = AV_PKT_FLAG_KEY
++            packet!.pointee.stream_index = muxer.videoOutputStreamIndex
++            #expect(muxer.writePacket(packet!).rc >= 0)
++        } else {
++            #expect(outcome.written.pts == 0 && outcome.written.dts == 0)
++        }
++        guard case .completed(let path, let count) = muxer.cutFragmentForNextSegment(1) else {
++            Issue.record("The valid sample did not produce a complete fragment")
++            return
++        }
++        let fragment = try Data(contentsOf: path)
++        #expect(fragment.count == count)
++        let result = Demuxer()
++        defer { result.close() }
++        try result.open(reader: DataIOReader(data: initial.get() + fragment), formatHint: "mp4")
++        var clean: UnsafeMutablePointer<AVPacket>? = try #require(try result.readPacket())
++        defer { trackedPacketFree(&clean) }
++        #expect(clean!.pointee.size == expected.count)
++        #expect(Data(bytes: clean!.pointee.data!, count: Int(clean!.pointee.size)) == expected)
++        if let unexpected = try result.readPacket() {
++            var owned: UnsafeMutablePointer<AVPacket>? = unexpected
++            trackedPacketFree(&owned)
++            Issue.record("The dropped header-only sample survived in the fragment")
++        }
++    }
++
++    // Own synthetic two-frame 64x64 black HEVC MP4; x265 info=0, no private sample.
++    private static let hevcFixture = """
++    AAAAHGZ0eXBpc29tAAACAGlzb21pc28ybXA0MQAAA3ttb292AAAAbG12aGQAAAAAAAAAAAAAAAAAAAPoAAAAVAABAAABAAAAAAAA
++    AAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACpnRy
++    YWsAAABcdGtoZAAAAAMAAAAAAAAAAAAAAAEAAAAAAAAAVAAAAAAAAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAA
++    AAAAAAAAAEAAAAAAQAAAAEAAAAAAACRlZHRzAAAAHGVsc3QAAAAAAAAAAQAAAFQAAAAAAAEAAAAAAh5tZGlhAAAAIG1kaGQAAAAA
++    AAAAAAAAAAAAADAAAAAEAFXEAAAAAAAtaGRscgAAAAAAAAAAdmlkZQAAAAAAAAAAAAAAAFZpZGVvSGFuZGxlcgAAAAHJbWluZgAA
++    ABR2bWhkAAAAAQAAAAAAAAAAAAAAJGRpbmYAAAAcZHJlZgAAAAAAAAABAAAADHVybCAAAAABAAABiXN0YmwAAAEJc3RzZAAAAAAA
++    AAABAAAA+Wh2YzEAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAAAQABAAEgAAABIAAAAAAAAAAEUTGF2YzYzLjEuMTAyIGxpYngyNjUA
++    AAAAAAAAAAAAAAAY//8AAAB1aHZjQwEBYAAAAJAAAAAAAB7wAPz9+PgAAA8DoAABABhAAQwB//8BYAAAAwCQAAADAAADAB6VmAmh
++    AAEAKEIBAQFgAAADAJAAAAMAAAMAHqAggQWWVmkkyvAWgIAAAAMAgAAADASiAAEAB0QBwXK0IkAAAAAKZmllbAEAAAAAEHBhc3AA
++    AAABAAAAAQAAABRidHJ0AAAAAAAADAAAAAAAAAAAGHN0dHMAAAAAAAAAAQAAAAIAAAIAAAAAFHN0c3MAAAAAAAAAAQAAAAEAAAAc
++    c3RzYwAAAAAAAAABAAAAAQAAAAIAAAABAAAAHHN0c3oAAAAAAAAAAAAAAAIAAAASAAAADgAAABRzdGNvAAAAAAAAAAEAAAOnAAAA
++    YXVkdGEAAABZbWV0YQAAAAAAAAAhaGRscgAAAAAAAAAAbWRpcmFwcGwAAAAAAAAAAAAAAAAsaWxzdAAAACSpdG9vAAAAHGRhdGEA
++    AAABAAAAAExhdmY2My4xLjEwMgAAAAhmcmVlAAAAKG1kYXQAAAAOKAGvHYD3AbL//SMvszwAAAAKAgHQCX4Qxjv6hA==
++    """
++
++}

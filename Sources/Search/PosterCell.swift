@@ -8,6 +8,8 @@ final class PosterCell: UICollectionViewCell {
     private let titleSkeleton = UIView()
     private var loadTask: Task<Void, Never>?
     private var artworkURLs: [URL]?
+    private var artworkMissingHandler: (() -> Void)?
+    private var didConfirmMissingArtwork = false
     private var isSkeleton = false
 
     override var canBecomeFocused: Bool { !isSkeleton && super.canBecomeFocused }
@@ -70,9 +72,7 @@ final class PosterCell: UICollectionViewCell {
 
     override func prepareForReuse() {
         super.prepareForReuse()
-        loadTask?.cancel()
-        loadTask = nil
-        artworkURLs = nil
+        resetArtworkLoad()
         poster.image = nil
         updateFocusAppearance(false)
         titleSkeleton.isHidden = true
@@ -81,6 +81,7 @@ final class PosterCell: UICollectionViewCell {
     }
 
     func showSkeleton() {
+        resetArtworkLoad()
         isSkeleton = true
         isAccessibilityElement = false
         titleSkeleton.isHidden = false
@@ -91,18 +92,28 @@ final class PosterCell: UICollectionViewCell {
         updateFocusAppearance(false)
     }
 
-    func configure(name: String, primaryURL: URL?, fallbackURL: URL?) {
+    func configure(name: String, artworkURLs: [URL], onArtworkMissing: @escaping () -> Void) {
         isSkeleton = false
         isAccessibilityElement = true
         titleSkeleton.isHidden = true
         label.text = name
         accessibilityLabel = name
         updateFocusAppearance(isFocused)
-        let urls = [primaryURL, fallbackURL == primaryURL ? nil : fallbackURL].compactMap { $0 }
-        guard artworkURLs != urls else { return }
-        artworkURLs = urls
-        loadTask?.cancel()
-        loadTask = nil
+
+        var seen = Set<URL>()
+        let urls = artworkURLs.filter { seen.insert($0).inserted }
+        if self.artworkURLs == urls {
+            // Updating a display name does not need another artwork request.
+            if loadTask != nil {
+                artworkMissingHandler = onArtworkMissing
+            } else if didConfirmMissingArtwork {
+                onArtworkMissing()
+            }
+            return
+        }
+
+        resetArtworkLoad()
+        self.artworkURLs = urls
 
         guard !urls.isEmpty else {
             showPlaceholder()
@@ -118,17 +129,40 @@ final class PosterCell: UICollectionViewCell {
         }
         poster.image = nil
         poster.backgroundColor = UIColor(white: 0.16, alpha: 1)
+        artworkMissingHandler = onArtworkMissing
         loadTask = Task { [weak self] in
+            var allMissing = true
             for url in urls {
                 guard self != nil, !Task.isCancelled else { return }
-                guard let image = try? await CinemaImageCache.shared.image(for: url) else { continue }
-                guard !Task.isCancelled else { return }
-                self?.showPoster(image)
-                return
+                do {
+                    let image = try await CinemaImageCache.shared.image(for: url)
+                    guard let self, !Task.isCancelled else { return }
+                    loadTask = nil
+                    artworkMissingHandler = nil
+                    showPoster(image)
+                    return
+                } catch CinemaImageError.missing {
+                    continue
+                } catch {
+                    allMissing = false
+                }
             }
-            guard !Task.isCancelled else { return }
-            self?.showPlaceholder()
+            guard let self, !Task.isCancelled else { return }
+            let reportMissing = artworkMissingHandler
+            loadTask = nil
+            artworkMissingHandler = nil
+            didConfirmMissingArtwork = allMissing
+            showPlaceholder()
+            if allMissing { reportMissing?() }
         }
+    }
+
+    private func resetArtworkLoad() {
+        loadTask?.cancel()
+        loadTask = nil
+        artworkURLs = nil
+        artworkMissingHandler = nil
+        didConfirmMissingArtwork = false
     }
 
     private func showPoster(_ image: CGImage) {

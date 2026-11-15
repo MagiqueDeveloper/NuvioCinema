@@ -1,0 +1,198 @@
+NuvioTVOS remote Aether startup watchdog grace backport
+
+https://github.com/bobsupra/NuvioTVOS/commit/47e6859b7595afe904b4196fc50f243f8ac2c7f8
+
+Extend the existing disc policy to other remote VOD at containerOpened.
+Keep the same current-load witness, timeout and first-frame guards.
+
+diff --git a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
+--- a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
+@@ -2728,9 +2728,9 @@
+     let checkpoint: StartupCheckpoint?
+ }
+ 
+-enum AetherDiscStartupWatchdogGracePolicy {
+-    /// The URL or filename hint scopes the exception; sourceOpened does not
+-    /// claim that the engine has positively identified a disc container.
++enum AetherStartupWatchdogGracePolicy {
++    /// Remote disc hints qualify at sourceOpened, since opening a disc's container
++    /// can be the expensive step. Other remote VOD must reach containerOpened.
+     static func shouldGrantGrace(
+         request: PlaybackLoadRequest?,
+         backend: PlayerBackendKind,
+@@ -2745,18 +2745,20 @@
+               let request,
+               !request.isLiveStream,
+               !request.isSports,
+-              PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString),
+-              PlaybackBackendPolicy.isDiscImage(request.videoURL.absoluteString, filename: request.filename),
+               let progress,
+               progress.ownerLoadGeneration == loadGeneration,
+               let generationFloor = progress.engineGenerationFloor,
+               let progressGeneration = progress.progressGeneration,
+               progressGeneration >= generationFloor,
+-              let checkpoint = progress.checkpoint,
+-              checkpoint >= .sourceOpened else {
++              let checkpoint = progress.checkpoint else {
+             return false
+         }
+-        return true
++
++        let url = request.videoURL.absoluteString
++        guard PlaybackBackendPolicy.isRemoteHTTP(url) else { return false }
++        let requiredCheckpoint: StartupCheckpoint = PlaybackBackendPolicy.isDiscImage(url, filename: request.filename)
++            ? .sourceOpened : .containerOpened
++        return checkpoint >= requiredCheckpoint
+     }
+ }
+ 
+diff --git a/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift b/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift
+--- a/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift
+@@ -394,9 +394,9 @@
+         return aetherController.hasPresentedCurrentLoad(generation: generation)
+     }
+ 
+-    func shouldGrantDiscStartupWatchdogGrace(generation: UInt64, graceAlreadyGranted: Bool) -> Bool {
++    func shouldGrantStartupWatchdogGrace(generation: UInt64, graceAlreadyGranted: Bool) -> Bool {
+         guard loadGeneration == generation else { return false }
+-        return AetherDiscStartupWatchdogGracePolicy.shouldGrantGrace(
++        return AetherStartupWatchdogGracePolicy.shouldGrantGrace(
+             request: lastRequest,
+             backend: activeBackend,
+             loadGeneration: generation,
+diff --git a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+--- a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+@@ -814,7 +814,7 @@
+     private var isFailingOver = false
+     private var toastClearTask: Task<Void, Never>?
+     private var loadWatchdogGeneration: UInt64?
+-    private var loadWatchdogDiscGraceGranted = false
++    private var loadWatchdogGraceGranted = false
+     /// A source that hasn't started within this long is treated as dead.
+     private let loadTimeoutSeconds: UInt64 = 30
+ 
+@@ -3110,7 +3110,7 @@
+         let targetGeneration = sessionCoordinator.loadGeneration
+         if loadWatchdogGeneration != targetGeneration {
+             loadWatchdogGeneration = targetGeneration
+-            loadWatchdogDiscGraceGranted = false
++            loadWatchdogGraceGranted = false
+         }
+         let timeoutSeconds = loadTimeoutSeconds
+         loadWatchdogTask = Task { [weak self] in
+@@ -3127,13 +3127,13 @@
+                   self.activeStreamURL == targetURL
+             else { return }
+             var elapsedTimeout = timeoutSeconds
+-            if self.sessionCoordinator.shouldGrantDiscStartupWatchdogGrace(
++            if self.sessionCoordinator.shouldGrantStartupWatchdogGrace(
+                 generation: targetGeneration,
+-                graceAlreadyGranted: self.loadWatchdogDiscGraceGranted
++                graceAlreadyGranted: self.loadWatchdogGraceGranted
+             ) {
+-                self.loadWatchdogDiscGraceGranted = true
++                self.loadWatchdogGraceGranted = true
+                 elapsedTimeout += timeoutSeconds
+-                print("[TVTrace] ⏳ [LOAD_WATCHDOG_GRACE] Remote disc-image hint reached Aether sourceOpened; allowing one additional \(timeoutSeconds)s startup window (\(elapsedTimeout)s total).")
++                print("[TVTrace] ⏳ [LOAD_WATCHDOG_GRACE] Current remote Aether load reached its startup checkpoint; allowing one additional \(timeoutSeconds)s startup window (\(elapsedTimeout)s total).")
+                 try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
+                 guard !Task.isCancelled,
+                       self.sessionCoordinator.loadGeneration == targetGeneration,
+diff --git a/tvosApp/NuvioTVTests/PlaybackBackendPolicyTests.swift b/tvosApp/NuvioTVTests/PlaybackBackendPolicyTests.swift
+--- a/tvosApp/NuvioTVTests/PlaybackBackendPolicyTests.swift
++++ b/tvosApp/NuvioTVTests/PlaybackBackendPolicyTests.swift
+@@ -89,7 +89,7 @@
+             checkpoint: .sourceOpened
+         )
+ 
+-        XCTAssertTrue(AetherDiscStartupWatchdogGracePolicy.shouldGrantGrace(
++        XCTAssertTrue(AetherStartupWatchdogGracePolicy.shouldGrantGrace(
+             request: request,
+             backend: .aether,
+             loadGeneration: 8,
+@@ -102,7 +102,7 @@
+             videoURL: URL(string: "https://example.test/stream?id=123")!,
+             filename: "Movie.BluRay.iso"
+         )
+-        XCTAssertTrue(AetherDiscStartupWatchdogGracePolicy.shouldGrantGrace(
++        XCTAssertTrue(AetherStartupWatchdogGracePolicy.shouldGrantGrace(
+             request: opaqueURLRequest,
+             backend: .aether,
+             loadGeneration: 8,
+@@ -127,7 +127,7 @@
+         )
+         let shouldGrant: (PlaybackLoadRequest?, PlayerBackendKind, UInt64, UInt64?, AetherStartupLoadCheckpointWitness?) -> Bool = {
+             request, backend, generation, dispatchedGeneration, progress in
+-            AetherDiscStartupWatchdogGracePolicy.shouldGrantGrace(
++            AetherStartupWatchdogGracePolicy.shouldGrantGrace(
+                 request: request,
+                 backend: backend,
+                 loadGeneration: generation,
+@@ -160,7 +160,7 @@
+         )), "Progress below the engine generation floor is stale")
+     }
+ 
+-    func testRemoteDiscStartupWatchdogGraceIsLimitedToDispatchedAetherVODDiscHintsOnce() {
++    func testRemoteStartupWatchdogGraceIsLimitedToDispatchedAetherVODOnce() {
+         let request = PlaybackLoadRequest(videoURL: URL(string: "https://example.test/movie.iso")!)
+         let progress = AetherStartupLoadCheckpointWitness(
+             ownerLoadGeneration: 8,
+@@ -169,7 +169,7 @@
+             checkpoint: .sourceOpened
+         )
+         let shouldGrant: (PlaybackLoadRequest?, PlayerBackendKind, Bool) -> Bool = { candidate, backend, graceAlreadyGranted in
+-            AetherDiscStartupWatchdogGracePolicy.shouldGrantGrace(
++            AetherStartupWatchdogGracePolicy.shouldGrantGrace(
+                 request: candidate,
+                 backend: backend,
+                 loadGeneration: 8,
+@@ -181,7 +181,7 @@
+ 
+         XCTAssertFalse(shouldGrant(PlaybackLoadRequest(
+             videoURL: URL(string: "https://example.test/movie.mkv")!
+-        ), .aether, false), "An ordinary remote URL keeps the 30-second timeout")
++        ), .aether, false), "An ordinary remote URL must progress beyond sourceOpened")
+         XCTAssertFalse(shouldGrant(PlaybackLoadRequest(
+             videoURL: URL(fileURLWithPath: "/movies/movie.iso")
+         ), .aether, false), "A local disc image keeps the 30-second timeout")
+@@ -195,6 +195,37 @@
+         ), .aether, false), "Sports requests keep the 30-second timeout")
+         XCTAssertFalse(shouldGrant(request, .mpv, false), "MPV requests keep the 30-second timeout")
+         XCTAssertFalse(shouldGrant(request, .aether, true), "One load can receive only one additional window")
++    }
++
++    func testRemoteVODStartupWatchdogGraceRequiresContainerOpened() {
++        let request = PlaybackLoadRequest(videoURL: URL(string: "https://example.test/movie.mkv")!)
++        let cases: [(StartupCheckpoint, Bool)] = [
++            (.dispatched, false),
++            (.sourceOpened, false),
++            (.containerOpened, true),
++            (.streamsProbed, true)
++        ]
++
++        for (checkpoint, expected) in cases {
++            let progress = AetherStartupLoadCheckpointWitness(
++                ownerLoadGeneration: 8,
++                engineGenerationFloor: 14,
++                progressGeneration: 14,
++                checkpoint: checkpoint
++            )
++            func shouldGrant(alreadyGranted: Bool) -> Bool {
++                AetherStartupWatchdogGracePolicy.shouldGrantGrace(
++                    request: request,
++                    backend: .aether,
++                    loadGeneration: 8,
++                    dispatchedLoadGeneration: 8,
++                    progress: progress,
++                    graceAlreadyGranted: alreadyGranted
++                )
++            }
++            XCTAssertEqual(shouldGrant(alreadyGranted: false), expected)
++            XCTAssertFalse(shouldGrant(alreadyGranted: true))
++        }
+     }
+ 
+     func testDebridAndTorrentAcceptISOExtensions() {

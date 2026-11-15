@@ -22,6 +22,7 @@
 		F2859720610B4D9E85271704 /* CinemaMetadataCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 158FD3AD484C4BDA9FE07345 /* CinemaMetadataCache.swift */; };
 		887A1486E34A4798B046FB71 /* AddonStreams.swift in Sources */ = {isa = PBXBuildFile; fileRef = C67B6C9B9F454201BD7F022A /* AddonStreams.swift */; };
 		C5B8B997EB4F4572A09CD1 /* BitmapSubtitleFallback.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F0D70C0A9904E3DBB4696 /* BitmapSubtitleFallback.swift */; };
+		27A3303C49C14356B412CC94 /* SubtitleCaptionFormatting.swift in Sources */ = {isa = PBXBuildFile; fileRef = A458F37CD85F491586554884 /* SubtitleCaptionFormatting.swift */; };
 		E4E725C472524E69869153C1 /* TitlePlaybackView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B5902E8C6BC46BFA3B92BE3 /* TitlePlaybackView.swift */; };
 		95EB7D8EFA614E5B990A308A /* NuvioAccount.swift in Sources */ = {isa = PBXBuildFile; fileRef = 15E26D6DC1684AE1B64D1636 /* NuvioAccount.swift */; };
 		493E22B5FD4948BDB97D411E /* NuvioCloud.swift in Sources */ = {isa = PBXBuildFile; fileRef = D86F96CFAD2F41A88F6239AC /* NuvioCloud.swift */; };
@@ -53,6 +54,7 @@
 		158FD3AD484C4BDA9FE07345 /* CinemaMetadataCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaMetadataCache.swift; sourceTree = "<group>"; };
 		C67B6C9B9F454201BD7F022A /* AddonStreams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddonStreams.swift; sourceTree = "<group>"; };
 		2F0D70C0A9904E3DBB4696 /* BitmapSubtitleFallback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BitmapSubtitleFallback.swift; sourceTree = "<group>"; };
+		A458F37CD85F491586554884 /* SubtitleCaptionFormatting.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SubtitleCaptionFormatting.swift; sourceTree = "<group>"; };
 		8B5902E8C6BC46BFA3B92BE3 /* TitlePlaybackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TitlePlaybackView.swift; sourceTree = "<group>"; };
 		15E26D6DC1684AE1B64D1636 /* NuvioAccount.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioAccount.swift; sourceTree = "<group>"; };
 		D86F96CFAD2F41A88F6239AC /* NuvioCloud.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioCloud.swift; sourceTree = "<group>"; };
@@ -154,6 +156,7 @@
 				5FAF79C52B7ABF905116D357 /* Legacy */,
 				C67B6C9B9F454201BD7F022A /* AddonStreams.swift */,
 				2F0D70C0A9904E3DBB4696 /* BitmapSubtitleFallback.swift */,
+				A458F37CD85F491586554884 /* SubtitleCaptionFormatting.swift */,
 				8B5902E8C6BC46BFA3B92BE3 /* TitlePlaybackView.swift */,
 				142E24E39EC5EEBE4DE1B41C /* UpstreamPlaybackBridge.swift */,
 			);
@@ -304,6 +307,7 @@
 				F2859720610B4D9E85271704 /* CinemaMetadataCache.swift in Sources */,
 				887A1486E34A4798B046FB71 /* AddonStreams.swift in Sources */,
 				C5B8B997EB4F4572A09CD1 /* BitmapSubtitleFallback.swift in Sources */,
+				27A3303C49C14356B412CC94 /* SubtitleCaptionFormatting.swift in Sources */,
 				E4E725C472524E69869153C1 /* TitlePlaybackView.swift in Sources */,
 				4251984B0143453991FB89C /* AetherPlaybackOptions.swift in Sources */,
 				233B2FDDBE8C4F09BCA3857 /* AetherPlaybackScrubber.swift in Sources */,
@@ -422,7 +426,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.3;
+				MARKETING_VERSION = 0.1.4;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuviocinema.app;
 				"EXCLUDED_ARCHS[sdk=appletvsimulator*]" = x86_64;
 				SDKROOT = appletvos;
@@ -440,7 +444,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 0.1.3;
+				MARKETING_VERSION = 0.1.4;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuviocinema.app;
 				"EXCLUDED_ARCHS[sdk=appletvsimulator*]" = x86_64;
 				SDKROOT = appletvos;

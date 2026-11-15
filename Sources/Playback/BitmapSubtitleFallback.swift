@@ -9,27 +9,26 @@ struct BitmapSubtitleFallback: View {
     @State private var whiteGlyphs: (source: ObjectIdentifier, image: CGImage)?
 
     var body: some View {
-        Group {
-            if let whiteGlyphs, whiteGlyphs.source == ObjectIdentifier(image) {
-                Image(decorative: whiteGlyphs.image, scale: 1, orientation: .up)
-                    .resizable()
-                    .background {
-                        RoundedRectangle(cornerRadius: 7, style: .continuous)
-                            .fill(.black.opacity(0.55))
-                            .padding(.horizontal, -12)
-                            .padding(.vertical, -6)
-                    }
+        let styled = whiteGlyphs?.source == ObjectIdentifier(image) ? whiteGlyphs?.image : nil
+        Image(decorative: styled ?? image, scale: 1, orientation: .up)
+            .resizable()
+            .background {
+                if styled != nil {
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(.black.opacity(0.55))
+                        .padding(.horizontal, -12)
+                        .padding(.vertical, -6)
+                }
             }
-        }
-        .task(id: ObjectIdentifier(image)) {
-            let image = image
-            let rendered = await Task.detached(priority: .userInitiated) {
-                Self.makeWhiteGlyphs(from: image)
-            }.value
-            if !Task.isCancelled, let rendered {
-                whiteGlyphs = (ObjectIdentifier(image), rendered)
+            .task(id: ObjectIdentifier(image)) {
+                let image = image
+                let rendered = await Task.detached(priority: .userInitiated) {
+                    Self.makeWhiteGlyphs(from: image)
+                }.value
+                if !Task.isCancelled, let rendered {
+                    whiteGlyphs = (ObjectIdentifier(image), rendered)
+                }
             }
-        }
     }
 
     nonisolated private static let renderContext = CIContext(options: [.cacheIntermediates: false])

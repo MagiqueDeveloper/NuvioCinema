@@ -1,0 +1,1362 @@
+AetherEngine software HDR10 metadata and HEVC format description backport
+
+https://github.com/superuser404notfound/AetherEngine/pull/1056
+
+Carry the source mastering and content light metadata to software-path
+samples, and initialize the hardware decoder with the right colour and
+metadata so correctly described frames need no retagging copy. The
+vendored tree predates the split architecture guide, so omit the test
+that checks a phrase in that guide. Keep the decoder and renderer tests.
+
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HDR10StaticMetadata.swift b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HDR10StaticMetadata.swift
+new file mode 100644
+index 0000000..e066df4
+--- /dev/null
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HDR10StaticMetadata.swift
+@@ -0,0 +1,47 @@
++import Foundation
++
++/// HDR10 static metadata as CoreVideo carries it: the mastering display colour volume and the content
++/// light level, in the byte layout of the HEVC SEI messages (big endian). Builds and describes the two
++/// attachments; `HDR10StaticMetadataSEI` finds a stream's own values.
++struct HDR10StaticMetadata: Equatable, Sendable {
++    var maxCLL: Int
++    var maxFALL: Int
++    var masteringPeakNits: Double
++    var masteringMinNits: Double
++
++    /// BT.2020 primaries in the SEI's order (green, blue, red), then the D65 white point, in 0.00002 units.
++    static let bt2020Chromaticities: [UInt16] = [8500, 39850, 6550, 2300, 35400, 14600, 15635, 16450]
++
++    /// `kCVImageBufferMasteringDisplayColorVolumeKey`: 24 bytes, BT.2020 primaries, luminance in 0.0001 nit.
++    var masteringDisplayColorVolume: Data {
++        var bytes: [UInt8] = []
++        for value in Self.bt2020Chromaticities { bytes += [UInt8(value >> 8), UInt8(value & 0xFF)] }
++        for nits in [masteringPeakNits, masteringMinNits] {
++            let units = UInt32((nits * 10_000).rounded())
++            bytes += [UInt8(units >> 24), UInt8((units >> 16) & 0xFF), UInt8((units >> 8) & 0xFF), UInt8(units & 0xFF)]
++        }
++        return Data(bytes)
++    }
++
++    /// `kCVImageBufferContentLightLevelInfoKey`: MaxCLL then MaxFALL, two bytes each.
++    var contentLightLevel: Data {
++        Data([UInt8(maxCLL >> 8), UInt8(maxCLL & 0xFF), UInt8(maxFALL >> 8), UInt8(maxFALL & 0xFF)])
++    }
++
++    /// "peak 1000 min 0.0050" from mastering display bytes, nil when they are not 24 bytes.
++    static func describe(masteringDisplayColorVolume data: Data?) -> String? {
++        guard let data, data.count == 24 else { return nil }
++        let b = [UInt8](data)
++        func u32(_ i: Int) -> Double {
++            Double(UInt32(b[i]) << 24 | UInt32(b[i + 1]) << 16 | UInt32(b[i + 2]) << 8 | UInt32(b[i + 3]))
++        }
++        return String(format: "peak %g min %.4f", u32(16) / 10_000, u32(20) / 10_000)
++    }
++
++    /// "1000/400" (MaxCLL/MaxFALL) from content light level bytes, nil when they are not 4 bytes.
++    static func describe(contentLightLevel data: Data?) -> String? {
++        guard let data, data.count == 4 else { return nil }
++        let b = [UInt8](data)
++        return "\(Int(b[0]) << 8 | Int(b[1]))/\(Int(b[2]) << 8 | Int(b[3]))"
++    }
++}
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HDR10StaticMetadataSEI.swift b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HDR10StaticMetadataSEI.swift
+new file mode 100644
+index 0000000..6f64e72
+--- /dev/null
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HDR10StaticMetadataSEI.swift
+@@ -0,0 +1,253 @@
++import Foundation
++import AetherLibavcodec
++import AetherLibavutil
++
++/// AE#957: a stream's HDR10 static metadata, for the frames the software path decodes. HEVC carries it
++/// in SEI, AV1 in metadata OBUs, and a decoded libavcodec frame as side data.
++///
++/// VideoToolbox attaches no mastering display colour volume and no content light level to the frames
++/// it decodes, though the HEVC stream carries both (measured on tvOS 27.2, A12, with the SEI in every
++/// IRAP and in the `hvcC`). Without them the television receives HDR10 with no static metadata. The
++/// HDR10 pass-through probe showed that the attachments on the frames given to the display layer do
++/// reach the television, so the decoder sets the stream's own values there.
++///
++/// Sources, first found wins: the container (`mdcv` / `clli` boxes, Matroska's colour metadata, both
++/// as `codecpar` side data), then the SEI in the `hvcC`, then the SEI in the first key frames. The SEI
++/// payloads (types 137 and 144) are byte for byte what Core Video's attachments hold, so they are
++/// copied as they are. Pure and stateless; malformed input yields nil.
++enum HDR10StaticMetadataSEI {
++
++    static let masteringDisplayPayloadType = 137
++    static let contentLightLevelPayloadType = 144
++    /// `kCVImageBufferMasteringDisplayColorVolumeKey`: G, B, R primaries and the white point as x, y
++    /// pairs in 0.00002 units, then peak and minimum luminance in 0.0001 nit, all big endian.
++    static let masteringDisplaySize = 24
++    /// `kCVImageBufferContentLightLevelInfoKey`: MaxCLL then MaxFALL, two bytes each, big endian.
++    static let contentLightLevelSize = 4
++    /// Key frames the in-band scan reads before it gives up on a stream that has no such SEI.
++    static let keyFramesToScan = 3
++
++    struct Values: Equatable, Sendable {
++        var masteringDisplay: Data?
++        var contentLightLevel: Data?
++
++        static let none = Values()
++        var isEmpty: Bool { masteringDisplay == nil && contentLightLevel == nil }
++        var isComplete: Bool { masteringDisplay != nil && contentLightLevel != nil }
++
++        /// Keeps what is already known and fills the rest from `other`.
++        func filling(from other: Values) -> Values {
++            Values(masteringDisplay: masteringDisplay ?? other.masteringDisplay,
++                   contentLightLevel: contentLightLevel ?? other.contentLightLevel)
++        }
++    }
++
++    /// The two SEI messages in one packet (an access unit) of an HEVC or H.264 stream.
++    static func scan(
++        _ data: UnsafePointer<UInt8>, size: Int,
++        codec: A53SEIParser.CodecKind, framing: A53SEIParser.NALFraming
++    ) -> Values {
++        var found = Values.none
++        A53SEIParser.forEachSEIRBSP(data, size, codec: codec, framing: framing) { rbsp in
++            A53SEIParser.forEachSEIPayload(rbsp) { type, offset, payloadSize in
++                if type == masteringDisplayPayloadType, payloadSize >= masteringDisplaySize,
++                   found.masteringDisplay == nil, offset + masteringDisplaySize <= rbsp.count {
++                    found.masteringDisplay = Data(rbsp[offset ..< offset + masteringDisplaySize])
++                } else if type == contentLightLevelPayloadType, payloadSize >= contentLightLevelSize,
++                          found.contentLightLevel == nil, offset + contentLightLevelSize <= rbsp.count {
++                    found.contentLightLevel = Data(rbsp[offset ..< offset + contentLightLevelSize])
++                }
++                return found.isComplete
++            }
++            return found.isComplete
++        }
++        return found
++    }
++
++    /// The SEI NAL units an `hvcC` record carries in its arrays (x265 writes the HDR10 SEI there).
++    static func scanHEVCConfigRecord(_ record: UnsafePointer<UInt8>, size: Int) -> Values {
++        guard size >= 23, record[0] == 1 else { return .none }
++        // Re-framed as 2-byte length-prefixed NAL units, which is what the arrays hold after their headers.
++        var seiNALs: [UInt8] = []
++        var offset = 23
++        for _ in 0 ..< Int(record[22]) {
++            guard offset + 3 <= size else { return .none }
++            let nalType = Int(record[offset]) & 0x3F
++            let count = Int(record[offset + 1]) << 8 | Int(record[offset + 2])
++            offset += 3
++            for _ in 0 ..< count {
++                guard offset + 2 <= size else { return .none }
++                let length = Int(record[offset]) << 8 | Int(record[offset + 1])
++                guard offset + 2 + length <= size else { return .none }
++                if nalType == 39 || nalType == 40 {
++                    seiNALs.append(contentsOf: UnsafeBufferPointer(start: record + offset, count: 2 + length))
++                }
++                offset += 2 + length
++            }
++        }
++        guard !seiNALs.isEmpty else { return .none }
++        return seiNALs.withUnsafeBufferPointer {
++            scan($0.baseAddress!, size: $0.count, codec: .hevc, framing: .lengthPrefixed(size: 2))
++        }
++    }
++
++    /// The container's declaration, from the stream's coded side data.
++    static func fromCodedSideData(_ codecpar: UnsafePointer<AVCodecParameters>) -> Values {
++        var found = Values.none
++        let count = Int(codecpar.pointee.nb_coded_side_data)
++        guard count > 0, let sideData = codecpar.pointee.coded_side_data else { return found }
++        for i in 0 ..< count {
++            let item = sideData[i]
++            guard let raw = item.data else { continue }
++            if item.type == AV_PKT_DATA_MASTERING_DISPLAY_METADATA,
++               item.size >= MemoryLayout<AVMasteringDisplayMetadata>.size {
++                let metadata = raw.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { $0.pointee }
++                found.masteringDisplay = masteringDisplay(metadata)
++            } else if item.type == AV_PKT_DATA_CONTENT_LIGHT_LEVEL,
++                      item.size >= MemoryLayout<AVContentLightMetadata>.size {
++                let metadata = raw.withMemoryRebound(to: AVContentLightMetadata.self, capacity: 1) { $0.pointee }
++                found.contentLightLevel = contentLightLevel(maxCLL: metadata.MaxCLL, maxFALL: metadata.MaxFALL)
++            }
++        }
++        return found
++    }
++
++    /// A decoded frame's own values (libavcodec exports them from the SEI, and libdav1d from the AV1
++    /// metadata OBUs), in Core Video's byte layout.
++    static func fromFrameSideData(_ frame: UnsafePointer<AVFrame>) -> Values {
++        var found = Values.none
++        guard frame.pointee.nb_side_data > 0 else { return found }
++        if let item = av_frame_get_side_data(frame, AV_FRAME_DATA_MASTERING_DISPLAY_METADATA),
++           let raw = item.pointee.data, item.pointee.size >= MemoryLayout<AVMasteringDisplayMetadata>.size {
++            found.masteringDisplay = masteringDisplay(
++                raw.withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) { $0.pointee })
++        }
++        if let item = av_frame_get_side_data(frame, AV_FRAME_DATA_CONTENT_LIGHT_LEVEL),
++           let raw = item.pointee.data, item.pointee.size >= MemoryLayout<AVContentLightMetadata>.size {
++            let metadata = raw.withMemoryRebound(to: AVContentLightMetadata.self, capacity: 1) { $0.pointee }
++            found.contentLightLevel = contentLightLevel(maxCLL: metadata.MaxCLL, maxFALL: metadata.MaxFALL)
++        }
++        return found
++    }
++
++    // MARK: - AV1 metadata OBUs
++
++    static let av1MetadataOBUType: UInt8 = 5
++    static let av1MetadataTypeContentLightLevel = 1
++    static let av1MetadataTypeMasteringDisplay = 2
++
++    /// The HDR10 metadata OBUs in one AV1 temporal unit (FFmpeg's demuxed packets use the low-overhead
++    /// format, every OBU with its size). CLL is laid out as Core Video's attachment; MDCV is not (red
++    /// first, 0.16 fixed point chromaticity, 24.8 and 18.14 fixed point luminance), so it is converted.
++    static func scanAV1(_ data: UnsafePointer<UInt8>, size: Int) -> Values {
++        var found = Values.none
++        var offset = 0
++        while offset < size, !found.isComplete {
++            let header = data[offset]
++            offset += 1
++            guard header & 0x80 == 0 else { return found } // obu_forbidden_bit
++            let type = (header >> 3) & 15
++            if header & 4 != 0 { offset += 1 } // obu_extension_header
++            let payloadSize: Int
++            if header & 2 != 0 {
++                guard let declared = leb128(data, size: size, offset: &offset) else { return found }
++                payloadSize = declared
++            } else {
++                payloadSize = size - offset
++            }
++            guard offset <= size, payloadSize <= size - offset else { return found }
++            let end = offset + payloadSize
++            if type == av1MetadataOBUType {
++                var cursor = offset
++                if let metadataType = leb128(data, size: end, offset: &cursor) {
++                    let body = UnsafeBufferPointer(start: data + cursor, count: end - cursor)
++                    if metadataType == av1MetadataTypeContentLightLevel, found.contentLightLevel == nil,
++                       body.count >= contentLightLevelSize {
++                        found.contentLightLevel = Data(body.prefix(contentLightLevelSize))
++                    } else if metadataType == av1MetadataTypeMasteringDisplay, found.masteringDisplay == nil {
++                        found.masteringDisplay = av1MasteringDisplay(body)
++                    }
++                }
++            }
++            offset = end
++        }
++        return found
++    }
++
++    /// The configuration OBUs of an `av1C` record (after its 4-byte header), which may hold the metadata.
++    static func scanAV1ConfigRecord(_ record: UnsafePointer<UInt8>, size: Int) -> Values {
++        guard size > 4, record[0] == 0x81 else { return .none } // marker and version 1
++        return scanAV1(record + 4, size: size - 4)
++    }
++
++    /// `metadata_hdr_mdcv` (AV1 section 5.8.4) in Core Video's layout, or nil when it is short or out of range.
++    static func av1MasteringDisplay(_ body: UnsafeBufferPointer<UInt8>) -> Data? {
++        guard body.count >= masteringDisplaySize else { return nil }
++        func u16(_ at: Int) -> UInt32 { UInt32(body[at]) << 8 | UInt32(body[at + 1]) }
++        func u32(_ at: Int) -> UInt64 { UInt64(u16(at)) << 16 | UInt64(u16(at + 2)) }
++        // 0.16 fixed point to 0.00002 units, rounded; at most 50000, so it fits two bytes.
++        func chromaticity(_ at: Int) -> UInt32 { (u16(at) * 50_000 + 32_768) >> 16 }
++        // Red, green, blue in the OBU; green, blue, red in Core Video.
++        let order = [4, 8, 0, 12]
++        var bytes: [UInt8] = []
++        bytes.reserveCapacity(masteringDisplaySize)
++        for pair in order {
++            for value in [chromaticity(pair), chromaticity(pair + 2)] {
++                bytes += [UInt8(value >> 8), UInt8(value & 0xFF)]
++            }
++        }
++        // 24.8 and 18.14 fixed point nits to 0.0001 nit.
++        let peak = (u32(16) * 10_000 + 128) >> 8
++        let minimum = (u32(20) * 10_000 + 8_192) >> 14
++        for value in [peak, minimum] {
++            guard value <= UInt64(UInt32.max) else { return nil }
++            bytes += [UInt8(value >> 24), UInt8((value >> 16) & 0xFF), UInt8((value >> 8) & 0xFF), UInt8(value & 0xFF)]
++        }
++        return Data(bytes)
++    }
++
++    /// AV1 leb128, read up to `size`; values are limited to 32 bits.
++    private static func leb128(_ data: UnsafePointer<UInt8>, size: Int, offset: inout Int) -> Int? {
++        var value: UInt64 = 0
++        for index in 0 ..< 8 {
++            guard offset < size else { return nil }
++            let byte = data[offset]
++            offset += 1
++            value |= UInt64(byte & 0x7F) << (index * 7)
++            if byte & 0x80 == 0 { return value <= UInt64(UInt32.max) ? Int(value) : nil }
++        }
++        return nil
++    }
++
++    /// FFmpeg's struct in Core Video's byte layout. nil unless it has both primaries and luminance, the
++    /// way the SEI always does: a half-filled volume would claim a gamut or a peak nobody declared.
++    static func masteringDisplay(_ m: AVMasteringDisplayMetadata) -> Data? {
++        guard m.has_primaries != 0, m.has_luminance != 0 else { return nil }
++        func units(_ q: AVRational, _ scale: Double, max: Double) -> Double? {
++            guard q.den != 0 else { return nil }
++            let value = (av_q2d(q) * scale).rounded()
++            return value >= 0 && value <= max ? value : nil
++        }
++        // FFmpeg stores red, green, blue; the SEI and Core Video order is green, blue, red.
++        let p = m.display_primaries
++        let chromaticities = [p.1.0, p.1.1, p.2.0, p.2.1, p.0.0, p.0.1, m.white_point.0, m.white_point.1]
++        var bytes: [UInt8] = []
++        for q in chromaticities {
++            guard let v = units(q, 50_000, max: Double(UInt16.max)) else { return nil }
++            let u = UInt16(v)
++            bytes += [UInt8(u >> 8), UInt8(u & 0xFF)]
++        }
++        for q in [m.max_luminance, m.min_luminance] {
++            guard let v = units(q, 10_000, max: Double(UInt32.max)) else { return nil }
++            let u = UInt32(v)
++            bytes += [UInt8(u >> 24), UInt8((u >> 16) & 0xFF), UInt8((u >> 8) & 0xFF), UInt8(u & 0xFF)]
++        }
++        return Data(bytes)
++    }
++
++    static func contentLightLevel(maxCLL: UInt32, maxFALL: UInt32) -> Data {
++        let cll = UInt16(min(maxCLL, UInt32(UInt16.max)))
++        let fall = UInt16(min(maxFALL, UInt32(UInt16.max)))
++        return Data([UInt8(cll >> 8), UInt8(cll & 0xFF), UInt8(fall >> 8), UInt8(fall & 0xFF)])
++    }
++}
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HardwareVideoDecoder.swift b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HardwareVideoDecoder.swift
+index 44dc0a6..27c7a15 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HardwareVideoDecoder.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/HardwareVideoDecoder.swift
+@@ -124,6 +124,17 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+     /// #177 latch unnecessary, since one resolution cannot oscillate.
+     private var pixelAspectRatio: AVRational?
+ 
++    /// AE#957: the stream's HDR10 static metadata, re-applied to every PQ frame because VideoToolbox
++    /// attaches none (`HDR10StaticMetadataSEI`). Found at `open()` from the container, the `hvcC` or the
++    /// `av1C`, or in the first key frames, so `decode` writes it and the output callback reads it:
++    /// its own lock, since the output callback must not take `lock`.
++    private let staticHDR10Lock = NSLock()
++    private var staticHDR10 = HDR10StaticMetadataSEI.Values.none
++    /// Key frames the in-band scan still reads; 0 once the values are complete or it gave up.
++    private var staticHDR10KeyFramesLeft = 0
++    /// The HDR10 values the current format description carries. Guarded by `lock`, like the description.
++    private var describedHDR10 = HDR10StaticMetadataSEI.Values.none
++
+     /// Protects `session` across the demux thread (decode), main thread (close/flush), and VT callback (delivery).
+     private let lock = NSLock()
+ 
+@@ -331,7 +342,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+         let configuration = try VideoToolboxVideoFormat.make(stream: stream)
+         codecName = configuration.codecName
+         formatCodecType = configuration.codecType
+-        formatExtensions = configuration.extensions
++        resolveStaticHDR10(codecpar: codecpar)
++        describedHDR10 = currentStaticHDR10()
++        let extensions = Self.extensions(configuration.extensions, carrying: describedHDR10)
++        formatExtensions = extensions
+         if codecpar.pointee.codec_id == AV_CODEC_ID_VP9 {
+             // Swift 6.2.3 is a proxy for the mobile declaration in stock Xcode 26.2 SDKs.
+             // Custom compiler/SDK pairings are not covered; capability queries stay outside.
+@@ -353,7 +367,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+             codecType: configuration.codecType,
+             width: width,
+             height: height,
+-            extensions: configuration.extensions,
++            extensions: extensions,
+             formatDescriptionOut: &fd
+         )
+         guard fdStatus == noErr, let formatDesc = fd else {
+@@ -547,6 +561,9 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+     ) throws {
+         self.onFrame = onFrame
+         self.timeBase = timeBase
++        // No stream here to read HDR10 static metadata from: nothing is added, and nothing from an
++        // earlier `open(stream:)` of this instance carries over.
++        setStaticHDR10(.none, keyFramesToScan: 0)
+ 
+         guard parameterSets.count >= 3 else {
+             throw VideoDecoderError.noExtradata
+@@ -646,6 +663,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+             UnsafeBufferPointer(start: data, count: Int(packet.pointee.size))) {
+             adoptVP9FrameSize(size, epoch: epoch)
+         }
++        // Before this key frame is wrapped: values it completes go into a new format description first.
++        if (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0, let data = packet.pointee.data, packet.pointee.size > 0,
++           let found = scanStaticHDR10(UnsafePointer(data), size: Int(packet.pointee.size)) {
++            describeStaticHDR10(found, epoch: epoch)
++        }
+         lock.lock()
+         // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
+         if let epoch, epoch != currentEpoch { lock.unlock(); return }
+@@ -853,13 +875,22 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+             self.session = nil
+         }
+         formatDescription = nil
++        describedHDR10 = .none
+         lock.unlock()
+ 
+         if let box = refConBox {
+             box.release()
+             refConBox = nil
+         }
++        let outcomes = outputMetadataNormalizer.takeOutcomes()
++        if outcomes.total > 0 {
++            EngineLog.emit("[HardwareVideoDecoder] output metadata over \(outcomes.total) frames: "
++                           + "\(outcomes.asDecoded) as decoded, \(outcomes.inPlace) in place, "
++                           + "\(outcomes.copied) copied, \(outcomes.copyFailed) copy failed",
++                           category: .swPlayback)
++        }
+         outputMetadataNormalizer.reset()
++        setStaticHDR10(.none, keyFramesToScan: 0)
+         onFrame = nil
+     }
+ 
+@@ -867,6 +898,150 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+         close()
+     }
+ 
++    // MARK: - HDR10 static metadata (AE#957)
++
++    private func resolveStaticHDR10(codecpar: UnsafeMutablePointer<AVCodecParameters>) {
++        var values = HDR10StaticMetadataSEI.Values.none
++        var keyFrames = 0
++        var source = "none"
++        if codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084 {
++            values = HDR10StaticMetadataSEI.fromCodedSideData(codecpar)
++            if !values.isEmpty { source = "container" }
++            if !values.isComplete, codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
++               let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
++                let fromRecord = HDR10StaticMetadataSEI.scanHEVCConfigRecord(
++                    extradata, size: Int(codecpar.pointee.extradata_size))
++                if !fromRecord.isEmpty { source = values.isEmpty ? "hvcC" : source + "+hvcC" }
++                values = values.filling(from: fromRecord)
++            }
++            if !values.isComplete, codecpar.pointee.codec_id == AV_CODEC_ID_AV1,
++               let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
++                let fromRecord = HDR10StaticMetadataSEI.scanAV1ConfigRecord(
++                    extradata, size: Int(codecpar.pointee.extradata_size))
++                if !fromRecord.isEmpty { source = values.isEmpty ? "av1C" : source + "+av1C" }
++                values = values.filling(from: fromRecord)
++            }
++            // HEVC (SEI) and AV1 (metadata OBUs). This decoder opens no H.264 (VideoToolboxVideoFormat),
++            // and VP9 has no in-band HDR10 metadata.
++            let scansInBand = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
++                || codecpar.pointee.codec_id == AV_CODEC_ID_AV1
++            keyFrames = values.isComplete || !scansInBand ? 0 : HDR10StaticMetadataSEI.keyFramesToScan
++            EngineLog.emit("[HardwareVideoDecoder] HDR10 static metadata: \(source) "
++                           + Self.describe(values)
++                           + (keyFrames > 0 ? ", scanning the first \(keyFrames) key frames" : ""),
++                           category: .swPlayback)
++        }
++        setStaticHDR10(values, keyFramesToScan: keyFrames)
++    }
++
++    private func setStaticHDR10(_ values: HDR10StaticMetadataSEI.Values, keyFramesToScan: Int) {
++        staticHDR10Lock.lock()
++        staticHDR10 = values
++        staticHDR10KeyFramesLeft = keyFramesToScan
++        staticHDR10Lock.unlock()
++    }
++
++    /// The values known at open, in the format description VideoToolbox decodes with: it then attaches
++    /// them to its own output, so the frames match and skip the owned copy (a full 4K frame transfer,
++    /// about 7 ms on an A12 Apple TV). Values found later, in a key frame's SEI, still need the copy.
++    static func extensions(_ base: NSDictionary?, carrying values: HDR10StaticMetadataSEI.Values) -> NSDictionary? {
++        guard !values.isEmpty else { return base }
++        let extensions = NSMutableDictionary(dictionary: base ?? [:])
++        if let masteringDisplay = values.masteringDisplay {
++            extensions[kCMFormatDescriptionExtension_MasteringDisplayColorVolume] = masteringDisplay as NSData
++        }
++        if let contentLightLevel = values.contentLightLevel {
++            extensions[kCMFormatDescriptionExtension_ContentLightLevelInfo] = contentLightLevel as NSData
++        }
++        return extensions
++    }
++
++    /// A key frame's SEI (HEVC) or metadata OBUs (AV1), while the values are incomplete and key frames are
++    /// left to read.
++    /// Returns the values when this key frame ended the scan, nil while it goes on or once it is over.
++    @discardableResult
++    private func scanStaticHDR10(_ data: UnsafePointer<UInt8>, size: Int) -> HDR10StaticMetadataSEI.Values? {
++        staticHDR10Lock.lock()
++        let scanning = staticHDR10KeyFramesLeft > 0
++        staticHDR10Lock.unlock()
++        guard scanning else { return nil }
++        let found = streamCodecID == AV_CODEC_ID_AV1
++            ? HDR10StaticMetadataSEI.scanAV1(data, size: size)
++            : HDR10StaticMetadataSEI.scan(data, size: size, codec: .hevc, framing: hdr10PlusFraming)
++        staticHDR10Lock.lock()
++        staticHDR10 = staticHDR10.filling(from: found)
++        staticHDR10KeyFramesLeft = staticHDR10.isComplete ? 0 : max(staticHDR10KeyFramesLeft - 1, 0)
++        let values = staticHDR10
++        let done = staticHDR10KeyFramesLeft == 0
++        staticHDR10Lock.unlock()
++        guard done else { return nil }
++        EngineLog.emit("[HardwareVideoDecoder] HDR10 static metadata from the stream's key frames: "
++                       + Self.describe(values), category: .swPlayback)
++        return values
++    }
++
++    /// Whether values the scan found must go into a new format description: they differ from what the
++    /// current one carries. Pure, for the tests.
++    static func needsNewDescription(found: HDR10StaticMetadataSEI.Values,
++                                    described: HDR10StaticMetadataSEI.Values) -> Bool {
++        !found.isEmpty && found != described
++    }
++
++    /// Values found in a key frame go into the format description too, before that key frame decodes: a
++    /// new description and session from it, the way `adoptVP9FrameSize` does. VideoToolbox then attaches
++    /// them itself, so the frames skip the owned copy (about 7 ms per 4K frame on an A12) for the rest of
++    /// the session, as with values known at open. Usually this is the stream's first key frame, with
++    /// nothing decoded before it. On a later one (the values were in its SEI only), that key frame's
++    /// leading pictures can be lost once, as after a seek. If VideoToolbox refuses, the old session stays
++    /// and the frames keep the copy.
++    private func describeStaticHDR10(_ values: HDR10StaticMetadataSEI.Values, epoch: UInt64?) {
++        lock.lock()
++        defer { lock.unlock() }
++        if let epoch, epoch != currentEpoch { return }
++        guard Self.needsNewDescription(found: values, described: describedHDR10),
++              let old = session, !sessionLost, let refConBox else { return }
++        let extensions = Self.extensions(formatExtensions, carrying: values)
++        var fd: CMVideoFormatDescription?
++        let fdStatus = CMVideoFormatDescriptionCreate(
++            allocator: kCFAllocatorDefault,
++            codecType: formatCodecType,
++            width: width,
++            height: height,
++            extensions: extensions,
++            formatDescriptionOut: &fd
++        )
++        guard fdStatus == noErr, let formatDesc = fd else {
++            EngineLog.emit("[HardwareVideoDecoder] HDR10 values found in a key frame: format description "
++                           + "failed (\(fdStatus)), frames keep the copy", category: .swPlayback)
++            return
++        }
++        VTDecompressionSessionWaitForAsynchronousFrames(old)
++        let created = makeSession(formatDescription: formatDesc, refCon: refConBox)
++        guard let fresh = created.session else {
++            EngineLog.emit("[HardwareVideoDecoder] HDR10 values found in a key frame: session refused "
++                           + "(\(created.status)), frames keep the copy", category: .swPlayback)
++            return
++        }
++        VTDecompressionSessionInvalidate(old)
++        session = fresh
++        formatDescription = formatDesc
++        formatExtensions = extensions
++        describedHDR10 = values
++        EngineLog.emit("[HardwareVideoDecoder] HDR10 values found in a key frame go into the format "
++                       + "description, session rebuilt", category: .swPlayback)
++    }
++
++    private func currentStaticHDR10() -> HDR10StaticMetadataSEI.Values {
++        staticHDR10Lock.lock()
++        defer { staticHDR10Lock.unlock() }
++        return staticHDR10
++    }
++
++    static func describe(_ values: HDR10StaticMetadataSEI.Values) -> String {
++        "mastering " + (HDR10StaticMetadata.describe(masteringDisplayColorVolume: values.masteringDisplay) ?? "-")
++            + ", MaxCLL/MaxFALL " + (HDR10StaticMetadata.describe(contentLightLevel: values.contentLightLevel) ?? "-")
++    }
++
+     // MARK: - Pixel aspect ratio (#354)
+ 
+     /// The ratio to attach, or nil when there is nothing to correct. Bitstream first, container
+@@ -916,7 +1091,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+             colorPrimaries: colorPrimaries,
+             transferFunction: colorTransfer,
+             yCbCrMatrix: colorMatrix,
+-            pixelAspectRatio: pixelAspectRatio)
++            pixelAspectRatio: pixelAspectRatio,
++            hdr10: currentStaticHDR10())
+         if attachesAV1DolbyVisionRPU {
+             // On VideoToolbox's own output buffer the attachment is set but never reaches the panel: viewed
+             // on the built-in XDR display, switching the RPU off and on changed nothing, and neither did the
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/SoftwareVideoDecoder.swift b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/SoftwareVideoDecoder.swift
+index 5a6e199..59b61c8 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/SoftwareVideoDecoder.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/SoftwareVideoDecoder.swift
+@@ -187,6 +187,14 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+     /// the decode thread afterwards, the same discipline `use10Bit` and the other open-time fields keep.
+     private var containerColor = ColorDescription.unspecified
+ 
++    /// AE#957: the container's HDR10 static metadata (`mdcv` / `clli`, Matroska's colour metadata),
++    /// for a PQ stream. Written in `open` like `containerColor`.
++    private var containerHDR10 = HDR10StaticMetadataSEI.Values.none
++    /// The last values a decoded frame carried. libavcodec exports them only on some frames (HEVC on
++    /// the pictures whose access unit had the SEI), so they stay until a frame brings new ones. Updated
++    /// as each frame leaves the decoder; guarded by `lock`, like everything `emit` reads.
++    private var streamHDR10 = HDR10StaticMetadataSEI.Values.none
++
+     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
+     private var droppedUntimestampedFields = 0
+ 
+@@ -291,6 +299,8 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+         av_dict_free(&opts)
+ 
+         containerColor = ColorDescription(codecpar: codecpar)
++        containerHDR10 = codecpar.pointee.color_trc == AVCOL_TRC_SMPTE2084
++            ? HDR10StaticMetadataSEI.fromCodedSideData(codecpar) : .none
+         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
+         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
+         use10Bit = bitsPerSample > 8 || isHDRTransfer
+@@ -394,6 +404,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+             // consumer reads the frame, for the same reason the timestamp repair below runs here.
+             ColorDescription.backfill(frame: f, container: containerColor)
+             decodedFormatKey = DecodedFormatKey(pixelFormat: f.pointee.format, color: ColorDescription(frame: f))
++            // AE#957: every decoded frame, so the values a pre-roll frame (skipped, not emitted) carried still count.
++            if f.pointee.nb_side_data > 0 {
++                streamHDR10 = HDR10StaticMetadataSEI.fromFrameSideData(f).filling(from: streamHDR10)
++            }
+ 
+             // #407: repair the frame's own timestamp BEFORE anything reads it. A frame that reaches
+             // the renderer with no PTS is unschedulable and gets dropped there, so every consumer
+@@ -636,6 +650,7 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+             VTPixelTransferSessionInvalidate(session)
+             transferSession = nil
+         }
++        streamHDR10 = .none
+         // Nil onFrame inside the lock: emit() reads it under the same lock; unsynchronized write is a data race.
+         onFrame = nil
+         onCacheTiming = nil
+@@ -812,6 +827,33 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
+         CVBufferSetAttachment(pb, kCVImageBufferColorPrimariesKey, tags.primaries, .shouldPropagate)
+         CVBufferSetAttachment(pb, kCVImageBufferTransferFunctionKey, tags.transfer, .shouldPropagate)
+         CVBufferSetAttachment(pb, kCVImageBufferYCbCrMatrixKey, tags.matrix, .shouldPropagate)
++        attachHDR10(from: frame, to: pb)
++    }
++
++    /// AE#957: HDR10 static metadata (mastering display, content light level) for a PQ frame: the
++    /// latest a decoded frame carried (`streamHDR10`), else the container's. Without it the television
++    /// gets HDR10 with no static metadata, as it did from VideoToolbox's frames. Every other frame
++    /// has both keys removed, since a pool buffer comes back with what its last use left on it.
++    private func attachHDR10(from frame: UnsafeMutablePointer<AVFrame>, to pb: CVPixelBuffer) {
++        let values = frame.pointee.color_trc == AVCOL_TRC_SMPTE2084
++            ? streamHDR10.filling(from: containerHDR10) : .none
++        Self.setHDR10(values, on: pb)
++    }
++
++    /// Sets the keys `values` has and removes the others.
++    static func setHDR10(_ values: HDR10StaticMetadataSEI.Values, on pb: CVPixelBuffer) {
++        if let masteringDisplay = values.masteringDisplay {
++            CVBufferSetAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey,
++                                  masteringDisplay as CFData, .shouldPropagate)
++        } else {
++            CVBufferRemoveAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey)
++        }
++        if let contentLightLevel = values.contentLightLevel {
++            CVBufferSetAttachment(pb, kCVImageBufferContentLightLevelInfoKey,
++                                  contentLightLevel as CFData, .shouldPropagate)
++        } else {
++            CVBufferRemoveAttachment(pb, kCVImageBufferContentLightLevelInfoKey)
++        }
+     }
+ 
+     // MARK: - Pixel Aspect Ratio (anamorphic SD)
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/VideoToolboxOutputMetadataNormalizer.swift b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/VideoToolboxOutputMetadataNormalizer.swift
+index d458872..67d9346 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/VideoToolboxOutputMetadataNormalizer.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/VideoToolboxOutputMetadataNormalizer.swift
+@@ -1,6 +1,7 @@
+ import Foundation
+ import CoreVideo
+ import VideoToolbox
++import os
+ import AetherLibavutil
+ 
+ /// Supplies codec-declared display metadata without mutating immutable VideoToolbox output.
+@@ -24,32 +25,58 @@ final class VideoToolboxOutputMetadataNormalizer: @unchecked Sendable {
+     private var poolFormat: PoolFormat?
+     private var loggedFailure = false
+ 
++    /// What happened to each frame since the last `takeOutcomes()`. The owned copy is the costly one
++    /// (a full-frame GPU transfer), so a session that copies every frame shows here. Its own lock: the
++    /// matching path takes no other.
++    struct Outcomes: Equatable, Sendable {
++        var asDecoded = 0
++        var inPlace = 0
++        var copied = 0
++        var copyFailed = 0
++        var total: Int { asDecoded + inPlace + copied + copyFailed }
++    }
++    private let outcomes = OSAllocatedUnfairLock(initialState: Outcomes())
++
++    /// The counts so far, and a fresh start.
++    func takeOutcomes() -> Outcomes {
++        outcomes.withLock { counts in
++            defer { counts = Outcomes() }
++            return counts
++        }
++    }
++
+     func applyingOutputMetadata(
+         to imageBuffer: CVPixelBuffer,
+         isModifiable: Bool,
+         colorPrimaries: CFString?,
+         transferFunction: CFString?,
+         yCbCrMatrix: CFString?,
+-        pixelAspectRatio: AVRational?
++        pixelAspectRatio: AVRational?,
++        hdr10: HDR10StaticMetadataSEI.Values = .none
+     ) -> CVPixelBuffer {
+         if Self.outputMetadataMatches(
+             imageBuffer,
+             colorPrimaries: colorPrimaries,
+             transferFunction: transferFunction,
+             yCbCrMatrix: yCbCrMatrix,
+-            pixelAspectRatio: pixelAspectRatio
++            pixelAspectRatio: pixelAspectRatio,
++            hdr10: hdr10
+         ) {
++            outcomes.withLock { $0.asDecoded += 1 }
+             return imageBuffer
+         }
+ 
+         let destination: CVPixelBuffer
+         if isModifiable {
+             destination = imageBuffer
++            outcomes.withLock { $0.inPlace += 1 }
+         } else {
+             guard let copiedBuffer = transferToOwnedBuffer(imageBuffer) else {
++                outcomes.withLock { $0.copyFailed += 1 }
+                 logFailureOnce()
+                 return imageBuffer
+             }
++            outcomes.withLock { $0.copied += 1 }
+             destination = copiedBuffer
+             CVBufferRemoveAllAttachments(destination)
+             CVBufferPropagateAttachments(imageBuffer, destination)
+@@ -60,7 +87,8 @@ final class VideoToolboxOutputMetadataNormalizer: @unchecked Sendable {
+             colorPrimaries: colorPrimaries,
+             transferFunction: transferFunction,
+             yCbCrMatrix: yCbCrMatrix,
+-            pixelAspectRatio: pixelAspectRatio
++            pixelAspectRatio: pixelAspectRatio,
++            hdr10: hdr10
+         )
+         return destination
+     }
+@@ -70,8 +98,21 @@ final class VideoToolboxOutputMetadataNormalizer: @unchecked Sendable {
+         colorPrimaries: CFString?,
+         transferFunction: CFString?,
+         yCbCrMatrix: CFString?,
+-        pixelAspectRatio: AVRational?
++        pixelAspectRatio: AVRational?,
++        hdr10: HDR10StaticMetadataSEI.Values
+     ) {
++        // AE#957: the stream's HDR10 static metadata where the frame lacks it. A key the frame already
++        // carries is the decoder's own value and stays; only a missing one is filled.
++        if let masteringDisplay = hdr10.masteringDisplay,
++           propagatingAttachment(imageBuffer, kCVImageBufferMasteringDisplayColorVolumeKey) == nil {
++            CVBufferSetAttachment(imageBuffer, kCVImageBufferMasteringDisplayColorVolumeKey,
++                                  masteringDisplay as CFData, .shouldPropagate)
++        }
++        if let contentLightLevel = hdr10.contentLightLevel,
++           propagatingAttachment(imageBuffer, kCVImageBufferContentLightLevelInfoKey) == nil {
++            CVBufferSetAttachment(imageBuffer, kCVImageBufferContentLightLevelInfoKey,
++                                  contentLightLevel as CFData, .shouldPropagate)
++        }
+         if let colorPrimaries {
+             CVBufferSetAttachment(
+                 imageBuffer,
+@@ -107,21 +148,24 @@ final class VideoToolboxOutputMetadataNormalizer: @unchecked Sendable {
+         }
+     }
+ 
++    /// Only a propagating attachment counts as a match: the subtitle compositor's copy carries
++    /// nothing else, so a matching value marked `.shouldNotPropagate` would be lost there.
++    private static func propagatingAttachment(_ imageBuffer: CVPixelBuffer, _ key: CFString) -> CFTypeRef? {
++        var mode = CVAttachmentMode.shouldPropagate
++        guard let value = CVBufferCopyAttachment(imageBuffer, key, &mode),
++              mode == .shouldPropagate else { return nil }
++        return value
++    }
++
+     private static func outputMetadataMatches(
+         _ imageBuffer: CVPixelBuffer,
+         colorPrimaries: CFString?,
+         transferFunction: CFString?,
+         yCbCrMatrix: CFString?,
+-        pixelAspectRatio: AVRational?
++        pixelAspectRatio: AVRational?,
++        hdr10: HDR10StaticMetadataSEI.Values
+     ) -> Bool {
+-        // Only a propagating attachment counts as a match: the subtitle compositor's copy carries
+-        // nothing else, so a matching value marked `.shouldNotPropagate` would be lost there.
+-        func attachment(_ key: CFString) -> CFTypeRef? {
+-            var mode = CVAttachmentMode.shouldPropagate
+-            guard let value = CVBufferCopyAttachment(imageBuffer, key, &mode),
+-                  mode == .shouldPropagate else { return nil }
+-            return value
+-        }
++        func attachment(_ key: CFString) -> CFTypeRef? { propagatingAttachment(imageBuffer, key) }
+ 
+         if let colorPrimaries,
+            attachment(kCVImageBufferColorPrimariesKey) as? String != colorPrimaries as String {
+@@ -135,6 +179,13 @@ final class VideoToolboxOutputMetadataNormalizer: @unchecked Sendable {
+            attachment(kCVImageBufferYCbCrMatrixKey) as? String != yCbCrMatrix as String {
+             return false
+         }
++        // Any HDR10 value the frame carries counts: it is not replaced, only a missing key is filled.
++        if hdr10.masteringDisplay != nil, attachment(kCVImageBufferMasteringDisplayColorVolumeKey) == nil {
++            return false
++        }
++        if hdr10.contentLightLevel != nil, attachment(kCVImageBufferContentLightLevelInfoKey) == nil {
++            return false
++        }
+         if let pixelAspectRatio {
+             guard let aspect = attachment(kCVImageBufferPixelAspectRatioKey) as? NSDictionary,
+                   aspect[kCVImageBufferPixelAspectRatioHorizontalSpacingKey] as? Int
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/VideoToolboxVideoFormat.swift b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/VideoToolboxVideoFormat.swift
+index 8d156b2..4b6934f 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Decoder/VideoToolboxVideoFormat.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Decoder/VideoToolboxVideoFormat.swift
+@@ -60,12 +60,16 @@ enum VideoToolboxVideoFormat {
+             }
+             let data = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
+             let atoms: NSDictionary = ["hvcC": data]
++            let extensions = NSMutableDictionary(dictionary: [
++                kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms
++            ])
++            addColor(codecpar: codecpar, to: extensions)
+             let bitDepth = codecpar.pointee.bits_per_raw_sample > 8
+                 || ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc) ? 10 : 8
+             return Configuration(
+                 codecName: "HEVC",
+                 codecType: kCMVideoCodecType_HEVC,
+-                extensions: [kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: atoms],
++                extensions: extensions,
+                 bitDepth: bitDepth
+             )
+ 
+@@ -127,7 +131,9 @@ enum VideoToolboxVideoFormat {
+     /// (`ColorInfoGuessedBy`) and tags its output BT.709 SDR in the buffer's CGColorSpace and the
+     /// IOSurface's colour space ID, under the PQ transfer the frame handler attaches afterwards, and a
+     /// PQ source came out blown out. VP9 gets the same keys so its output cannot be tagged that way
+-    /// either. HEVC carries its colour in the VUI of the hvcC's SPS and needs none of this.
++    /// either. HEVC too (AE#957): on an A12 Apple TV, tvOS 27.2, a PQ BT.2020 clip came out tagged
++    /// BT.709 the same way despite its VUI, so the output normalizer copied every 4K frame to retag
++    /// it (about 7 ms each).
+     private static func addColor(
+         codecpar: UnsafeMutablePointer<AVCodecParameters>,
+         to extensions: NSMutableDictionary
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Renderer/SampleBufferRenderer.swift b/Vendor/AetherEngine/Sources/AetherEngine/Renderer/SampleBufferRenderer.swift
+index a41318b..aa7cf78 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/Renderer/SampleBufferRenderer.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/Renderer/SampleBufferRenderer.swift
+@@ -311,7 +311,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
+         return _flushGeneration
+     }
+ 
+-    /// Cached CMVideoFormatDescription keyed by dimensions + pixel format + colorimetry + pixel aspect ratio. CMVideoFormatDescriptionCreateForImageBuffer snapshots color AND aspect attachments at creation, so a mid-stream change at same dimensions must invalidate the cache; a PAR-less first frame froze a PAR-less description for the whole stream and collapsed anamorphic content to coded dimensions (#177). Guarded by reorderLock; nil'd by flush().
++    /// Cached CMVideoFormatDescription keyed by dimensions + pixel format + colorimetry + pixel aspect ratio + HDR10 static metadata. CMVideoFormatDescriptionCreateForImageBuffer snapshots color AND aspect attachments at creation, so a mid-stream change at same dimensions must invalidate the cache; a PAR-less first frame froze a PAR-less description for the whole stream and collapsed anamorphic content to coded dimensions (#177). Guarded by reorderLock; nil'd by flush().
+     private var cachedFormatDesc: CMVideoFormatDescription?
+     private var cachedFormatKey: FormatDescriptionKey?
+ 
+@@ -325,6 +325,10 @@ final class SampleBufferRenderer: @unchecked Sendable {
+         var matrix: String?
+         var parH: Int?
+         var parV: Int?
++        /// HDR10 static metadata (AE#957): the description snapshots it too, so a change mid-stream
++        /// (a stream whose first frames carry none, or values that change mid-stream) must make a new one.
++        var masteringDisplay: Data?
++        var contentLightLevel: Data?
+     }
+ 
+     private var loggedLayerFailed = false
+@@ -1141,7 +1145,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
+             transfer: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferTransferFunctionKey, nil) as? String,
+             matrix: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferYCbCrMatrixKey, nil) as? String,
+             parH: (par?[kCVImageBufferPixelAspectRatioHorizontalSpacingKey] as? NSNumber)?.intValue,
+-            parV: (par?[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? NSNumber)?.intValue
++            parV: (par?[kCVImageBufferPixelAspectRatioVerticalSpacingKey] as? NSNumber)?.intValue,
++            masteringDisplay: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data,
++            contentLightLevel: CVBufferCopyAttachment(pixelBuffer, kCVImageBufferContentLightLevelInfoKey, nil) as? Data
+         )
+ 
+         // Guarded by reorderLock: flush() nils the cache from other threads.
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/DecoderFormatCarriesStreamColourAndHDR10Tests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/DecoderFormatCarriesStreamColourAndHDR10Tests.swift
+new file mode 100644
+index 0000000..ae87cc2
+--- /dev/null
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/DecoderFormatCarriesStreamColourAndHDR10Tests.swift
+@@ -0,0 +1,95 @@
++import Foundation
++import CoreMedia
++import AetherLibavformat
++import AetherLibavutil
++import AetherLibavcodec
++import Testing
++@testable import AetherEngine
++
++/// AE#957: VideoToolbox tagged a PQ BT.2020 HEVC clip's frames BT.709 and gave them no HDR10 metadata, so the
++/// output normalizer copied every 4K frame (about 7 ms each on an A12 Apple TV). The format description it
++/// decodes with now names the stream's colour and HDR10 values, and VideoToolbox attaches them itself.
++@Suite("Decoder format description carries the stream's colour and HDR10 values (AE#957)")
++struct DecoderFormatCarriesStreamColourAndHDR10Tests {
++
++    private static let clip = HDR10StaticMetadata(maxCLL: 1000, maxFALL: 400, masteringPeakNits: 1000,
++                                                  masteringMinNits: 0.005)
++
++    @Test func issue957HEVCDescriptionNamesTheStreamsColour() throws {
++        let context = try #require(avformat_alloc_context())
++        defer { avformat_free_context(context) }
++        let stream = try #require(avformat_new_stream(context, nil))
++        let parameters = try #require(stream.pointee.codecpar)
++        parameters.pointee.codec_id = AV_CODEC_ID_HEVC
++        parameters.pointee.codec_type = AVMEDIA_TYPE_VIDEO
++        parameters.pointee.width = 3840
++        parameters.pointee.height = 2160
++        parameters.pointee.color_primaries = AVCOL_PRI_BT2020
++        parameters.pointee.color_trc = AVCOL_TRC_SMPTE2084
++        parameters.pointee.color_space = AVCOL_SPC_BT2020_NCL
++        parameters.pointee.color_range = AVCOL_RANGE_MPEG
++        // A minimal hvcC (version 1, no arrays); avformat_free_context frees it.
++        let record = [UInt8](repeating: 0, count: 23)
++        let extradata = try #require(av_mallocz(record.count + 64)?.assumingMemoryBound(to: UInt8.self))
++        extradata.update(from: record, count: record.count)
++        extradata[0] = 1
++        parameters.pointee.extradata = extradata
++        parameters.pointee.extradata_size = Int32(record.count)
++
++        let configuration = try VideoToolboxVideoFormat.make(stream: stream)
++        let extensions = configuration.extensions
++        let primaries = extensions[kCMFormatDescriptionExtension_ColorPrimaries] as? String
++        let transfer = extensions[kCMFormatDescriptionExtension_TransferFunction] as? String
++        let matrix = extensions[kCMFormatDescriptionExtension_YCbCrMatrix] as? String
++        let fullRange = extensions[kCMFormatDescriptionExtension_FullRangeVideo] as? Bool
++        let hasRecord = (extensions[kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms]
++            as? NSDictionary)?["hvcC"] != nil
++        #expect(configuration.codecName == "HEVC")
++        #expect(hasRecord)
++        #expect(primaries == kCMFormatDescriptionColorPrimaries_ITU_R_2020 as String)
++        #expect(transfer == kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
++        #expect(matrix == kCMFormatDescriptionYCbCrMatrix_ITU_R_2020 as String)
++        #expect(fullRange == false)
++    }
++
++    @Test func issue957TheHDR10ValuesKnownAtOpenGoIntoTheDescription() {
++        let base: NSDictionary = [kCMFormatDescriptionExtension_TransferFunction:
++                                    kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ]
++        let values = HDR10StaticMetadataSEI.Values(
++            masteringDisplay: Self.clip.masteringDisplayColorVolume, contentLightLevel: Self.clip.contentLightLevel)
++        let extensions = HardwareVideoDecoder.extensions(base, carrying: values)
++        let mastering = extensions?[kCMFormatDescriptionExtension_MasteringDisplayColorVolume] as? Data
++        let lightLevel = extensions?[kCMFormatDescriptionExtension_ContentLightLevelInfo] as? Data
++        let transfer = extensions?[kCMFormatDescriptionExtension_TransferFunction] as? String
++        #expect(mastering == Self.clip.masteringDisplayColorVolume)
++        #expect(lightLevel == Self.clip.contentLightLevel)
++        #expect(transfer == kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
++
++        // Nothing known: the description is left as it was.
++        let unchanged = HardwareVideoDecoder.extensions(base, carrying: .none)
++        #expect(unchanged === base)
++    }
++
++    /// Values only a key frame carries also go into the description (a new one, before that key frame
++    /// decodes), or every frame after it would be copied. Many AV1 HDR10 encodes carry them in-band only.
++    @Test func issue957ValuesFoundInAKeyFrameMakeANewDescription() {
++        let full = HDR10StaticMetadataSEI.Values(
++            masteringDisplay: Self.clip.masteringDisplayColorVolume, contentLightLevel: Self.clip.contentLightLevel)
++        let containerCLLOnly = HDR10StaticMetadataSEI.Values(contentLightLevel: Self.clip.contentLightLevel)
++        #expect(HardwareVideoDecoder.needsNewDescription(found: full, described: .none))
++        #expect(HardwareVideoDecoder.needsNewDescription(found: full, described: containerCLLOnly))
++        #expect(!HardwareVideoDecoder.needsNewDescription(found: full, described: full))
++        #expect(!HardwareVideoDecoder.needsNewDescription(found: .none, described: .none))
++
++        // The new description keeps what the old one had and adds what the key frame brought.
++        let opened = HardwareVideoDecoder.extensions(
++            [kCMFormatDescriptionExtension_TransferFunction: kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ],
++            carrying: containerCLLOnly)
++        let rebuilt = HardwareVideoDecoder.extensions(opened, carrying: full)
++        #expect(rebuilt?[kCMFormatDescriptionExtension_MasteringDisplayColorVolume] as? Data
++                == Self.clip.masteringDisplayColorVolume)
++        #expect(rebuilt?[kCMFormatDescriptionExtension_ContentLightLevelInfo] as? Data == Self.clip.contentLightLevel)
++        #expect(rebuilt?[kCMFormatDescriptionExtension_TransferFunction] as? String
++                == kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ as String)
++    }
++}
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/FormatDescriptionFollowsHDR10MetadataTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/FormatDescriptionFollowsHDR10MetadataTests.swift
+new file mode 100644
+index 0000000..ea5fdad
+--- /dev/null
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/FormatDescriptionFollowsHDR10MetadataTests.swift
+@@ -0,0 +1,58 @@
++import Foundation
++import Testing
++import CoreMedia
++import CoreVideo
++@testable import AetherEngine
++
++/// AE#957: the renderer reuses its format description while the frames look the same, and the
++/// description snapshots the frame's HDR10 static metadata. So a change of that metadata at the same
++/// size and colour (a stream whose first frames carry none, or values that change) must make a new
++/// description, or the display layer keeps seeing the first frame's values.
++@Suite("Format description follows HDR10 static metadata")
++struct FormatDescriptionFollowsHDR10MetadataTests {
++
++    private func frame(cll: [UInt8]?) throws -> CVPixelBuffer {
++        var pb: CVPixelBuffer?
++        CVPixelBufferCreate(kCFAllocatorDefault, 64, 36, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
++                            [kCVPixelBufferIOSurfacePropertiesKey: NSDictionary()] as NSDictionary, &pb)
++        let buffer = try #require(pb)
++        CVBufferSetAttachment(buffer, kCVImageBufferColorPrimariesKey, kCVImageBufferColorPrimaries_ITU_R_2020,
++                              .shouldPropagate)
++        CVBufferSetAttachment(buffer, kCVImageBufferTransferFunctionKey,
++                              kCVImageBufferTransferFunction_SMPTE_ST_2084_PQ, .shouldPropagate)
++        CVBufferSetAttachment(buffer, kCVImageBufferYCbCrMatrixKey, kCVImageBufferYCbCrMatrix_ITU_R_2020,
++                              .shouldPropagate)
++        if let cll {
++            CVBufferSetAttachment(buffer, kCVImageBufferContentLightLevelInfoKey, Data(cll) as CFData,
++                                  .shouldPropagate)
++        }
++        return buffer
++    }
++
++    private func cll(_ sample: CMSampleBuffer) -> Data? {
++        guard let desc = CMSampleBufferGetFormatDescription(sample) else { return nil }
++        return CMFormatDescriptionGetExtension(
++            desc, extensionKey: kCMFormatDescriptionExtension_ContentLightLevelInfo) as? Data
++    }
++
++    @Test
++    @MainActor
++    func issue957AChangedContentLightLevelMakesANewDescription() throws {
++        let renderer = SampleBufferRenderer()
++        let none = try #require(renderer.createSampleBuffer(from: frame(cll: nil), pts: CMTime(value: 0, timescale: 24)))
++        #expect(cll(none) == nil)
++
++        let a = try #require(renderer.createSampleBuffer(from: frame(cll: [0x01, 0x59, 0x00, 0x7B]),
++                                                         pts: CMTime(value: 1, timescale: 24)))
++        #expect(cll(a) == Data([0x01, 0x59, 0x00, 0x7B]))
++
++        let b = try #require(renderer.createSampleBuffer(from: frame(cll: [0x0F, 0xA0, 0x03, 0xE8]),
++                                                         pts: CMTime(value: 2, timescale: 24)))
++        #expect(cll(b) == Data([0x0F, 0xA0, 0x03, 0xE8]))
++
++        // The same values again reuse the description: the cache still works.
++        let again = try #require(renderer.createSampleBuffer(from: frame(cll: [0x0F, 0xA0, 0x03, 0xE8]),
++                                                             pts: CMTime(value: 3, timescale: 24)))
++        #expect(CMSampleBufferGetFormatDescription(again) === CMSampleBufferGetFormatDescription(b))
++    }
++}
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/HDR10MetadataFromAV1AndDecodedFramesTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/HDR10MetadataFromAV1AndDecodedFramesTests.swift
+new file mode 100644
+index 0000000..3e2768a
+--- /dev/null
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/HDR10MetadataFromAV1AndDecodedFramesTests.swift
+@@ -0,0 +1,115 @@
++import Foundation
++import CoreVideo
++import AetherLibavutil
++import Testing
++@testable import AetherEngine
++
++/// AE#957: HDR10 static metadata on the software path's other routes. Hardware AV1 (VideoToolbox) reads it
++/// from the stream's metadata OBUs; the libavcodec decoder (dav1d AV1, VP9, H.264 High 10, HEVC Rext) reads it
++/// from each decoded frame's side data. Both give Core Video's byte layout, the one HEVC's SEI already has.
++@Suite("HDR10 metadata from AV1 OBUs and decoded frames (AE#957)")
++struct HDR10MetadataFromAV1AndDecodedFramesTests {
++
++    private static let clip = HDR10StaticMetadata(maxCLL: 1000, maxFALL: 400, masteringPeakNits: 1000,
++                                                  masteringMinNits: 0.005)
++    private static let expected = HDR10StaticMetadataSEI.Values(
++        masteringDisplay: clip.masteringDisplayColorVolume, contentLightLevel: clip.contentLightLevel)
++
++    /// BT.2020 red, green, blue, then D65, as x, y pairs.
++    private static let chromaticities: [Double] = [0.708, 0.292, 0.170, 0.797, 0.131, 0.046, 0.3127, 0.3290]
++
++    private static func bigEndian(_ value: UInt32, bytes: Int) -> [UInt8] {
++        (0 ..< bytes).reversed().map { UInt8((value >> (8 * UInt32($0))) & 0xFF) }
++    }
++
++    /// A metadata OBU with its size, then the trailing bits.
++    private static func metadataOBU(type: UInt8, _ body: [UInt8]) -> [UInt8] {
++        let payload = [type] + body + [0x80]
++        return [5 << 3 | 2, UInt8(payload.count)] + payload
++    }
++
++    private static var cllOBU: [UInt8] { metadataOBU(type: 1, bigEndian(1000, bytes: 2) + bigEndian(400, bytes: 2)) }
++
++    private static var mdcvOBU: [UInt8] {
++        var body: [UInt8] = []
++        for value in chromaticities { body += bigEndian(UInt32((value * 65_536).rounded()), bytes: 2) }
++        body += bigEndian(UInt32(1000 * 256), bytes: 4) // 24.8 fixed point
++        body += bigEndian(UInt32((0.005 * 16_384).rounded()), bytes: 4) // 18.14 fixed point
++        return metadataOBU(type: 2, body)
++    }
++
++    private static let temporalDelimiter: [UInt8] = [2 << 3 | 2, 0]
++    private static let frameOBU: [UInt8] = [6 << 3 | 2, 3, 0x10, 0x20, 0x30]
++
++    private static func scan(_ bytes: [UInt8]) -> HDR10StaticMetadataSEI.Values {
++        bytes.withUnsafeBufferPointer { HDR10StaticMetadataSEI.scanAV1($0.baseAddress!, size: $0.count) }
++    }
++
++    @Test func issue957AV1MetadataOBUsGiveCoreVideosLayout() {
++        let found = Self.scan(Self.temporalDelimiter + Self.cllOBU + Self.mdcvOBU + Self.frameOBU)
++        #expect(found == Self.expected)
++    }
++
++    @Test func issue957AV1ConfigRecordOBUsAreRead() {
++        let record: [UInt8] = [0x81, 0x0C, 0x00, 0x00] + Self.mdcvOBU + Self.cllOBU
++        let found = record.withUnsafeBufferPointer {
++            HDR10StaticMetadataSEI.scanAV1ConfigRecord($0.baseAddress!, size: $0.count)
++        }
++        #expect(found == Self.expected)
++        let notARecord = [UInt8](repeating: 0, count: 8)
++        let none = notARecord.withUnsafeBufferPointer {
++            HDR10StaticMetadataSEI.scanAV1ConfigRecord($0.baseAddress!, size: $0.count)
++        }
++        #expect(none == .none)
++    }
++
++    @Test func issue957AMalformedAV1TemporalUnitKeepsWhatWasRead() {
++        // An OBU that declares more bytes than the packet holds ends the walk.
++        let overrun = Self.scan(Self.cllOBU + [5 << 3 | 2, 0x7F, 0x02, 0x00])
++        #expect(overrun == HDR10StaticMetadataSEI.Values(contentLightLevel: Self.expected.contentLightLevel))
++        // A short MDCV and a set forbidden bit yield nothing.
++        #expect(Self.scan(Self.metadataOBU(type: 2, [0x01, 0x02])) == .none)
++        #expect(Self.scan([0x80] + Self.cllOBU) == .none)
++    }
++
++    @Test func issue957ADecodedFramesSideDataGivesCoreVideosLayout() throws {
++        var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
++        defer { av_frame_free(&frame) }
++        let decoded = try #require(frame)
++        #expect(HDR10StaticMetadataSEI.fromFrameSideData(decoded) == .none)
++
++        // libdav1d's units: 0.16 fixed point chromaticity, 24.8 and 18.14 fixed point luminance.
++        let mastering = try #require(av_mastering_display_metadata_create_side_data(decoded))
++        func q(_ value: Double, _ den: Int32) -> AVRational {
++            AVRational(num: Int32((value * Double(den)).rounded()), den: den)
++        }
++        let c = Self.chromaticities.map { q($0, 1 << 16) }
++        mastering.pointee.display_primaries = ((c[0], c[1]), (c[2], c[3]), (c[4], c[5]))
++        mastering.pointee.white_point = (c[6], c[7])
++        mastering.pointee.max_luminance = q(1000, 1 << 8)
++        mastering.pointee.min_luminance = q(0.005, 1 << 14)
++        mastering.pointee.has_primaries = 1
++        mastering.pointee.has_luminance = 1
++        let lightLevel = try #require(av_content_light_metadata_create_side_data(decoded))
++        lightLevel.pointee.MaxCLL = 1000
++        lightLevel.pointee.MaxFALL = 400
++
++        #expect(HDR10StaticMetadataSEI.fromFrameSideData(decoded) == Self.expected)
++    }
++
++    @Test func issue957TheSoftwareDecoderSetsAndClearsTheHDR10Keys() throws {
++        var buffer: CVPixelBuffer?
++        CVPixelBufferCreate(kCFAllocatorDefault, 16, 16, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange, nil, &buffer)
++        let pb = try #require(buffer)
++        SoftwareVideoDecoder.setHDR10(Self.expected, on: pb)
++        let mastering = CVBufferCopyAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data
++        let lightLevel = CVBufferCopyAttachment(pb, kCVImageBufferContentLightLevelInfoKey, nil) as? Data
++        #expect(mastering == Self.expected.masteringDisplay)
++        #expect(lightLevel == Self.expected.contentLightLevel)
++
++        // A reused pool buffer for a frame with no values keeps none of the last frame's.
++        SoftwareVideoDecoder.setHDR10(.none, on: pb)
++        #expect(CVBufferCopyAttachment(pb, kCVImageBufferMasteringDisplayColorVolumeKey, nil) == nil)
++        #expect(CVBufferCopyAttachment(pb, kCVImageBufferContentLightLevelInfoKey, nil) == nil)
++    }
++}
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/SoftwarePathCarriesStreamHDR10MetadataTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/SoftwarePathCarriesStreamHDR10MetadataTests.swift
+new file mode 100644
+index 0000000..8842aed
+--- /dev/null
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/SoftwarePathCarriesStreamHDR10MetadataTests.swift
+@@ -0,0 +1,196 @@
++import Foundation
++import CoreVideo
++import AetherLibavcodec
++import AetherLibavutil
++import Testing
++@testable import AetherEngine
++
++/// AE#957: VideoToolbox attaches no HDR10 static metadata to the frames it decodes, so the software path
++/// sent HDR10 with none. The hardware decoder now finds the stream's values (container, `hvcC` or SEI)
++/// and the output normalizer attaches them to every frame.
++@Suite("Software path carries the stream's HDR10 metadata (AE#957)")
++struct SoftwarePathCarriesStreamHDR10MetadataTests {
++
++    /// A typical x265 HDR10 encode: BT.2020 at 1000 nit, minimum 0.005, MaxCLL 1000 / 400.
++    private static let clip = HDR10StaticMetadata(maxCLL: 1000, maxFALL: 400, masteringPeakNits: 1000,
++                                                  masteringMinNits: 0.005)
++
++    /// A prefix SEI NAL (no start code or length) with both messages, emulation prevention applied: the
++    /// minimum luminance (50 = 00 00 00 32) needs it, as in every real HDR10 stream.
++    private static func seiNAL(_ m: HDR10StaticMetadata = clip) -> [UInt8] {
++        var rbsp: [UInt8] = [137, 24] + [UInt8](m.masteringDisplayColorVolume)
++        rbsp += [144, 4] + [UInt8](m.contentLightLevel)
++        rbsp.append(0x80)
++        var escaped: [UInt8] = [39 << 1, 1]
++        var zeros = 0
++        for byte in rbsp {
++            if zeros >= 2, byte <= 3 { escaped.append(3); zeros = 0 }
++            escaped.append(byte)
++            zeros = byte == 0 ? zeros + 1 : 0
++        }
++        return escaped
++    }
++
++    private static func lengthPrefixed(_ nal: [UInt8], size: Int) -> [UInt8] {
++        (0 ..< size).reversed().map { UInt8((nal.count >> (8 * $0)) & 0xFF) } + nal
++    }
++
++    private func scan(_ bytes: [UInt8], framing: A53SEIParser.NALFraming) -> HDR10StaticMetadataSEI.Values {
++        bytes.withUnsafeBufferPointer {
++            HDR10StaticMetadataSEI.scan($0.baseAddress!, size: $0.count, codec: .hevc, framing: framing)
++        }
++    }
++
++    @Test func issue957TheSEIInAKeyFrameGivesCoreVideosBytes() {
++        let expected = HDR10StaticMetadataSEI.Values(
++            masteringDisplay: Self.clip.masteringDisplayColorVolume, contentLightLevel: Self.clip.contentLightLevel)
++        // An access unit: an AUD, the SEI, a slice.
++        let aud: [UInt8] = [35 << 1, 1, 0x50]
++        let slice: [UInt8] = [19 << 1, 1, 0xAF, 0x00, 0x11]
++        let annexB: [UInt8] = [0, 0, 0, 1] + aud + [0, 0, 1] + Self.seiNAL() + [0, 0, 1] + slice
++        let fromAnnexB = scan(annexB, framing: .annexB)
++        #expect(fromAnnexB == expected)
++        let mp4 = [aud, Self.seiNAL(), slice].flatMap { Self.lengthPrefixed($0, size: 4) }
++        let fromMP4 = scan(mp4, framing: .lengthPrefixed(size: 4))
++        #expect(fromMP4 == expected)
++    }
++
++    @Test func issue957APacketWithoutTheSEIGivesNothing() {
++        let slice: [UInt8] = [19 << 1, 1, 0xAF, 0x00, 0x11]
++        let fromSlice = scan(Self.lengthPrefixed(slice, size: 4), framing: .lengthPrefixed(size: 4))
++        #expect(fromSlice.isEmpty)
++        // A truncated message is skipped, not read past its end.
++        let cut = Array(Self.seiNAL().prefix(12))
++        let fromCut = scan(Self.lengthPrefixed(cut, size: 4), framing: .lengthPrefixed(size: 4))
++        #expect(fromCut.isEmpty)
++    }
++
++    @Test func issue957TheHvcCSEIArrayIsRead() {
++        let sei = Self.seiNAL()
++        var record = [UInt8](repeating: 0, count: 23)
++        record[0] = 1
++        record[22] = 2
++        let vps: [UInt8] = [32 << 1, 1, 0x0C]
++        let vpsArray: [UInt8] = [0x80 | 32, 0, 1, 0, UInt8(vps.count)]
++        let seiArray: [UInt8] = [39, 0, 1, UInt8(sei.count >> 8), UInt8(sei.count & 0xFF)]
++        record += vpsArray + vps
++        record += seiArray + sei
++        let found = record.withUnsafeBufferPointer {
++            HDR10StaticMetadataSEI.scanHEVCConfigRecord($0.baseAddress!, size: $0.count)
++        }
++        #expect(found.masteringDisplay == Self.clip.masteringDisplayColorVolume)
++        #expect(found.contentLightLevel == Self.clip.contentLightLevel)
++        // A record cut inside its arrays gives nothing rather than a guess.
++        let cut = Array(record.dropLast(10))
++        let fromCut = cut.withUnsafeBufferPointer {
++            HDR10StaticMetadataSEI.scanHEVCConfigRecord($0.baseAddress!, size: $0.count)
++        }
++        #expect(fromCut.isEmpty)
++    }
++
++    @Test func issue957TheContainersDeclarationMatchesTheSEIBytes() throws {
++        let codecpar = try #require(avcodec_parameters_alloc())
++        defer { var p: UnsafeMutablePointer<AVCodecParameters>? = codecpar; avcodec_parameters_free(&p) }
++        let mdcv = try #require(av_packet_side_data_new(
++            &codecpar.pointee.coded_side_data, &codecpar.pointee.nb_coded_side_data,
++            AV_PKT_DATA_MASTERING_DISPLAY_METADATA, MemoryLayout<AVMasteringDisplayMetadata>.size, 0))
++        try #require(mdcv.pointee.data).withMemoryRebound(to: AVMasteringDisplayMetadata.self, capacity: 1) {
++            func q(_ v: Int32) -> AVRational { AVRational(num: v, den: 50_000) }
++            // FFmpeg's order: red, green, blue.
++            $0.pointee.display_primaries = ((q(35400), q(14600)), (q(8500), q(39850)), (q(6550), q(2300)))
++            $0.pointee.white_point = (q(15635), q(16450))
++            $0.pointee.max_luminance = AVRational(num: 1000, den: 1)
++            $0.pointee.min_luminance = AVRational(num: 50, den: 10_000)
++            $0.pointee.has_primaries = 1
++            $0.pointee.has_luminance = 1
++        }
++        let cll = try #require(av_packet_side_data_new(
++            &codecpar.pointee.coded_side_data, &codecpar.pointee.nb_coded_side_data,
++            AV_PKT_DATA_CONTENT_LIGHT_LEVEL, MemoryLayout<AVContentLightMetadata>.size, 0))
++        try #require(cll.pointee.data).withMemoryRebound(to: AVContentLightMetadata.self, capacity: 1) {
++            $0.pointee.MaxCLL = 1000
++            $0.pointee.MaxFALL = 400
++        }
++        let found = HDR10StaticMetadataSEI.fromCodedSideData(codecpar)
++        #expect(found.masteringDisplay == Self.clip.masteringDisplayColorVolume)
++        #expect(found.contentLightLevel == Self.clip.contentLightLevel)
++    }
++
++    @Test func issue957AHalfFilledContainerVolumeIsNotUsed() {
++        var m = AVMasteringDisplayMetadata()
++        m.max_luminance = AVRational(num: 1000, den: 1)
++        m.has_luminance = 1
++        #expect(HDR10StaticMetadataSEI.masteringDisplay(m) == nil)
++    }
++
++    @Test func issue957TheNormalizerAttachesTheValuesToEveryFrame() throws {
++        let values = HDR10StaticMetadataSEI.Values(
++            masteringDisplay: Self.clip.masteringDisplayColorVolume, contentLightLevel: Self.clip.contentLightLevel)
++        let normalizer = VideoToolboxOutputMetadataNormalizer()
++        func frame() throws -> CVPixelBuffer {
++            var buffer: CVPixelBuffer?
++            CVPixelBufferCreate(kCFAllocatorDefault, 16, 16, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
++                                [kCVPixelBufferIOSurfacePropertiesKey: NSDictionary()] as NSDictionary, &buffer)
++            return try #require(buffer)
++        }
++        func attached(_ b: CVPixelBuffer) -> [Data?] {
++            [CVBufferCopyAttachment(b, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data,
++             CVBufferCopyAttachment(b, kCVImageBufferContentLightLevelInfoKey, nil) as? Data]
++        }
++        let both: [Data?] = [values.masteringDisplay, values.contentLightLevel]
++        let neither: [Data?] = [nil, nil]
++        func normalize(_ b: CVPixelBuffer, modifiable: Bool) -> CVPixelBuffer {
++            normalizer.applyingOutputMetadata(to: b, isModifiable: modifiable, colorPrimaries: nil,
++                transferFunction: nil, yCbCrMatrix: nil, pixelAspectRatio: nil, hdr10: values)
++        }
++
++        // Decoder-owned (immutable) output: the values go on an owned copy, the original is untouched.
++        let owned = try frame()
++        let copy = normalize(owned, modifiable: false)
++        #expect(copy !== owned)
++        #expect(attached(owned) == neither)
++        #expect(attached(copy) == both)
++
++        // Modifiable output gets them in place; a frame that already carries them passes unchanged.
++        let modifiable = try frame()
++        #expect(normalize(modifiable, modifiable: true) === modifiable)
++        #expect(attached(modifiable) == both)
++        #expect(normalize(modifiable, modifiable: false) === modifiable)
++
++        // No values known: the frame is left as it is.
++        let plain = try frame()
++        let untouched = normalizer.applyingOutputMetadata(to: plain, isModifiable: false, colorPrimaries: nil,
++            transferFunction: nil, yCbCrMatrix: nil, pixelAspectRatio: nil)
++        #expect(untouched === plain)
++    }
++
++    /// A value the frame already carries is the decoder's own and stays: only a missing key is filled, and a
++    /// frame with both keys is not copied, whatever values they hold.
++    @Test func issue957AFrameThatCarriesItsOwnValuesKeepsThem() throws {
++        let values = HDR10StaticMetadataSEI.Values(
++            masteringDisplay: Self.clip.masteringDisplayColorVolume, contentLightLevel: Self.clip.contentLightLevel)
++        let own = HDR10StaticMetadata(maxCLL: 4000, maxFALL: 1000, masteringPeakNits: 4000,
++                                      masteringMinNits: 0.005).masteringDisplayColorVolume
++        var created: CVPixelBuffer?
++        CVPixelBufferCreate(kCFAllocatorDefault, 16, 16, kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
++                            [kCVPixelBufferIOSurfacePropertiesKey: NSDictionary()] as NSDictionary, &created)
++        let frame = try #require(created)
++        CVBufferSetAttachment(frame, kCVImageBufferMasteringDisplayColorVolumeKey, own as CFData, .shouldPropagate)
++        let normalizer = VideoToolboxOutputMetadataNormalizer()
++        func normalize(modifiable: Bool) -> CVPixelBuffer {
++            normalizer.applyingOutputMetadata(to: frame, isModifiable: modifiable, colorPrimaries: nil,
++                transferFunction: nil, yCbCrMatrix: nil, pixelAspectRatio: nil, hdr10: values)
++        }
++
++        let inPlace = normalize(modifiable: true)
++        let mastering = CVBufferCopyAttachment(frame, kCVImageBufferMasteringDisplayColorVolumeKey, nil) as? Data
++        let lightLevel = CVBufferCopyAttachment(frame, kCVImageBufferContentLightLevelInfoKey, nil) as? Data
++        #expect(inPlace === frame)
++        #expect(mastering == own)
++        #expect(lightLevel == Self.clip.contentLightLevel)
++
++        // Both keys present now: a decoder-owned frame passes as it is, no copy.
++        let owned = normalize(modifiable: false)
++        #expect(owned === frame)
++    }
++}

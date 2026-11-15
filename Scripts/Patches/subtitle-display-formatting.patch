@@ -1,0 +1,13 @@
+diff --git a/tvosApp/NuvioTV/Sources/UI/Player/OutlinedSubtitleText.swift b/tvosApp/NuvioTV/Sources/UI/Player/OutlinedSubtitleText.swift
+--- a/tvosApp/NuvioTV/Sources/UI/Player/OutlinedSubtitleText.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/OutlinedSubtitleText.swift
+@@ -37,7 +37,8 @@ struct SubtitleTextAppearance: Equatable {
+ /// the outline drawn behind them.
+ enum SubtitleAttributedText {
+     static func make(plain string: String, appearance: SubtitleTextAppearance) -> NSAttributedString {
+-        NSAttributedString(string: string, attributes: attributes(
++        let displayText = SubtitleCaptionFormatting.formatted(string)
++        return NSAttributedString(string: displayText, attributes: attributes(
+             font: font(size: appearance.fontSize, bold: appearance.bold, italic: false, name: nil,
+                        family: appearance.fontFamily),
+             color: appearance.color,

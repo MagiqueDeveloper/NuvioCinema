@@ -295,7 +295,7 @@ struct AetherPlaybackSubtitleOverlay: View {
 
     private func caption(_ text: String, width: CGFloat) -> some View {
         let size = max(25, width * 0.023) * (captionSize.scale ?? captionStyle.sizeScale)
-        return Text(verbatim: text)
+        return Text(verbatim: SubtitleCaptionFormatting.formatted(text))
             .font(.system(size: size, weight: .medium))
             .foregroundStyle(.white)
             .multilineTextAlignment(.center)

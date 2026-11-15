@@ -47,6 +47,14 @@ actor CinemaImageCache {
         return artwork.image
     }
 
+    func knownMissingURLs(in urls: Set<URL>) -> Set<URL> {
+        let now = Date.now
+        return urls.filter { url in
+            guard let until = missingUntil[url], until > now else { return false }
+            return Self.cached(url) == nil
+        }
+    }
+
     func image(for url: URL) async throws -> CGImage {
         try Task.checkCancellation()
         if let image = Self.cached(url) {

@@ -1,6 +1,9 @@
+import CryptoKit
 import Foundation
 
 struct AddonStream: Identifiable, Sendable {
+    typealias FocusKey = SHA256.Digest
+
     enum Destination: Hashable, Sendable {
         case video(URL), external(URL)
     }
@@ -16,6 +19,7 @@ struct AddonStream: Identifiable, Sendable {
     let subtitles: [AddonSubtitle]
     let destination: Destination
     let requestHeaders: [String: String]
+    var focusKeys: [FocusKey] = []
 
     var prefersAether: Bool {
         guard case .video(let url) = destination else { return false }
@@ -64,6 +68,24 @@ struct AddonStreamResults: Sendable {
     let streams: [AddonStream]
     let failedAddons: Int
     let unsupportedStreams: Int
+
+    func focusKeys(for stream: AddonStream) -> [AddonStream.FocusKey] {
+        // Remember only keys that distinguish this row in the old list. The replacement list
+        // must also contain exactly one match before focus can be restored.
+        stream.focusKeys.filter { uniqueStream(with: $0)?.id == stream.id }
+    }
+
+    func stream(matching focusKeys: [AddonStream.FocusKey]) -> AddonStream? {
+        for key in focusKeys {
+            if let stream = uniqueStream(with: key) { return stream }
+        }
+        return nil
+    }
+
+    private func uniqueStream(with key: AddonStream.FocusKey) -> AddonStream? {
+        let matches = streams.lazy.filter { $0.focusKeys.contains(key) }.prefix(2)
+        return matches.count == 1 ? matches.first : nil
+    }
 }
 
 struct AddonStreams: Sendable {
@@ -159,14 +181,18 @@ struct AddonStreams: Sendable {
                 }
                 let streams = response.streams.compactMap { stream -> AddonStream? in
                     guard let (destination, requestHeaders) = stream.playbackSource else { return nil }
-                    return AddonStream(id: UUID(), addon: provider, name: clean(stream.name) ?? String(localized: "Source"),
-                                       description: clean(stream.description ?? stream.title, limit: 240),
-                                       filename: stream.behaviorHints?.filename,
+                    let name = clean(stream.name)
+                    let description = clean(stream.description ?? stream.title, limit: 240)
+                    return AddonStream(id: UUID(), addon: provider, name: name ?? String(localized: "Source"),
+                                       description: description, filename: stream.behaviorHints?.filename,
                                        videoHash: stream.behaviorHints?.videoHash,
                                        videoSize: stream.behaviorHints?.videoSize,
                                        notWebReady: stream.behaviorHints?.notWebReady == true,
                                        subtitles: stream.subtitles?.compactMap(\.value).filter(\.isHTTPS) ?? [],
-                                       destination: destination, requestHeaders: requestHeaders)
+                                       destination: destination, requestHeaders: requestHeaders,
+                                       focusKeys: stream.focusKeys(providerID: addon.id, destination: destination,
+                                                                    headers: requestHeaders, name: name,
+                                                                    description: description))
                 }
                 unsupported += response.entriesCount - streams.count
                 if !streams.isEmpty { return ProviderResult(streams: streams, unsupported: unsupported) }
@@ -392,6 +418,41 @@ struct AddonStreams: Sendable {
                 return (.external(url), [:])
             }
             return nil
+        }
+
+        func focusKeys(providerID: String, destination: AddonStream.Destination, headers: [String: String],
+                       name: String?, description: String?) -> [AddonStream.FocusKey] {
+            let (type, url): (String, URL)
+            switch destination {
+            case let .video(value): (type, url) = ("video", value)
+            case let .external(value): (type, url) = ("external", value)
+            }
+
+            func key(_ field: String, _ parts: [String]) -> AddonStream.FocusKey {
+                let value = ([providerID, type, field] + parts).map { "\($0.utf8.count):\($0)" }.joined()
+                return SHA256.hash(data: Data(value.utf8))
+            }
+
+            let headerParts = headers.sorted { $0.key < $1.key }.flatMap { [$0.key, $0.value] }
+            var keys = [key("exact", [url.absoluteString] + headerParts)]
+            if let hash = behaviorHints?.videoHash, !hash.isEmpty {
+                keys.append(key("hash", [hash.lowercased()]))
+            }
+            if let filename = behaviorHints?.filename, !filename.isEmpty {
+                let size = behaviorHints?.videoSize.map(String.init) ?? ""
+                keys.append(key("file", [filename, size]))
+            }
+
+            // A fresh signed URL may change its query or its entire path.
+            if var components = URLComponents(url: url, resolvingAgainstBaseURL: false) {
+                components.percentEncodedQuery = nil
+                components.percentEncodedFragment = nil
+                if let address = components.string { keys.append(key("address", [address] + headerParts)) }
+            }
+            if let description {
+                keys.append(key("label", [name ?? "", description]))
+            }
+            return keys
         }
     }
 }

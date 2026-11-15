@@ -1,0 +1,634 @@
+AetherEngine scrub-preview decoder budget and in-flight accounting (AE#1059)
+
+https://github.com/superuser404notfound/AetherEngine/commit/08993d94a240b18f68a386feab3a026a356284cd
+https://github.com/superuser404notfound/AetherEngine/commit/5b48147fd409732ed8e12d6844744a9b666c665f
+
+Close older native segment decoders without invalidating their held stills.
+Serialize budget admission through decode for the shared segment pool and
+reuse the existing serial context-close gate. Keep the host's stronger
+cleanup, playback cancellation, and preview-lane policy.
+
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Live.swift b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Live.swift
+index ab9317d..77c88ea 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Live.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+Live.swift
+@@ -30,7 +30,9 @@ extension AetherEngine {
+         }.value
+         guard let source else { return nil }
+         // Guard against zap/stop clearing the LRU: a stale extractor's segment indices collide with the next channel's.
+-        guard loadGeneration == gen else { return nil }
++        guard loadGeneration == gen, await acquireScrubDecoderTurn() else { return nil }
++        defer { releaseScrubDecoderTurn() }
++        guard loadGeneration == gen, !Task.isCancelled else { return nil }
+         let extractor: FrameExtractor
+         if let idx = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
+             let hit = scrubThumbnailExtractors.remove(at: idx)
+@@ -38,14 +40,17 @@ extension AetherEngine {
+             extractor = hit.extractor
+         } else {
+             guard let reader = source.makeReader() else { return nil }
+-            extractor = FrameExtractor(reader: reader, formatHint: "mp4")
++            extractor = FrameExtractor(scrubThumbnailReader: reader, formatHint: "mp4")
+             scrubThumbnailExtractors.append((source.segmentIndex, extractor))
+             while scrubThumbnailExtractors.count > 2 {
+                 let evicted = scrubThumbnailExtractors.removeFirst()
+-                Task { await evicted.extractor.shutdown() }
++                await evicted.extractor.shutdown()
+             }
+         }
+-        return await extractor.thumbnail(at: outputSeconds, maxWidth: maxWidth)
++        await enforceScrubDecoderBudget(before: extractor)
++        guard loadGeneration == gen, !Task.isCancelled else { return nil }
++        let image = await extractor.thumbnail(at: outputSeconds, maxWidth: maxWidth)
++        return loadGeneration == gen && !Task.isCancelled ? image : nil
+     }
+ 
+     /// 1 Hz timer to update live surfaces while paused (the `$currentTime` sink already covers the playing case).
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+ScrubThumbnail.swift b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+ScrubThumbnail.swift
+index d84bfe5..d90eddf 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+ScrubThumbnail.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine+ScrubThumbnail.swift
+@@ -8,12 +8,94 @@ extension AetherEngine {
+     /// warm; each extractor maps its segment file (audit SEG-2), so the entries hold clean
+     /// file-backed pages rather than heap copies, and the bound remains fixed.
+     nonisolated static let scrubThumbnailExtractorLimit = 6
++    /// Six coded 1920 × 1088 decoders fit. A 4K decoder can retain over 100 MB of reference frames.
++    nonisolated static let scrubDecoderPixelBudget = 6 * 1920 * 1088
++
+     public func clearResidentPreviewFrames() {
+         for entry in scrubThumbnailExtractors {
+             Task { await entry.extractor.clearResidentPreviewCache() }
+         }
+     }
+ 
++    /// Hold admission through the decode, so concurrent requests cannot reserve the same pixels.
++    func acquireScrubDecoderTurn() async -> Bool {
++        let id = UUID()
++        return await withTaskCancellationHandler {
++            await withCheckedContinuation { continuation in
++                guard !Task.isCancelled else {
++                    continuation.resume(returning: false)
++                    return
++                }
++                if scrubDecoderBusy {
++                    scrubDecoderWaiters.append((id, continuation))
++                } else {
++                    scrubDecoderBusy = true
++                    continuation.resume(returning: true)
++                }
++            }
++        } onCancel: {
++            Task { @MainActor in
++                guard let index = self.scrubDecoderWaiters.firstIndex(where: { $0.id == id }) else { return }
++                self.scrubDecoderWaiters.remove(at: index).continuation.resume(returning: false)
++            }
++        }
++    }
++
++    func releaseScrubDecoderTurn() {
++        if scrubDecoderWaiters.isEmpty {
++            scrubDecoderBusy = false
++        } else {
++            scrubDecoderWaiters.removeFirst().continuation.resume(returning: true)
++        }
++    }
++
++    /// Leave room for the incoming decoder before it opens. A submitted decode can still be
++    /// opening, so count it at the known source size until its queue reports the actual area.
++    func enforceScrubDecoderBudget(before incoming: FrameExtractor) async {
++        let extractors = scrubThumbnailExtractors.map(\.extractor)
++        var estimates: [Int?] = []
++        let sourceArea = max(0, Int(sourceVideoWidth)) * max(0, Int(sourceVideoHeight))
++        var largest = sourceArea
++        var incomingArea = 0
++        for extractor in extractors {
++            let state = await extractor.decoderBudgetState
++            largest = max(largest, state.known)
++            if extractor === incoming {
++                incomingArea = state.known
++                estimates.append(nil)
++            } else {
++                estimates.append(state.estimatedOpen)
++            }
++        }
++        let estimatedArea = largest > 0 ? largest : Self.scrubDecoderPixelBudget
++        let areas = estimates.map { estimate in
++            estimate.map { $0 > 0 ? $0 : estimatedArea } ?? 0
++        }
++        let released = Self.scrubDecodersToRelease(newestLast: areas,
++                                                   incomingArea: incomingArea > 0 ? max(incomingArea, sourceArea) : estimatedArea)
++        await withTaskGroup(of: Void.self) { group in
++            for index in released {
++                let extractor = extractors[index]
++                group.addTask { await extractor.releaseDecoder() }
++            }
++        }
++    }
++
++    /// Open areas in LRU order, with zero for a closed decoder. Keep the newest ones that fit.
++    nonisolated static func scrubDecodersToRelease(newestLast areas: [Int], incomingArea: Int,
++                                                   budget: Int = scrubDecoderPixelBudget) -> [Int] {
++        var used = incomingArea
++        var released: [Int] = []
++        for index in areas.indices.reversed() where areas[index] > 0 {
++            if areas[index] > budget - used {
++                released.append(index)
++            } else {
++                used += areas[index]
++            }
++        }
++        return released
++    }
++
+     /// Timestamped production preview. All reads come from existing resident
+     /// bytes; a missing target never opens a second connection or seeks playback.
+     public func scrubPreviewFrame(atSeconds seconds: Double, refined: Bool, maxWidth: Int = 320,
+@@ -52,15 +134,18 @@ extension AetherEngine {
+             return await ladderPreviewFrame(session: session, outputSeconds: output, planOrigin: planOrigin,
+                                             maxWidth: maxWidth, generation: gen, isCancelled: isCancelled)
+         }
+-        guard let carried = source.carriedOffset else { return nil }
++        guard let carried = source.carriedOffset, await acquireScrubDecoderTurn() else { return nil }
++        defer { releaseScrubDecoderTurn() }
++        guard gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+         let extractor: FrameExtractor
+         if let index = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
+             let hit = scrubThumbnailExtractors.remove(at: index)
+             if hit.extractor.residentIdentity == source.identity {
+                 scrubThumbnailExtractors.append(hit); extractor = hit.extractor
+             } else {
+-                Task { await hit.extractor.shutdown() }
+-                guard let reader = source.makeReader() else { return nil }
++                await hit.extractor.shutdown()
++                guard gen == loadGeneration, !Task.isCancelled, !isCancelled(),
++                      let reader = source.makeReader() else { return nil }
+                 extractor = FrameExtractor(residentReader: reader, formatHint: "mp4", identity: source.identity)
+                 scrubThumbnailExtractors.append((source.segmentIndex, extractor))
+             }
+@@ -68,8 +153,10 @@ extension AetherEngine {
+             guard let reader = source.makeReader() else { return nil }
+             extractor = FrameExtractor(residentReader: reader, formatHint: "mp4", identity: source.identity)
+             scrubThumbnailExtractors.append((source.segmentIndex, extractor))
+-            trimScrubThumbnailExtractors()
++            await trimScrubThumbnailExtractors()
+         }
++        await enforceScrubDecoderBudget(before: extractor)
++        guard gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+         guard let frame = await extractor.residentPreview(rawTarget: live ? output : sourceTarget - carried,
+                     refined: refined, maxWidth: maxWidth, isCancelled: isCancelled),
+               gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+@@ -96,6 +183,9 @@ extension AetherEngine {
+             session.stillLadderFrame(atSeconds: outputSeconds)
+         }.value
+         guard let rung, gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
++        guard await acquireScrubDecoderTurn() else { return nil }
++        defer { releaseScrubDecoderTurn() }
++        guard gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+         let key = Self.ladderStillKey(segmentIndex: rung.segmentIndex)
+         let extractor: FrameExtractor
+         if let index = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == key }) {
+@@ -106,8 +196,10 @@ extension AetherEngine {
+             extractor = FrameExtractor(residentReader: rung.makeReader(), formatHint: "mp4",
+                                        identity: "ladder:\(rung.segmentIndex)")
+             scrubThumbnailExtractors.append((key, extractor))
+-            trimScrubThumbnailExtractors()
++            await trimScrubThumbnailExtractors()
+         }
++        await enforceScrubDecoderBudget(before: extractor)
++        guard gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+         guard let frame = await extractor.residentPreview(rawTarget: 0, refined: false, maxWidth: maxWidth,
+                                                           isCancelled: isCancelled),
+               gen == loadGeneration, !Task.isCancelled, !isCancelled() else { return nil }
+@@ -186,7 +278,9 @@ extension AetherEngine {
+         }.value
+         // Guard against zap/stop clearing the LRU: a stale extractor's segment indices
+         // collide with the next source's.
+-        guard let source, loadGeneration == gen else { return nil }
++        guard let source, loadGeneration == gen, await acquireScrubDecoderTurn() else { return nil }
++        defer { releaseScrubDecoderTurn() }
++        guard loadGeneration == gen, !Task.isCancelled else { return nil }
+         let extractor: FrameExtractor
+         if let idx = scrubThumbnailExtractors.firstIndex(where: { $0.segmentIndex == source.segmentIndex }) {
+             let hit = scrubThumbnailExtractors.remove(at: idx)
+@@ -194,25 +288,30 @@ extension AetherEngine {
+             extractor = hit.extractor
+         } else {
+             guard let reader = source.makeReader() else { return nil }
+-            extractor = FrameExtractor(reader: reader, formatHint: "mp4")
++            extractor = FrameExtractor(scrubThumbnailReader: reader, formatHint: "mp4")
+             scrubThumbnailExtractors.append((source.segmentIndex, extractor))
+-            trimScrubThumbnailExtractors()
++            await trimScrubThumbnailExtractors()
+         }
++        await enforceScrubDecoderBudget(before: extractor)
++        guard loadGeneration == gen, !Task.isCancelled else { return nil }
++        let image: CGImage?
+         if precise {
+-            return await extractor.preciseThumbnail(
++            image = await extractor.preciseThumbnail(
+                 at: max(0, seconds - source.startSeconds),
+                 maxWidth: maxWidth
+             )
++        } else {
++            image = await extractor.thumbnail(at: 0, maxWidth: maxWidth)
+         }
+-        return await extractor.thumbnail(at: 0, maxWidth: maxWidth)
++        return loadGeneration == gen && !Task.isCancelled ? image : nil
+     }
+ 
+     /// Enforce the cache-backed still LRU after a miss. Kept internal so the exact six-entry
+     /// eviction boundary can be pinned without opening a playback session.
+-    func trimScrubThumbnailExtractors() {
++    func trimScrubThumbnailExtractors() async {
+         while scrubThumbnailExtractors.count > Self.scrubThumbnailExtractorLimit {
+             let evicted = scrubThumbnailExtractors.removeFirst()
+-            Task { await evicted.extractor.closeAuxiliaryContext() }
++            await evicted.extractor.closeAuxiliaryContext()
+         }
+     }
+ 
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift
+index 6e63286..2948fdc 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/AetherEngine.swift
+@@ -2002,6 +2002,8 @@ public final class AetherEngine: ObservableObject {
+     /// VOD; a session is one or the other). Reuses open demux/decode contexts across scrubs
+     /// within the same segment; torn down in stopInternal.
+     var scrubThumbnailExtractors: [(segmentIndex: Int, extractor: FrameExtractor)] = []
++    var scrubDecoderBusy = false
++    var scrubDecoderWaiters: [(id: UUID, continuation: CheckedContinuation<Bool, Never>)] = []
+ 
+     // MARK: - Output
+ 
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/FrameExtractor/FrameDecodeContext.swift b/Vendor/AetherEngine/Sources/AetherEngine/FrameExtractor/FrameDecodeContext.swift
+index dd14928..c720cca 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/FrameExtractor/FrameDecodeContext.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/FrameExtractor/FrameDecodeContext.swift
+@@ -53,6 +53,11 @@ final class FrameDecodeContext: @unchecked Sendable {
+     /// this the thumbnail draws square-pixel and looks stretched. Defaults 1:1.
+     private var streamSAR = AVRational(num: 1, den: 1)
+     private(set) var isOpen = false
++    /// Coded pixels in the open decoder. Read only on the serial decode queue.
++    var openDecoderPixelArea: Int {
++        guard isOpen, let codecContext else { return 0 }
++        return max(0, Int(codecContext.pointee.width)) * max(0, Int(codecContext.pointee.height))
++    }
+     /// AE#499: the container's colour declaration, captured at open. `isHDR` below is read off
+     /// exactly this, so a frame whose VUI says nothing has to inherit it or the two disagree: the gate
+     /// switches tone mapping on from the container while zscale reads the frame and finds no path to
+diff --git a/Vendor/AetherEngine/Sources/AetherEngine/FrameExtractor/FrameExtractor.swift b/Vendor/AetherEngine/Sources/AetherEngine/FrameExtractor/FrameExtractor.swift
+index a8fec34..38918a6 100644
+--- a/Vendor/AetherEngine/Sources/AetherEngine/FrameExtractor/FrameExtractor.swift
++++ b/Vendor/AetherEngine/Sources/AetherEngine/FrameExtractor/FrameExtractor.swift
+@@ -56,8 +56,18 @@ public actor FrameExtractor {
+     var isClosingContextForTesting: Bool { isClosingAuxiliaryContext }
+     var isContextOpenForTesting: Bool { context.isOpen }
+ 
+-    private var idleInterval: Duration = .seconds(10)
++    nonisolated static let residentIdleInterval: Duration = .seconds(3)
++    private var idleInterval: Duration
+     private var idleTask: Task<Void, Never>?
++    private var queueJobsInFlight = 0
++    private var nextQueueOrder: UInt64 = 0
++    private var lastReportedQueueOrder: UInt64 = 0
++    private(set) var openDecoderPixelArea = 0
++    private(set) var knownDecoderPixelArea = 0
++    var decoderMayBeOpen: Bool { openDecoderPixelArea > 0 || queueJobsInFlight > 0 }
++    var decoderBudgetState: (known: Int, estimatedOpen: Int?) {
++        (knownDecoderPixelArea, decoderMayBeOpen ? max(openDecoderPixelArea, knownDecoderPixelArea) : nil)
++    }
+     private var residentApproximation: (width: Int, frame: ScrubFrame)?
+     nonisolated let residentIdentity: String?
+     func clearResidentPreviewCache() {
+@@ -108,9 +118,11 @@ public actor FrameExtractor {
+     }
+ 
+     private init(context: FrameDecodeContext, yieldWhile: (@Sendable () -> Bool)?, residentIdentity: String? = nil,
++                 idleInterval: Duration = .seconds(10),
+                  beforeContextCloseForTesting: (@Sendable () -> Void)? = nil) {
+         self.context = context
+         self.residentIdentity = residentIdentity
++        self.idleInterval = idleInterval
+         self.yieldWhile = yieldWhile
+         self.beforeContextCloseForTesting = beforeContextCloseForTesting
+         self.cache = FrameCache(
+@@ -157,7 +169,12 @@ public actor FrameExtractor {
+          residentBudget: Duration = .milliseconds(750)) {
+         self.init(context: FrameDecodeContext(reader: residentReader, formatHint: formatHint,
+                                               residentBudget: residentBudget),
+-                  yieldWhile: nil, residentIdentity: identity)
++                  yieldWhile: nil, residentIdentity: identity, idleInterval: Self.residentIdleInterval)
++    }
++
++    init(scrubThumbnailReader reader: IOReader, formatHint: String) {
++        self.init(context: FrameDecodeContext(reader: reader, formatHint: formatHint),
++                  yieldWhile: nil, idleInterval: Self.residentIdleInterval)
+     }
+ 
+     /// Test-only construction seam for holding the serial queue at context teardown.
+@@ -349,11 +366,6 @@ public actor FrameExtractor {
+             if let task = contextCloseTask { await task.value }
+             return
+         }
+-        if let task = contextCloseTask {
+-            coalescedContextCloseCountForTesting += 1
+-            await task.value
+-            return
+-        }
+         idleTask?.cancel()
+         idleTask = nil
+         currentToken?.cancel()
+@@ -363,6 +375,21 @@ public actor FrameExtractor {
+         cache.clear()
+         residentApproximation = nil
+         admissionGeneration &+= 1
++        if let task = contextCloseTask {
++            coalescedContextCloseCountForTesting += 1
++            await task.value
++            return
++        }
++        let (closeID, task) = startContextClose()
++        await task.value
++        finishContextClose(closeID)
++    }
++
++    /// Retire the decoder under budget pressure, leaving its cached stills available.
++    func releaseDecoder() async {
++        guard !isShutDown, decoderMayBeOpen else { return }
++        idleTask?.cancel()
++        idleTask = nil
+         let (closeID, task) = startContextClose()
+         await task.value
+         finishContextClose(closeID)
+@@ -400,16 +427,12 @@ public actor FrameExtractor {
+         }
+         let closeID = UUID()
+         let context = self.context
+-        let decodeQueue = self.decodeQueue
+         let beforeClose = beforeContextCloseForTesting
+         isClosingAuxiliaryContext = true
+         let task = Task {
+-            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+-                decodeQueue.async {
+-                    beforeClose?()
+-                    context.close()
+-                    continuation.resume()
+-                }
++            await runOnQueue {
++                beforeClose?()
++                context.close()
+             }
+         }
+         contextCloseID = closeID
+@@ -503,11 +526,25 @@ public actor FrameExtractor {
+ 
+     /// Run blocking work on the serial queue, awaiting the result without blocking the actor's executor.
+     private func runOnQueue<T: Sendable>(_ work: @escaping @Sendable () -> T) async -> T {
+-        await withCheckedContinuation { (continuation: CheckedContinuation<T, Never>) in
++        let context = self.context
++        nextQueueOrder &+= 1
++        let order = nextQueueOrder
++        queueJobsInFlight += 1
++        let (result, area) = await withCheckedContinuation {
++            (continuation: CheckedContinuation<(T, Int), Never>) in
+             decodeQueue.async {
+-                continuation.resume(returning: work())
++                let result = work()
++                continuation.resume(returning: (result, context.openDecoderPixelArea))
+             }
+         }
++        queueJobsInFlight -= 1
++        knownDecoderPixelArea = max(knownDecoderPixelArea, area)
++        // The serial decode queue completes in order. Actor continuations may resume out of order.
++        if order > lastReportedQueueOrder {
++            lastReportedQueueOrder = order
++            openDecoderPixelArea = area
++        }
++        return result
+     }
+ 
+     /// Tests that wait for the idle close shorten it, so a starved runner does not spend the
+@@ -523,6 +560,7 @@ public actor FrameExtractor {
+         idleTask = Task { [weak self, idleInterval] in
+             do {
+                 try await Task.sleep(for: idleInterval)
++                guard !Task.isCancelled else { return }
+                 await self?.idleClose()
+             } catch {
+                 // Cancelled before the interval elapsed: nothing to do.
+@@ -532,12 +570,11 @@ public actor FrameExtractor {
+ 
+     /// Transient teardown after idle: closes the context and drops the cache. Unlike
+     /// shutdown() this does NOT set `isShutDown`, so the next request lazily reopens.
+-    private func idleClose() {
++    private func idleClose() async {
+         cache.clear()
+         residentApproximation = nil
+         let context = self.context
+-        // Fire-and-forget: best-effort, no caller awaits it; runOnQueue would block the actor for nothing.
+-        decodeQueue.async { context.close() }
++        await runOnQueue { context.close() }
+     }
+ }
+ 
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/FrameExtractorCancellationTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/FrameExtractorCancellationTests.swift
+index 02112aa..e37d8a4 100644
+--- a/Vendor/AetherEngine/Tests/AetherEngineTests/FrameExtractorCancellationTests.swift
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/FrameExtractorCancellationTests.swift
+@@ -200,7 +200,7 @@ struct FrameExtractorCancellationTests {
+ 
+ /// The production decode queue blocks at a real source operation, while the extractor actor can
+ /// accept a newer request. The condition protects only this one-shot gate; DataIOReader owns its cursor.
+-private final class StillGateReader: IOReader, @unchecked Sendable {
++final class StillGateReader: IOReader, @unchecked Sendable {
+     private let reader: DataIOReader
+     // Short reads let a resident refinement cross the AVIO buffer and reach the real I/O gate.
+     private let maxReadSize: Int32
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/Issue1059ScrubDecoderBudgetTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/Issue1059ScrubDecoderBudgetTests.swift
+new file mode 100644
+index 0000000..5405641
+--- /dev/null
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/Issue1059ScrubDecoderBudgetTests.swift
+@@ -0,0 +1,162 @@
++import Foundation
++import Testing
++@testable import AetherEngine
++
++/// AE#1059: six resident 4K still decoders held about 750 MB on an Apple TV 4K. The engine now
++/// keeps the open decoders inside a pixel budget and lets the host close them when a scrub ends.
++struct Issue1059ScrubDecoderBudgetTests {
++
++    private let uhd = 3840 * 2160
++    private let hd = 1920 * 1080
++
++    @Test("A 1080p LRU stays fully open inside the budget")
++    func hdLRUKeepsEveryDecoder() {
++        let released = AetherEngine.scrubDecodersToRelease(
++            newestLast: Array(repeating: hd, count: 5), incomingArea: hd)
++        #expect(released.isEmpty)
++    }
++
++    @Test("A 4K source keeps only the incoming decoder open")
++    func uhdClosesEveryOlderDecoder() {
++        let released = AetherEngine.scrubDecodersToRelease(
++            newestLast: [uhd, uhd, 0, uhd], incomingArea: uhd)
++        #expect(released.sorted() == [0, 1, 3])
++    }
++
++    @Test("The newest decoder wins when an unknown incoming source leaves room for one")
++    func newestDecoderWinsTheRemainingRoom() {
++        let released = AetherEngine.scrubDecodersToRelease(
++            newestLast: [uhd, uhd], incomingArea: 0)
++        #expect(released == [0])
++    }
++
++    @Test("Releasing a resident decoder keeps its cached still")
++    func releaseKeepsCachedStill() async throws {
++        let extractor = FrameExtractor(
++            residentReader: DataIOReader(data: try LongGOPTransportStreamFixture.data()),
++            formatHint: "mpegts", identity: "release-keeps-cache", residentBudget: .seconds(60))
++        // A loaded runner can take longer than the 3 s resident idle close between two steps.
++        await extractor.setIdleIntervalForTesting(.seconds(600))
++        let first = try #require(await extractor.residentPreview(
++            rawTarget: 2, refined: false, maxWidth: 16, isCancelled: { false }))
++        #expect(await extractor.openDecoderPixelArea > 0)
++
++        await extractor.releaseDecoder()
++        #expect(await extractor.openDecoderPixelArea == 0)
++        #expect(await extractor.knownDecoderPixelArea > 0)
++
++        // The cached approximation answers without reopening the decoder.
++        let again = try #require(await extractor.residentPreview(
++            rawTarget: 2, refined: false, maxWidth: 16, isCancelled: { false }))
++        #expect(again.image === first.image)
++        #expect(await extractor.openDecoderPixelArea == 0)
++
++        // A refined request reopens lazily.
++        #expect(await extractor.residentPreview(
++            rawTarget: 2, refined: true, maxWidth: 16, isCancelled: { false }) != nil)
++        #expect(await extractor.openDecoderPixelArea > 0)
++        await extractor.shutdown()
++    }
++
++    @Test("A decoder still opening is released once its decode finishes")
++    func releaseCoversAFirstOpenInFlight() async throws {
++        let reader = StillGateReader(data: try LongGOPTransportStreamFixture.data())
++        let extractor = FrameExtractor(residentReader: reader, formatHint: "mpegts",
++                                       identity: "release-in-flight", residentBudget: .seconds(60))
++        await extractor.setIdleIntervalForTesting(.seconds(600))
++        reader.arm()
++        let pending = Task {
++            await extractor.residentPreview(rawTarget: 2, refined: false, maxWidth: 16, isCancelled: { false })
++        }
++        defer { reader.release(); pending.cancel() }
++        try await waitFor { reader.isBlocked }
++        #expect(await extractor.openDecoderPixelArea == 0)
++        #expect(await extractor.decoderMayBeOpen)
++
++        let release = Task { await extractor.releaseDecoder() }
++        try await waitFor { await extractor.isClosingContextForTesting }
++        reader.release()
++        _ = await pending.value
++        await release.value
++        #expect(await extractor.openDecoderPixelArea == 0)
++        #expect(await !extractor.decoderMayBeOpen)
++        await extractor.shutdown()
++    }
++
++    private struct GateTimedOut: Error {}
++
++    private func waitFor(_ condition: () async -> Bool) async throws {
++        let deadline = Date().addingTimeInterval(20)
++        while !(await condition()) {
++            guard Date() < deadline else {
++                throw GateTimedOut()
++            }
++            try await Task.sleep(nanoseconds: 10_000_000)
++        }
++    }
++
++    @Test("A second scrub waits for the first decoder and can cancel while queued")
++    @MainActor
++    func serialAdmissionSkipsCancelledWaiter() async throws {
++        let engine = try AetherEngine()
++        try #require(await engine.acquireScrubDecoderTurn())
++        defer { engine.releaseScrubDecoderTurn() }
++
++        let cancelled = Task { await engine.acquireScrubDecoderTurn() }
++        defer { cancelled.cancel() }
++        for _ in 0..<200 where engine.scrubDecoderWaiters.isEmpty {
++            try await Task.sleep(for: .milliseconds(10))
++        }
++        try #require(engine.scrubDecoderWaiters.count == 1)
++        cancelled.cancel()
++        #expect(await !cancelled.value)
++        #expect(engine.scrubDecoderBusy)
++
++        let next = Task { await engine.acquireScrubDecoderTurn() }
++        defer { next.cancel() }
++        for _ in 0..<200 where engine.scrubDecoderWaiters.isEmpty {
++            try await Task.sleep(for: .milliseconds(10))
++        }
++        try #require(engine.scrubDecoderWaiters.count == 1)
++
++        engine.releaseScrubDecoderTurn()
++        #expect(await next.value)
++        #expect(engine.scrubDecoderBusy)
++    }
++
++    @Test("The budget closes older decoders before a new one opens")
++    @MainActor
++    func budgetClosesOlderDecodersBeforeIncoming() async throws {
++        let engine = try AetherEngine()
++        let data = try LongGOPTransportStreamFixture.data()
++        var extractors: [FrameExtractor] = []
++        for segmentIndex in 0..<3 {
++            let extractor = FrameExtractor(residentReader: DataIOReader(data: data), formatHint: "mpegts",
++                                           identity: "budget-\(segmentIndex)", residentBudget: .seconds(60))
++            await extractor.setIdleIntervalForTesting(.seconds(600))
++            #expect(await extractor.residentPreview(
++                rawTarget: 2, refined: false, maxWidth: 16, isCancelled: { false }) != nil)
++            engine.scrubThumbnailExtractors.append((segmentIndex, extractor))
++            extractors.append(extractor)
++        }
++        let area = await extractors[0].openDecoderPixelArea
++        #expect(area > 0)
++        // The fixture is small, so it fits six times over. A budget of two of its decoders has to
++        // close the oldest one, and the incoming one counts at its known size.
++        let states = await [extractors[0].openDecoderPixelArea, extractors[1].openDecoderPixelArea, 0]
++        #expect(AetherEngine.scrubDecodersToRelease(newestLast: states, incomingArea: area,
++                                                    budget: 2 * area) == [0])
++
++        await engine.enforceScrubDecoderBudget(before: extractors[2])
++        // Inside the real budget nothing closes.
++        for extractor in extractors { #expect(await extractor.openDecoderPixelArea > 0) }
++
++        engine.scrubThumbnailExtractors.removeAll()
++        for extractor in extractors { await extractor.shutdown() }
++    }
++
++    @Test("Resident extractors close idle decoders after three seconds")
++    func residentIdleIntervalIsShort() {
++        #expect(FrameExtractor.residentIdleInterval == .seconds(3))
++    }
++}
+diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/ScrubThumbnailExtractorLRUTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/ScrubThumbnailExtractorLRUTests.swift
+index 1e8f486..2efae3e 100644
+--- a/Vendor/AetherEngine/Tests/AetherEngineTests/ScrubThumbnailExtractorLRUTests.swift
++++ b/Vendor/AetherEngine/Tests/AetherEngineTests/ScrubThumbnailExtractorLRUTests.swift
+@@ -14,13 +14,13 @@ struct ScrubThumbnailExtractorLRUTests {
+                 FrameExtractor(reader: DataIOReader(data: Data()), formatHint: "mp4")))
+         }
+ 
+-        engine.trimScrubThumbnailExtractors()
++        await engine.trimScrubThumbnailExtractors()
+         #expect(engine.scrubThumbnailExtractors.map { $0.segmentIndex } == Array(0..<6))
+ 
+         engine.scrubThumbnailExtractors.append((
+             6,
+             FrameExtractor(reader: DataIOReader(data: Data()), formatHint: "mp4")))
+-        engine.trimScrubThumbnailExtractors()
++        await engine.trimScrubThumbnailExtractors()
+         #expect(engine.scrubThumbnailExtractors.map { $0.segmentIndex } == Array(1...6))
+ 
+         let retained = engine.scrubThumbnailExtractors.map { $0.extractor }
