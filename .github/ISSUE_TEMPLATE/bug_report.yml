@@ -1,0 +1,73 @@
+name: Bug report
+description: Report a problem with Nuvio Cinema.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search the [open issues](https://github.com/MagiqueDeveloper/NuvioCinema/issues) for an existing report. If you find a match, add any new details there.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Where did you see the issue?
+      options:
+        - Home or Search
+        - Title details or Siri Remote navigation
+        - Playback or subtitles
+        - Account linking or sync
+        - Apple TV Top Shelf
+        - Build, install, or signing
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Start with the screen or action that leads to the problem. Include your remote inputs if focus or navigation is involved.
+      placeholder: |
+        1. Open ...
+        2. Select ...
+        3. Press ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: behavior
+    attributes:
+      label: What happened?
+      description: Describe what you saw, what you expected, and whether it happens every time.
+    validations:
+      required: true
+
+  - type: input
+    id: app-version
+    attributes:
+      label: Nuvio Cinema version or commit
+      description: Enter the IPA version or the commit you built from.
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Device and software version
+      description: Include the Apple TV model or simulator and tvOS version. For build errors, include the Xcode version and tvOS SDK. For install or Top Shelf issues, include the signing method if known.
+      placeholder: Apple TV 4K (3rd generation), tvOS 26.0
+    validations:
+      required: true
+
+  - type: input
+    id: playback
+    attributes:
+      label: Playback details
+      description: For playback or subtitle issues, include the player backend if you know it and any error message or HTTP status.
+      placeholder: AetherEngine, HTTP 403 when opening the source
+
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Logs or screenshots
+      description: Share any relevant logs or images. Remove account details, pairing codes, tokens, and private add-on or stream URLs before posting.

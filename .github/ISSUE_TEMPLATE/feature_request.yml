@@ -1,0 +1,25 @@
+name: Feature request
+description: Suggest a feature or improvement for Nuvio Cinema.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: use-case
+    attributes:
+      label: What would you like to be able to do?
+      description: Describe what you’re trying to do in Nuvio Cinema and where the current experience gets in the way.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: How should it work?
+      description: Describe the change you’d like to see. Include the screen or Siri Remote interaction if it helps explain the idea.
+    validations:
+      required: true
+
+  - type: textarea
+    id: examples
+    attributes:
+      label: Examples or alternatives
+      description: Add screenshots, a current workaround, or examples of how another app handles this, if useful.
