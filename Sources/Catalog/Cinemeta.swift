@@ -534,10 +534,14 @@ enum HomeGenre: String, CaseIterable, Sendable {
 }
 
 struct CinemetaClient: Sendable {
-    private let session: URLSession
+    private static let searchSession = URLSession(configuration: .ephemeral)
 
-    init(session: URLSession = .shared) {
+    private let session: URLSession
+    private let cache: CinemaMetadataCache?
+
+    init(session: URLSession = .shared, cache: CinemaMetadataCache? = nil) {
         self.session = session
+        self.cache = cache ?? (session === URLSession.shared ? .shared : nil)
     }
 
     func load(query: String? = nil) async -> CinemetaCatalog {
@@ -697,14 +701,17 @@ struct CinemetaClient: Sendable {
     func details(imdbID id: String, kind: CinemetaKind) async -> CinemetaTitle? {
         guard id.hasPrefix("tt"), id.utf8.count > 2,
               id.utf8.dropFirst(2).allSatisfy({ (48...57).contains($0) }) else { return nil }
-        return await fetch(TitleResponse.self, path: "/meta/\(kind.rawValue)/\(id).json")?.meta
+        return await fetch(TitleResponse.self, path: "/meta/\(kind.rawValue)/\(id).json", policy: .title) {
+            $0.meta.id == id || $0.meta.imdbID == id
+        }?.meta
     }
 
     func details(contentID: String, kind: CinemetaKind) async -> CinemetaTitle? {
         guard contentID.hasPrefix("tmdb:") else { return await details(imdbID: contentID, kind: kind) }
         let digits = contentID.utf8.dropFirst(5)
         guard !digits.isEmpty, digits.allSatisfy({ (48...57).contains($0) }) else { return nil }
-        return await fetch(TitleResponse.self, path: "/meta/\(kind.rawValue)/\(contentID).json", source: .betterPosters)?.meta
+        return await fetch(TitleResponse.self, path: "/meta/\(kind.rawValue)/\(contentID).json",
+                           source: .betterPosters, policy: .title)?.meta
     }
 
     func related(to title: CinemetaTitle, kind: CinemetaKind) async -> [CinemetaTitle] {
@@ -734,7 +741,21 @@ struct CinemetaClient: Sendable {
         }
         if skip > 0 { extra.append("skip=\(skip)") }
         if !extra.isEmpty { path += "/" + extra.joined(separator: "&") }
-        guard let response = await fetch(CatalogResponse.self, path: path + ".json", source: source) else { return nil }
+        let policy: CinemaMetadataCache.Policy = filter?.name == "search" ? .search : .catalog
+        let minimumEntries = switch id {
+        case "tmdb-today", "tmdb-today-shows": 5
+        case "trakt-popular", "trakt-trending", "tmdb-latest", "tmdb-latest-shows": 1
+        default: 0
+        }
+        let loaded = await fetch(CatalogResponse.self, path: path + ".json", source: source, policy: policy) { response in
+            let titles = response.metas.compactMap { entry in
+                entry.kind == nil || entry.kind == kind ? entry.title : nil
+            }
+            guard minimumEntries > 0 else { return response.metas.isEmpty || !titles.isEmpty }
+            let usable = titles.filter { !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            return Set(usable.compactMap(\.imdbID)).count >= minimumEntries
+        }
+        guard let response = loaded else { return nil }
         var seen = Set<String>()
         return response.metas.compactMap { entry in
             guard let title = entry.title, entry.kind == nil || entry.kind == kind,
@@ -743,34 +764,33 @@ struct CinemetaClient: Sendable {
         }
     }
 
-    private func fetch<Value: Decodable>(_ type: Value.Type, path: String, source: CatalogSource = .cinemeta) async -> Value? {
+    private func fetch<Value: Decodable & Sendable>(
+        _ type: Value.Type, path: String, source: CatalogSource = .cinemeta, policy: CinemaMetadataCache.Policy,
+        canStore: @escaping @Sendable (Value) -> Bool = { _ in true }
+    ) async -> Value? {
         var endpoint = URLComponents()
         endpoint.scheme = "https"
         endpoint.host = source.rawValue
         endpoint.percentEncodedPath = path
         guard let url = endpoint.url else { return nil }
 
-        do {
-            let request = URLRequest(url: url, timeoutInterval: source == .cinemeta ? 12 : 7)
-            let (data, response) = try await session.data(for: request)
-            guard let response = response as? HTTPURLResponse, (200..<300).contains(response.statusCode) else {
-                return nil
-            }
-            return try JSONDecoder().decode(type, from: data)
-        } catch {
-            return nil
+        let request = URLRequest(url: url, timeoutInterval: source == .cinemeta ? 12 : 7)
+        let session = policy == .search && self.session === URLSession.shared ? Self.searchSession : self.session
+        if let cache {
+            return await cache.load(type, request: request, session: session, policy: policy, canStore: canStore)
         }
+        return await CinemaMetadataCache.loadUncached(type, request: request, session: session)
     }
 
-    private struct TitleResponse: Decodable {
+    private struct TitleResponse: Decodable, Sendable {
         let meta: CinemetaTitle
     }
 
-    private struct CatalogResponse: Decodable {
+    private struct CatalogResponse: Decodable, Sendable {
         let metas: [CatalogEntry]
     }
 
-    private struct CatalogEntry: Decodable {
+    private struct CatalogEntry: Decodable, Sendable {
         let title: CinemetaTitle?
         let kind: CinemetaKind?
 

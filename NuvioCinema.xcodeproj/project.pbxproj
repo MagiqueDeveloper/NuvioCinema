@@ -17,6 +17,9 @@
 		E71BDAAA269541D79465F1AA /* AetherPlaybackView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A54E296ED4174115977EDE6B /* AetherPlaybackView.swift */; };
 		4980284FF5AB4613ACCB058B /* ThirdPartyNotices in Resources */ = {isa = PBXBuildFile; fileRef = 3DB2EAC6E90F4434B326F0BA /* ThirdPartyNotices */; };
 		9E8DBA39896E4DFD9A063A34 /* CinemaImageCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3F1FEC3837E94D56BE011A7E /* CinemaImageCache.swift */; };
+		CC5D4973EC1B4F6284129E0D /* CinemaHTTPFreshness.swift in Sources */ = {isa = PBXBuildFile; fileRef = 14FF9D6CB301463B921C8A68 /* CinemaHTTPFreshness.swift */; };
+		58DAB61A43774C369FDBF9A3 /* CinemaPublicNetwork.swift in Sources */ = {isa = PBXBuildFile; fileRef = C2DC5C7814F94464B7E858E3 /* CinemaPublicNetwork.swift */; };
+		F2859720610B4D9E85271704 /* CinemaMetadataCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 158FD3AD484C4BDA9FE07345 /* CinemaMetadataCache.swift */; };
 		887A1486E34A4798B046FB71 /* AddonStreams.swift in Sources */ = {isa = PBXBuildFile; fileRef = C67B6C9B9F454201BD7F022A /* AddonStreams.swift */; };
 		C5B8B997EB4F4572A09CD1 /* BitmapSubtitleFallback.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F0D70C0A9904E3DBB4696 /* BitmapSubtitleFallback.swift */; };
 		E4E725C472524E69869153C1 /* TitlePlaybackView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8B5902E8C6BC46BFA3B92BE3 /* TitlePlaybackView.swift */; };
@@ -45,6 +48,9 @@
 		A54E296ED4174115977EDE6B /* AetherPlaybackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AetherPlaybackView.swift; sourceTree = "<group>"; };
 		3DB2EAC6E90F4434B326F0BA /* ThirdPartyNotices */ = {isa = PBXFileReference; lastKnownFileType = folder; name = ThirdPartyNotices; path = Resources/ThirdPartyNotices; sourceTree = "<group>"; };
 		3F1FEC3837E94D56BE011A7E /* CinemaImageCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaImageCache.swift; sourceTree = "<group>"; };
+		14FF9D6CB301463B921C8A68 /* CinemaHTTPFreshness.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaHTTPFreshness.swift; sourceTree = "<group>"; };
+		C2DC5C7814F94464B7E858E3 /* CinemaPublicNetwork.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaPublicNetwork.swift; sourceTree = "<group>"; };
+		158FD3AD484C4BDA9FE07345 /* CinemaMetadataCache.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CinemaMetadataCache.swift; sourceTree = "<group>"; };
 		C67B6C9B9F454201BD7F022A /* AddonStreams.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddonStreams.swift; sourceTree = "<group>"; };
 		2F0D70C0A9904E3DBB4696 /* BitmapSubtitleFallback.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BitmapSubtitleFallback.swift; sourceTree = "<group>"; };
 		8B5902E8C6BC46BFA3B92BE3 /* TitlePlaybackView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TitlePlaybackView.swift; sourceTree = "<group>"; };
@@ -107,7 +113,9 @@
 			isa = PBXGroup;
 			children = (
 				8C04A0669CA847E5B11AB51D /* CastPortraits.swift */,
+				14FF9D6CB301463B921C8A68 /* CinemaHTTPFreshness.swift */,
 				3F1FEC3837E94D56BE011A7E /* CinemaImageCache.swift */,
+				C2DC5C7814F94464B7E858E3 /* CinemaPublicNetwork.swift */,
 			);
 			path = Artwork;
 			sourceTree = "<group>";
@@ -117,6 +125,7 @@
 			children = (
 				F330C43CC5AF4EB98FF63249 /* Cinemeta.swift */,
 				9F0298DA749C407ABC33DFD4 /* CinemaCredits.swift */,
+				158FD3AD484C4BDA9FE07345 /* CinemaMetadataCache.swift */,
 			);
 			path = Catalog;
 			sourceTree = "<group>";
@@ -290,6 +299,9 @@
 			files = (
 				6B220F5D0B9340CAB32E6EAB /* CastPortraits.swift in Sources */,
 				9E8DBA39896E4DFD9A063A34 /* CinemaImageCache.swift in Sources */,
+				CC5D4973EC1B4F6284129E0D /* CinemaHTTPFreshness.swift in Sources */,
+				58DAB61A43774C369FDBF9A3 /* CinemaPublicNetwork.swift in Sources */,
+				F2859720610B4D9E85271704 /* CinemaMetadataCache.swift in Sources */,
 				887A1486E34A4798B046FB71 /* AddonStreams.swift in Sources */,
 				C5B8B997EB4F4572A09CD1 /* BitmapSubtitleFallback.swift in Sources */,
 				E4E725C472524E69869153C1 /* TitlePlaybackView.swift in Sources */,

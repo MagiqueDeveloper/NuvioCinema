@@ -1,0 +1,228 @@
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerLoadingOverlay.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerLoadingOverlay.swift
+@@ -273,6 +273,24 @@
+     }
+ }
+ 
++#if NUVIO_UPSTREAM_PLAYER
++struct CinemaPlaybackLoadingContext: Sendable {
++    let episodeLine: String?
++    let showsStatus: Bool
++}
++
++private struct CinemaPlaybackLoadingContextKey: EnvironmentKey {
++    static let defaultValue: CinemaPlaybackLoadingContext? = nil
++}
++
++extension EnvironmentValues {
++    var cinemaPlaybackLoadingContext: CinemaPlaybackLoadingContext? {
++        get { self[CinemaPlaybackLoadingContextKey.self] }
++        set { self[CinemaPlaybackLoadingContextKey.self] = newValue }
++    }
++}
++#endif
++
+ struct PlayerLoadingOverlay: View {
+     let backdropUrl: String?
+     let logoUrl: String?
+@@ -285,6 +303,10 @@
+     var onSelect: (() -> Void)? = nil
+     var onMove: ((MoveCommandDirection) -> Void)? = nil
+ 
++    #if NUVIO_UPSTREAM_PLAYER
++    @Environment(\.cinemaPlaybackArtwork) private var cinemaArtwork
++    @Environment(\.cinemaPlaybackLoadingContext) private var cinemaLoadingContext
++    #endif
+     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
+     @FocusState private var isFocusActive: Bool
+     @State private var isPulsing = false
+@@ -356,6 +378,51 @@
+                 }
+             #endif
+ 
++            presentation
++        }
++        .frame(maxWidth: .infinity, maxHeight: .infinity)
++        .ignoresSafeArea()
++        #if os(tvOS)
++        .onExitCommand {
++            if focusEnabled {
++                onDismiss?()
++            }
++        }
++        .onAppear {
++            DispatchQueue.main.async {
++                isFocusActive = focusEnabled
++            }
++        }
++        .onChange(of: focusEnabled) { _, enabled in
++            if enabled {
++                DispatchQueue.main.async { isFocusActive = focusEnabled }
++            } else {
++                isFocusActive = false
++            }
++        }
++        #endif
++    }
++
++    @ViewBuilder
++    private var presentation: some View {
++        #if NUVIO_UPSTREAM_PLAYER
++        if let cinemaArtwork, let cinemaLoadingContext {
++            CinemaPlaybackLoadingView(
++                artwork: cinemaArtwork,
++                title: title ?? "",
++                episodeLine: cinemaLoadingContext.episodeLine,
++                message: cinemaLoadingContext.showsStatus && !message.isEmpty ? message : nil
++            )
++        } else {
++            upstreamPresentation
++        }
++        #else
++        upstreamPresentation
++        #endif
++    }
++
++    private var upstreamPresentation: some View {
++        ZStack {
+             // 1. Solid Black Base
+             Color.black.ignoresSafeArea()
+ 
+@@ -579,32 +646,7 @@
+             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+             .padding(.horizontal, 80)
+         }
+-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+-        .ignoresSafeArea()
+-        #if os(tvOS)
+-        .onExitCommand {
+-            if focusEnabled {
+-                onDismiss?()
+-            }
+-        }
+-        #endif
+-        .onAppear {
+-            isPulsing = true
+-            #if os(tvOS)
+-            DispatchQueue.main.async {
+-                isFocusActive = focusEnabled
+-            }
+-            #endif
+-        }
+-        #if os(tvOS)
+-        .onChange(of: focusEnabled) { _, enabled in
+-            if enabled {
+-                DispatchQueue.main.async { isFocusActive = focusEnabled }
+-            } else {
+-                isFocusActive = false
+-            }
+-        }
+-        #endif
++        .onAppear { isPulsing = true }
+         .task(id: targetArtworkURL) {
+             guard let url = targetArtworkURL else {
+                 backdropImage = nil
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+Overlays.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+Overlays.swift
+@@ -80,8 +80,25 @@
+         .accessibilityLabel("Return to video")
+     }
+ 
++    var playerStatusOverlay: some View {
++        playerStatusContent
++            #if NUVIO_UPSTREAM_PLAYER
++            .environment(\.cinemaPlaybackLoadingContext, cinemaLoadingContext)
++            #endif
++    }
++
++    #if NUVIO_UPSTREAM_PLAYER
++    private var cinemaLoadingContext: CinemaPlaybackLoadingContext? {
++        guard isLoadingOverlayVisible else { return nil }
++        return CinemaPlaybackLoadingContext(
++            episodeLine: meta.isSeries ? viewModel.cinemaLoadingEpisodeLine(initialSubtitle: subtitle) : nil,
++            showsStatus: viewModel.isShowLoadingStatusEnabled
++        )
++    }
++    #endif
++
+     @ViewBuilder
+-    var playerStatusOverlay: some View {
++    private var playerStatusContent: some View {
+         if let diagnostic = viewModel.currentErrorDiagnostic {
+             PlaybackErrorOverlayView(
+                 diagnostic: diagnostic,
+--- a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+@@ -438,6 +438,7 @@
+     private var isCurrentPlayerSurface: @MainActor () -> Bool = { true }
+     private var allowsManualEpisodeSelection = true
+     private(set) var startupBenchmarkToken: UUID?
++    private var pendingLoadingEpisode: (token: UUID, episode: NuvioVideo)?
+ 
+     // MARK: - Post-Play Recommendations
+     @Published var postPlayState = PostPlayRecommendationUiState()
+@@ -1114,10 +1115,25 @@
+     }
+ 
+     @discardableResult
+-    private func beginStartupBenchmark(title: String = "") -> UUID {
++    private func beginStartupBenchmark(title: String = "", loadingEpisode: NuvioVideo? = nil) -> UUID {
+         let token = PlaybackStartupTiming.start(title: title)
+         startupBenchmarkToken = token
++        pendingLoadingEpisode = loadingEpisode.map { (token, $0) }
+         return token
++    }
++
++    func cinemaLoadingEpisodeLine(initialSubtitle: String) -> String? {
++        if let pendingLoadingEpisode,
++           startupBenchmarkToken == pendingLoadingEpisode.token,
++           PlaybackStartupTiming.isActive(token: pendingLoadingEpisode.token) {
++            let episode = pendingLoadingEpisode.episode
++            let number = "S\(episode.season) · E\(episode.episode)"
++            let title = episode.title.trimmingCharacters(in: .whitespacesAndNewlines)
++            return title.isEmpty ? number : "\(number) · \(title)"
++        }
++        if activeMeta != nil { return pauseOverlayEpisodeLine }
++        let line = initialSubtitle.trimmingCharacters(in: .whitespacesAndNewlines)
++        return line.isEmpty || line == PlaybackMarkers.trailerSubtitle ? nil : line
+     }
+ 
+     func completeStartupBenchmark() -> TimeInterval? {
+@@ -2846,7 +2862,7 @@
+         lastAdvancedEpisodeId = next.id
+         advanceGeneration &+= 1
+         let gen = advanceGeneration
+-        let startupToken = beginStartupBenchmark(title: activeMeta?.name ?? "")
++        let startupToken = beginStartupBenchmark(title: activeMeta?.name ?? "", loadingEpisode: next)
+         pendingAdvanceResolutionGeneration = gen
+         isAdvanceInFlight = true
+         isAdvancingEpisode = true
+@@ -3005,6 +3021,7 @@
+             self.activeBingeGroup = bg
+         }
+         if let episode {
++            pendingLoadingEpisode = nil
+             currentEpisodeVideo = episode
+             nextEpisode = Self.nextEpisode(after: episode, in: seriesEpisodes)
+             isAutoPlayCancelled = false
+@@ -7817,9 +7834,9 @@
+     /// Shared entry for a user-initiated switch: park the engine and put the
+     /// player into a labelled loading state that stays up until the new stream
+     /// actually starts.
+-    private func beginSourceSwitch(message: String) -> UUID {
++    private func beginSourceSwitch(message: String, loadingEpisode: NuvioVideo? = nil) -> UUID {
+         cancelPendingAdvanceResolution()
+-        let token = beginStartupBenchmark(title: activeMeta?.name ?? "")
++        let token = beginStartupBenchmark(title: activeMeta?.name ?? "", loadingEpisode: loadingEpisode)
+         isSwitchingSource = true
+         switchingSourceMessage = message
+         loadingStepMessage = message
+@@ -7848,7 +7865,7 @@
+         }
+         isAdvanceInFlight = false
+         lastAdvancedEpisodeId = nil
+-        let startupToken = beginSourceSwitch(message: "Loading episode…")
++        let startupToken = beginSourceSwitch(message: "Loading episode…", loadingEpisode: episode)
+         closeSidePanel()
+ 
+         Task { @MainActor [weak self] in

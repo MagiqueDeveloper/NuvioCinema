@@ -12,28 +12,17 @@ struct CinemaTitleCredits: Sendable {
     let sourceURL: URL
 }
 
-actor CinemaCredits {
+struct CinemaCredits: Sendable {
     static let shared = CinemaCredits()
-
-    private var cache: [String: CinemaTitleCredits] = [:]
 
     func load(imdbID: String, kind: CinemetaKind) async -> CinemaTitleCredits? {
         let digits = imdbID.utf8.dropFirst(2)
         guard imdbID.hasPrefix("tt"), (1...22).contains(digits.count),
               digits.allSatisfy({ (48...57).contains($0) }) else { return nil }
-        let key = "\(kind.rawValue):\(imdbID)"
-        if let cached = cache[key] { return cached }
-
         let seriesCredits = kind == .series ? await Self.tvMaze(imdbID: imdbID) : nil
         guard !Task.isCancelled else { return nil }
-        let credits: CinemaTitleCredits?
-        if let seriesCredits {
-            credits = seriesCredits
-        } else {
-            credits = await Self.wikidata(imdbID: imdbID)
-        }
-        if let credits { cache[key] = credits }
-        return credits
+        if let seriesCredits { return seriesCredits }
+        return await Self.wikidata(imdbID: imdbID)
     }
 
     private static func tvMaze(imdbID: String) async -> CinemaTitleCredits? {
@@ -42,7 +31,9 @@ actor CinemaCredits {
         guard let lookup: TVMazeShow = await fetch(lookupURL), !Task.isCancelled else { return nil }
         let showURL = URL(string: "https://api.tvmaze.com/shows/\(lookup.id)")!
             .appending(queryItems: [URLQueryItem(name: "embed[]", value: "cast"), URLQueryItem(name: "embed[]", value: "crew")])
-        guard let show: TVMazeShow = await fetch(showURL), let credits = show._embedded,
+        guard let show: TVMazeShow = await fetch(showURL, canStore: {
+            $0._embedded != nil && $0.url.scheme == "https" && $0.url.host() == "www.tvmaze.com"
+        }), let credits = show._embedded,
               show.url.scheme == "https", show.url.host() == "www.tvmaze.com" else { return nil }
 
         let cast = credits.cast.compactMap { entry -> CinemaCredit? in
@@ -146,49 +137,49 @@ actor CinemaCredits {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    private static func fetch<Value: Decodable>(_ url: URL) async -> Value? {
+    private static func fetch<Value: Decodable & Sendable>(
+        _ url: URL, canStore: @escaping @Sendable (Value) -> Bool = { _ in true }
+    ) async -> Value? {
         var request = URLRequest(url: url, timeoutInterval: 6)
         request.setValue("NuvioCinema/0.1 (https://github.com/MagiqueDeveloper/NuvioCinema)", forHTTPHeaderField: "User-Agent")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
-              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-        return try? JSONDecoder().decode(Value.self, from: data)
+        return await CinemaMetadataCache.shared.load(Value.self, request: request, policy: .reference, canStore: canStore)
     }
 
-    private struct TVMazeShow: Decodable {
+    private struct TVMazeShow: Decodable, Sendable {
         let id: Int
         let url: URL
         let _embedded: Credits?
 
-        struct Credits: Decodable {
+        struct Credits: Decodable, Sendable {
             let cast: [Cast]
             let crew: [Crew]
         }
 
-        struct Cast: Decodable {
+        struct Cast: Decodable, Sendable {
             let person: Name
             let character: Name
             let voice: Bool?
         }
 
-        struct Crew: Decodable {
+        struct Crew: Decodable, Sendable {
             let person: Name
             let type: String
         }
 
-        struct Name: Decodable {
+        struct Name: Decodable, Sendable {
             let name: String
         }
     }
 
-    private struct WikidataResult: Decodable {
+    private struct WikidataResult: Decodable, Sendable {
         let results: Results
 
-        struct Results: Decodable {
+        struct Results: Decodable, Sendable {
             let bindings: [Binding]
         }
 
-        struct Binding: Decodable {
+        struct Binding: Decodable, Sendable {
             let title: Value
             let name: Value
             let credit: Value
@@ -198,7 +189,7 @@ actor CinemaCredits {
             var billingOrder: Int { ordinal.flatMap { Int($0.value) } ?? Int.max }
         }
 
-        struct Value: Decodable {
+        struct Value: Decodable, Sendable {
             let value: String
         }
     }

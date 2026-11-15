@@ -97,6 +97,7 @@ struct UpstreamPlaybackBridge: View {
             onBack: close,
             onRemoteBack: close
         )
+        .environment(\.cinemaPlaybackArtwork, request.startupArtwork)
         .onAppear { isMounted = true }
         .onReceive(viewModel.clock.$position) { position in
             guard viewModel.status == .playing, canRecordProgress else { return }

@@ -2,6 +2,11 @@ import AVKit
 import OSLog
 import SwiftUI
 
+struct CinemaPlaybackArtwork: Sendable {
+    let backdropURLs: [URL]
+    let logoURL: URL?
+}
+
 struct TitlePlaybackRequest: Identifiable, Sendable {
     let id = UUID()
     let title: String
@@ -18,6 +23,7 @@ struct TitlePlaybackRequest: Identifiable, Sendable {
     let followingEpisodes: [CinemetaEpisode]
     var metadata: CinemetaTitle? = nil
     var selectedEpisode: CinemetaEpisode? = nil
+    var startupArtwork = CinemaPlaybackArtwork(backdropURLs: [], logoURL: nil)
     var startsFromBeginning = false
 
     func videoIDs(for episode: CinemetaEpisode) -> [String] {
@@ -35,7 +41,7 @@ struct TitlePlaybackRequest: Identifiable, Sendable {
                                     contentID: contentID, season: episode.season, episodeNumber: episode.episode,
                                     profileID: profileID, accountID: accountID,
                                     followingEpisodes: Array(followingEpisodes.dropFirst(index + 1)),
-                                    metadata: metadata, selectedEpisode: episode)
+                                    metadata: metadata, selectedEpisode: episode, startupArtwork: startupArtwork)
     }
 }
 

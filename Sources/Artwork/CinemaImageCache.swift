@@ -3,19 +3,37 @@ import ImageIO
 import SwiftUI
 
 enum CinemaImageError: Error {
-    case missing, unavailable, invalidImage
+    case missing, unavailable, invalidImage, throttled
+    case response(Int)
 }
 
 actor CinemaImageCache {
     static let shared = CinemaImageCache()
     private static let memory = DecodedImages()
     private static let maximumDownloadSize = 12 * 1024 * 1024
+    private static let defaultMaxAge: TimeInterval = 86_400
+    private static let defaultStaleIfError: TimeInterval = 7 * 86_400
 
     private let session: URLSession
     private let directory: URL?
     private let diskLimit: Int
-    private var requests: [URL: Task<CGImage, Error>] = [:]
+    private var requests: [URL: ArtworkRequest] = [:]
     private var missingUntil: [URL: Date] = [:]
+
+    private struct ArtworkRequest {
+        let task: Task<CGImage, Error>
+        var consumers: Set<UUID>
+    }
+
+    private struct StoredArtwork: Codable {
+        let data: Data
+        let freshness: CinemaHTTPFreshness
+    }
+
+    private struct DecodedArtwork {
+        let image: CGImage
+        let freshness: CinemaHTTPFreshness
+    }
 
     init(session: URLSession = .shared, directory: URL? = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
         .first?.appendingPathComponent("CinemaArtwork", isDirectory: true), diskLimit: Int = 160 * 1024 * 1024) {
@@ -25,53 +43,134 @@ actor CinemaImageCache {
     }
 
     nonisolated static func cached(_ url: URL) -> CGImage? {
-        memory.image(for: url)
+        guard let artwork = memory.artwork(for: url), artwork.freshness.expiresAt > .now else { return nil }
+        return artwork.image
     }
 
     func image(for url: URL) async throws -> CGImage {
-        if let image = Self.cached(url) { return image }
-        if let until = missingUntil[url], until > .now { throw CinemaImageError.missing }
-        if let request = requests[url] { return try await request.value }
-
-        // Keep a shared request alive when a cell scrolls offscreen.
-        let request = Task {
-            defer { requests[url] = nil }
-            let file = diskURL(for: url)
-            if let file, let data = try? Data(contentsOf: file),
-               let image = await Self.decode(data) {
-                try? FileManager.default.setAttributes([.modificationDate: Date.now], ofItemAtPath: file.path())
-                Self.memory.insert(image, for: url)
-                return image
-            }
-
-            do {
-                let (data, image) = try await Self.download(url, session: session)
-                Self.memory.insert(image, for: url)
-                if let file { store(data, at: file) }
-                return image
-            } catch CinemaImageError.missing {
-                if missingUntil.count >= 512 {
-                    missingUntil = missingUntil.filter { $0.value > .now }
-                    if missingUntil.count >= 512 { missingUntil.removeAll(keepingCapacity: true) }
-                }
-                missingUntil[url] = Date.now.addingTimeInterval(300)
-                throw CinemaImageError.missing
-            }
+        try Task.checkCancellation()
+        if let image = Self.cached(url) {
+            CinemaNetworkMetrics.recordCacheHit(for: url, resource: .artwork, tier: .memory)
+            return image
         }
-        requests[url] = request
-        return try await request.value
+        if let until = missingUntil[url], until > .now {
+            CinemaNetworkMetrics.recordCacheHit(for: url, resource: .artwork, tier: .memory)
+            throw CinemaImageError.missing
+        }
+        let consumer = UUID()
+        let task: Task<CGImage, Error>
+        if let request = requests[url] {
+            CinemaNetworkMetrics.recordCacheHit(for: url, resource: .artwork, tier: .coalesced)
+            requests[url]?.consumers.insert(consumer)
+            task = request.task
+        } else {
+            task = Task { try await loadImage(for: url) }
+            requests[url] = ArtworkRequest(task: task, consumers: [consumer])
+        }
+        return try await withTaskCancellationHandler {
+            defer { release(consumer, for: url) }
+            let image = try await task.value
+            try Task.checkCancellation()
+            return image
+        } onCancel: {
+            Task { await self.release(consumer, for: url) }
+        }
     }
 
-    private static func download(_ url: URL, session: URLSession) async throws -> (Data, CGImage) {
-        let request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
-        let (data, response) = try await session.data(for: request)
-        guard let response = response as? HTTPURLResponse else { throw CinemaImageError.unavailable }
-        if response.statusCode == 404 || response.statusCode == 410 { throw CinemaImageError.missing }
-        guard (200..<300).contains(response.statusCode), data.count <= maximumDownloadSize else {
-            throw CinemaImageError.unavailable
+    private func release(_ consumer: UUID, for url: URL) {
+        guard requests[url]?.consumers.remove(consumer) != nil, requests[url]?.consumers.isEmpty == true else { return }
+        requests.removeValue(forKey: url)?.task.cancel()
+    }
+
+    private func loadImage(for url: URL) async throws -> CGImage {
+        let file = diskURL(for: url)
+        let stored = file.flatMap(readArtwork)
+        var cached = Self.memory.artwork(for: url)
+        if cached == nil, let stored, let image = await Self.decode(stored.data) {
+            cached = DecodedArtwork(image: image, freshness: stored.freshness)
         }
-        guard let image = await decode(data) else { throw CinemaImageError.invalidImage }
-        return (data, image)
+        try Task.checkCancellation()
+        if let cached, cached.freshness.expiresAt > .now {
+            CinemaNetworkMetrics.recordCacheHit(for: url, resource: .artwork, tier: .disk)
+            if let file {
+                try? FileManager.default.setAttributes([.modificationDate: Date.now], ofItemAtPath: file.path())
+            }
+            Self.memory.insert(cached, for: url)
+            return cached.image
+        }
+
+        var request = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 12)
+        cached?.freshness.applyValidators(to: &request)
+        do {
+            let (data, response) = try await CinemaPublicNetwork.shared.data(for: request, session: session, resource: .artwork)
+            try Task.checkCancellation()
+            let previous = response.statusCode == 304 ? cached?.freshness : nil
+            let freshness = CinemaHTTPFreshness(response: response, defaultMaxAge: Self.defaultMaxAge,
+                                                defaultStaleIfError: Self.defaultStaleIfError, revalidating: previous)
+            switch response.statusCode {
+            case 304:
+                guard let cached else { throw CinemaImageError.unavailable }
+                save(cached.image, bytes: stored?.data, freshness: freshness, url: url, file: file)
+                return cached.image
+            case 200..<300:
+                guard data.count <= Self.maximumDownloadSize, let image = await Self.decode(data) else {
+                    throw CinemaImageError.invalidImage
+                }
+                try Task.checkCancellation()
+                save(image, bytes: data, freshness: freshness, url: url, file: file)
+                return image
+            case 404, 410:
+                removeArtwork(for: url, file: file)
+                if freshness.allowsStorage, freshness.expiresAt > .now {
+                    if missingUntil.count >= 512 {
+                        missingUntil = missingUntil.filter { $0.value > .now }
+                        if missingUntil.count >= 512 { missingUntil.removeAll(keepingCapacity: true) }
+                    }
+                    missingUntil[url] = min(freshness.expiresAt, .now.addingTimeInterval(300))
+                }
+                throw CinemaImageError.missing
+            case 429:
+                throw CinemaImageError.throttled
+            default:
+                throw CinemaImageError.response(response.statusCode)
+            }
+        } catch {
+            try Task.checkCancellation()
+            let failure: Error
+            if case .coolingDown? = error as? CinemaPublicNetworkError {
+                failure = CinemaImageError.throttled
+            } else {
+                failure = error
+            }
+            if let cached, cached.freshness.staleUntil > .now, Self.canUseStale(after: failure) {
+                CinemaNetworkMetrics.recordCacheHit(for: url, resource: .artwork, tier: .stale)
+                return cached.image
+            }
+            throw failure
+        }
+    }
+
+    private static func canUseStale(after error: Error) -> Bool {
+        if let error = error as? URLError { return error.code != .cancelled }
+        switch error as? CinemaImageError {
+        case .throttled?: return true
+        case let .response(status)?: return (500..<600).contains(status)
+        default: return false
+        }
+    }
+
+    private func save(_ image: CGImage, bytes: Data?, freshness: CinemaHTTPFreshness, url: URL, file: URL?) {
+        guard freshness.allowsStorage else {
+            removeArtwork(for: url, file: file)
+            return
+        }
+        Self.memory.insert(DecodedArtwork(image: image, freshness: freshness), for: url)
+        if let file, let bytes { store(StoredArtwork(data: bytes, freshness: freshness), at: file) }
+    }
+
+    private func removeArtwork(for url: URL, file: URL?) {
+        Self.memory.remove(url)
+        if let file { try? FileManager.default.removeItem(at: file) }
     }
 
     private static func decode(_ data: Data) async -> CGImage? {
@@ -92,8 +191,20 @@ actor CinemaImageCache {
         return directory?.appendingPathComponent(key)
     }
 
-    private func store(_ data: Data, at file: URL) {
-        guard let directory, data.count <= diskLimit else { return }
+    private func readArtwork(_ file: URL) -> StoredArtwork? {
+        guard let data = try? Data(contentsOf: file) else { return nil }
+        if let stored = try? PropertyListDecoder().decode(StoredArtwork.self, from: data) { return stored }
+        let date = (try? file.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
+        let freshness = CinemaHTTPFreshness(legacyFileDate: date, maxAge: Self.defaultMaxAge,
+                                            staleIfError: Self.defaultStaleIfError)
+        return StoredArtwork(data: data, freshness: freshness)
+    }
+
+    private func store(_ artwork: StoredArtwork, at file: URL) {
+        guard let directory else { return }
+        let encoder = PropertyListEncoder()
+        encoder.outputFormat = .binary
+        guard let data = try? encoder.encode(artwork), data.count <= diskLimit else { return }
         let manager = FileManager.default
         do {
             try manager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -114,18 +225,27 @@ actor CinemaImageCache {
     }
 
     private final class DecodedImages: @unchecked Sendable {
-        private let cache = NSCache<NSURL, CGImage>()
+        private final class Entry {
+            let artwork: DecodedArtwork
+
+            init(_ artwork: DecodedArtwork) { self.artwork = artwork }
+        }
+
+        private let cache = NSCache<NSURL, Entry>()
 
         init() {
             cache.totalCostLimit = 128 * 1024 * 1024
             cache.countLimit = 200
         }
 
-        func image(for url: URL) -> CGImage? { cache.object(forKey: url as NSURL) }
+        func artwork(for url: URL) -> DecodedArtwork? { cache.object(forKey: url as NSURL)?.artwork }
 
-        func insert(_ image: CGImage, for url: URL) {
-            cache.setObject(image, forKey: url as NSURL, cost: image.bytesPerRow * image.height)
+        func insert(_ artwork: DecodedArtwork, for url: URL) {
+            let image = artwork.image
+            cache.setObject(Entry(artwork), forKey: url as NSURL, cost: image.bytesPerRow * image.height)
         }
+
+        func remove(_ url: URL) { cache.removeObject(forKey: url as NSURL) }
     }
 }
 

@@ -104,13 +104,15 @@ final class PosterCell: UICollectionViewCell {
         loadTask?.cancel()
         loadTask = nil
 
-        guard let first = urls.first else {
+        guard !urls.isEmpty else {
             showPlaceholder()
             return
         }
 
         placeholder.isHidden = true
-        if let image = CinemaImageCache.cached(first) {
+        for url in urls {
+            guard let image = CinemaImageCache.cached(url) else { continue }
+            CinemaNetworkMetrics.recordCacheHit(for: url, resource: .artwork, tier: .memory)
             showPoster(image)
             return
         }

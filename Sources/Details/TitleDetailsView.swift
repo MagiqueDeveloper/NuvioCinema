@@ -94,6 +94,14 @@ struct TitleDetailsView: View {
     }
 
     private var metadata: CinemetaTitle { details ?? title }
+
+    private var heroArtwork: CinemaPlaybackArtwork {
+        let catalogURL = title.background
+        let detailURL = details?.background
+        let backdropURLs = [catalogURL, detailURL == catalogURL ? nil : detailURL].compactMap { $0 }
+        return CinemaPlaybackArtwork(backdropURLs: backdropURLs, logoURL: title.logo ?? details?.logo)
+    }
+
     private var watchContentID: String { metadata.imdbID ?? title.imdbID ?? title.id }
     private var trailers: [CinemaTrailer] { metadata.trailers.isEmpty ? title.trailers : metadata.trailers }
     private var people: [PersonCredit] {
@@ -464,6 +472,7 @@ struct TitleDetailsView: View {
                                            profileID: account.profileID, accountID: account.playbackAccountID,
                                            followingEpisodes: episode.map { nextEpisodesForPlayback(after: $0) } ?? [],
                                            metadata: metadata, selectedEpisode: episode,
+                                           startupArtwork: heroArtwork,
                                            startsFromBeginning: startsFromBeginning)
         setPlaybackRequest(request)
     }
@@ -509,9 +518,7 @@ struct TitleDetailsView: View {
     private var heroBackdrop: some View {
         let animate = !reduceMotion
         let transaction = Transaction(animation: animate ? .easeOut(duration: 0.44) : nil)
-        let catalogURL = title.background
-        let detailURL = details?.background
-        let urls = [catalogURL, detailURL == catalogURL ? nil : detailURL].compactMap { $0 }
+        let urls = heroArtwork.backdropURLs
         let cached = urls.lazy.compactMap { CinemaImageCache.cached($0) }.first
 
         return GeometryReader { geometry in
@@ -574,7 +581,7 @@ struct TitleDetailsView: View {
                         loadedHeroBackdrop = Image(decorative: image, scale: 1)
                     }
                     return
-                } catch CinemaImageError.missing {
+                } catch CinemaImageError.missing, CinemaImageError.throttled {
                     continue
                 } catch {
                     guard !Task.isCancelled else { return }
@@ -626,7 +633,7 @@ struct TitleDetailsView: View {
 
     private var titleLogo: some View {
         let transaction = Transaction(animation: reduceMotion ? nil : .easeOut(duration: 0.25))
-        return CachedArtwork(url: title.logo ?? details?.logo, transaction: transaction) { phase in
+        return CachedArtwork(url: heroArtwork.logoURL, transaction: transaction) { phase in
             if let logo = phase.image {
                 logo.resizable()
                     .scaledToFit()
@@ -1113,7 +1120,7 @@ struct TitleDetailsView: View {
                 seasonPicker(seasons: seasons, current: season)
                 ZStack {
                     episodeShelf(seasonEpisodes.sorted { $0.episode < $1.episode },
-                                 initialEpisodeID: currentEpisode?.season == season ? currentEpisode?.id : nil)
+                                 currentEpisodeID: currentEpisode?.season == season ? currentEpisode?.id : nil)
                         .id(season)
                         .transition(seasonShelfTransition)
                 }
@@ -1174,7 +1181,6 @@ struct TitleDetailsView: View {
     }
 
     private func currentEpisode(in groups: [Int: [CinemetaEpisode]]) -> CinemetaEpisode? {
-        guard selectedSeason == nil else { return nil }
         let now = Date.now
         let playable = groups.values.flatMap { $0 }.filter { !$0.isUpcoming(at: now) }
         return account.currentSeriesEpisode(in: playable, contentID: watchContentID)
@@ -1186,7 +1192,8 @@ struct TitleDetailsView: View {
     }
 
     private func seasonPicker(seasons: [Int], current: Int) -> some View {
-        ScrollViewReader { scroll in
+        let entersFromAdjacentRow = focusRegion == .hero || focusRegion == .episodeCards
+        return ScrollViewReader { scroll in
             ScrollView(.horizontal) {
                 HStack(spacing: 16) {
                     ForEach(seasons, id: \.self) { season in
@@ -1205,16 +1212,21 @@ struct TitleDetailsView: View {
                 .padding(.vertical, 8)
             }
             .task(id: current) {
-                guard !Task.isCancelled, selectedSeason == nil, current != seasons.first else { return }
-                scroll.scrollTo(current, anchor: .leading)
+                guard !Task.isCancelled, focusRegion != .seasonPicker else { return }
+                scroll.scrollTo(current, anchor: .center)
             }
         }
         .scrollIndicators(.hidden)
         .scrollClipDisabled()
+        .focusSection()
+        .defaultFocus($focus, .season(current), priority: entersFromAdjacentRow ? .userInitiated : .automatic)
     }
 
-    private func episodeShelf(_ episodes: [CinemetaEpisode], initialEpisodeID: CinemetaEpisode.ID?) -> some View {
+    private func episodeShelf(_ episodes: [CinemetaEpisode], currentEpisodeID: CinemetaEpisode.ID?) -> some View {
         let now = Date.now
+        let preferredEpisodeID = currentEpisodeID
+            ?? episodes.first { !$0.isUpcoming(at: now) }?.id
+            ?? episodes.first?.id
         return ScrollViewReader { scroll in
             ScrollView(.horizontal) {
                 LazyHStack(alignment: .top, spacing: DetailShelf.cardGap) {
@@ -1238,10 +1250,24 @@ struct TitleDetailsView: View {
                     }
                 }
             }
-            .task(id: initialEpisodeID) {
-                guard !Task.isCancelled, selectedSeason == nil,
-                      let initialEpisodeID, initialEpisodeID != episodes.first?.id else { return }
-                scroll.scrollTo(initialEpisodeID, anchor: .leading)
+            .task(id: preferredEpisodeID) {
+                guard !Task.isCancelled, focusRegion != .episodeCards, let preferredEpisodeID else { return }
+                scroll.scrollTo(preferredEpisodeID, anchor: .center)
+            }
+            .onChange(of: focus) { previous, landed in
+                guard case let .season(season)? = previous, episodes.first?.season == season,
+                      case let .episode(landedID)? = landed,
+                      let preferredEpisodeID, landedID != preferredEpisodeID,
+                      episodes.contains(where: { $0.id == landedID }) else { return }
+
+                // The preferred episode can be outside the lazy shelf's visible range.
+                Task { @MainActor in
+                    guard isEnabled, playbackRequest == nil, focus == landed else { return }
+                    scroll.scrollTo(preferredEpisodeID, anchor: .center)
+                    await Task.yield()
+                    guard isEnabled, playbackRequest == nil, focus == landed || focus == nil else { return }
+                    focus = .episode(preferredEpisodeID)
+                }
             }
         }
         .scrollIndicators(.hidden)
@@ -1249,6 +1275,8 @@ struct TitleDetailsView: View {
         .fixedSize(horizontal: false, vertical: true)
         .buttonStyle(.borderless)
         .focusSection()
+        .defaultFocus($focus, preferredEpisodeID.map(FocusTarget.episode),
+                      priority: focusRegion == .seasonPicker ? .userInitiated : .automatic)
     }
 
     @ViewBuilder

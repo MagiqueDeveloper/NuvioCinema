@@ -10,16 +10,29 @@ struct CastPortrait: Sendable {
 actor CastPortraits {
     static let shared = CastPortraits()
 
-    private var cache: [String: CastPortrait] = [:]
+    private final class CachedPortrait {
+        let value: CastPortrait
+        let expiresAt: Date
+
+        init(_ value: CastPortrait, expiresAt: Date) {
+            self.value = value
+            self.expiresAt = expiresAt
+        }
+    }
+
+    private let cache = NSCache<NSString, CachedPortrait>()
+
+    init() {
+        cache.countLimit = 256
+    }
 
     func load(for names: [String]) async -> [String: CastPortrait] {
         var results: [String: CastPortrait] = [:]
         var pending: [String] = []
-        var seen = Set<String>()
-        for name in names where seen.insert(name).inserted {
-            if let portrait = cache[name] {
-                results[name] = portrait
-            } else if !name.contains("|"), !Self.normalizedName(name).isEmpty {
+        for name in Set(names).sorted() where !name.contains("|") && !Self.normalizedName(name).isEmpty {
+            if let cached = cache.object(forKey: name as NSString), cached.expiresAt > .now {
+                results[name] = cached.value
+            } else {
                 pending.append(name)
             }
         }
@@ -28,13 +41,17 @@ actor CastPortraits {
         for start in stride(from: 0, to: pending.count, by: 50) {
             guard !Task.isCancelled else { break }
             let end = min(start + 50, pending.count)
-            let files = await Self.findFiles(for: pending[start..<end])
+            let (files, filesExpiry) = await Self.findFiles(for: pending[start..<end])
 
             guard !Task.isCancelled else { break }
-            let portraits = await Self.loadCredits(for: Set(files.values))
+            let (portraits, creditsExpiry) = await Self.loadCredits(for: Set(files.values))
+            let now = Date.now
+            let expiresAt = min(filesExpiry ?? now, creditsExpiry ?? now, now.addingTimeInterval(3600))
             for (name, file) in files {
                 if let portrait = portraits[Self.fileKey(file)] {
-                    cache[name] = portrait
+                    if expiresAt > now {
+                        cache.setObject(CachedPortrait(portrait, expiresAt: expiresAt), forKey: name as NSString)
+                    }
                     results[name] = portrait
                 }
             }
@@ -42,7 +59,7 @@ actor CastPortraits {
         return results
     }
 
-    private static func findFiles(for names: ArraySlice<String>) async -> [String: String] {
+    private static func findFiles(for names: ArraySlice<String>) async -> ([String: String], Date?) {
         let endpoint = URL(string: "https://en.wikipedia.org/w/api.php")!
         let query = [
             URLQueryItem(name: "action", value: "query"),
@@ -56,7 +73,8 @@ actor CastPortraits {
             URLQueryItem(name: "pilicense", value: "free"),
             URLQueryItem(name: "wbptterms", value: "description")
         ]
-        guard let response: WikipediaResponse = await fetch(endpoint.appending(queryItems: query)) else { return [:] }
+        guard let (response, freshUntil) = await fetch(WikipediaPage.self, from: endpoint.appending(queryItems: query))
+        else { return ([:], nil) }
 
         let creditOccupations: Set<String> = [
             "actor", "actress", "director", "screenwriter", "filmmaker", "playwright",
@@ -78,11 +96,11 @@ actor CastPortraits {
                   let url = page.thumbnail?.source, isCommonsArtwork(url) else { continue }
             files[name] = "File:\(file)"
         }
-        return files
+        return (files, freshUntil)
     }
 
-    private static func loadCredits(for files: Set<String>) async -> [String: CastPortrait] {
-        guard !files.isEmpty else { return [:] }
+    private static func loadCredits(for files: Set<String>) async -> ([String: CastPortrait], Date?) {
+        guard !files.isEmpty else { return ([:], nil) }
         let endpoint = URL(string: "https://commons.wikimedia.org/w/api.php")!
         let query = [
             URLQueryItem(name: "action", value: "query"),
@@ -94,7 +112,8 @@ actor CastPortraits {
             URLQueryItem(name: "iiurlwidth", value: "360"),
             URLQueryItem(name: "iiextmetadatafilter", value: "Artist|LicenseShortName|LicenseUrl|Attribution")
         ]
-        guard let response: CommonsResponse = await fetch(endpoint.appending(queryItems: query)) else { return [:] }
+        guard let (response, freshUntil) = await fetch(CommonsPage.self, from: endpoint.appending(queryItems: query))
+        else { return ([:], nil) }
 
         var portraits: [String: CastPortrait] = [:]
         for page in response.query.pages {
@@ -115,19 +134,22 @@ actor CastPortraits {
                 licenseURL: licenseURL?.scheme == "https" ? licenseURL : nil
             )
         }
-        return portraits
+        return (portraits, freshUntil)
     }
 
-    private static func fetch<Value: Decodable>(_ url: URL) async -> Value? {
+    private static func fetch<Page: Decodable & Sendable>(
+        _: Page.Type, from url: URL
+    ) async -> (value: MediaWikiResponse<Page>, freshUntil: Date?)? {
+        let url = url.appending(queryItems: [
+            URLQueryItem(name: "maxage", value: "3600"),
+            URLQueryItem(name: "smaxage", value: "3600"),
+        ])
         var request = URLRequest(url: url, timeoutInterval: 8)
-        request.setValue("NuvioCinema/0.1 (Apple TV cast artwork)", forHTTPHeaderField: "User-Agent")
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-            return try JSONDecoder().decode(Value.self, from: data)
-        } catch {
-            return nil
-        }
+        request.httpShouldHandleCookies = false
+        request.setValue("NuvioCinema/0.1 (https://github.com/MagiqueDeveloper/NuvioCinema)", forHTTPHeaderField: "User-Agent")
+        return await CinemaMetadataCache.shared.loadWithFreshness(
+            MediaWikiResponse<Page>.self, request: request, policy: .reference, canStore: { $0.isComplete }
+        )
     }
 
     private static func normalizedName(_ value: String) -> String {
@@ -154,48 +176,49 @@ actor CastPortraits {
         return credit.isEmpty ? nil : credit
     }
 
-    private struct WikipediaResponse: Decodable {
+    private struct MediaWikiResponse<Page: Decodable & Sendable>: Decodable, Sendable {
         let query: Query
+        let isComplete: Bool
 
-        struct Query: Decodable {
+        private enum CodingKeys: String, CodingKey { case query, `continue`, warnings }
+
+        init(from decoder: any Decoder) throws {
+            let fields = try decoder.container(keyedBy: CodingKeys.self)
+            query = try fields.decode(Query.self, forKey: .query)
+            isComplete = !fields.contains(.`continue`) && !fields.contains(.warnings)
+        }
+
+        struct Query: Decodable, Sendable {
             let pages: [Page]
         }
+    }
 
-        struct Page: Decodable {
-            let title: String
-            let terms: Terms?
-            let thumbnail: Thumbnail?
-            let pageimage: String?
-        }
+    private struct WikipediaPage: Decodable, Sendable {
+        let title: String
+        let terms: Terms?
+        let thumbnail: Thumbnail?
+        let pageimage: String?
 
-        struct Terms: Decodable {
+        struct Terms: Decodable, Sendable {
             let description: [String]?
         }
 
-        struct Thumbnail: Decodable {
+        struct Thumbnail: Decodable, Sendable {
             let source: URL
         }
     }
 
-    private struct CommonsResponse: Decodable {
-        let query: Query
+    private struct CommonsPage: Decodable, Sendable {
+        let title: String
+        let imageinfo: [ImageInfo]?
 
-        struct Query: Decodable {
-            let pages: [Page]
-        }
-
-        struct Page: Decodable {
-            let title: String
-            let imageinfo: [ImageInfo]?
-        }
-
-        struct ImageInfo: Decodable {
+        struct ImageInfo: Decodable, Sendable {
             let thumburl: URL?
             let descriptionurl: URL?
             let extmetadata: [String: Metadata]?
         }
 
-        struct Metadata: Decodable {
+        struct Metadata: Decodable, Sendable {
             let value: String
         }
     }

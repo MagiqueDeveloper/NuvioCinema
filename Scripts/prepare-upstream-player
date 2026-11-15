@@ -102,6 +102,8 @@ project = replace_once(project, 'let bundleID = "com.pyksel.nuviotvos"', 'let bu
 project = replace_once(project, 'let marketingVersion = "3.5.1"', 'let marketingVersion = "0.1.3"')
 project = replace_once(project, 'let projectVersion = "82"', 'let projectVersion = "1"')
 project = replace_once(project, '    productName: "NuvioTV",', '    productName: "NuvioCinema",')
+project = replace_once(project, '    "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "$(inherited) NUVIO_MPV_MEMORY_WATCHDOG",',
+                        '    "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "$(inherited) NUVIO_MPV_MEMORY_WATCHDOG NUVIO_NETWORK_METRICS",')
 project = replace_once(project, '    sources: ["NuvioTV/Sources/**/*.swift"],',
                         '    sources: ["NuvioTV/Sources/**/*.swift", "NuvioTV/CinemaSources/**/*.swift"],')
 project = replace_once(project, '    resources: [\n        "NuvioTV/Images.xcassets",',

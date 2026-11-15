@@ -483,7 +483,8 @@ private struct HomeLandscapeArtwork: View {
                         if let image = alternatePhase.image {
                             backdrop(image)
                         } else {
-                            poster(showFallbackIcon: failed)
+                            let canLoadPoster = failed && (fallback == nil || alternatePhase.error != nil)
+                            poster(showFallbackIcon: failed, loadIfNeeded: canLoadPoster)
                         }
                     }
                 }
@@ -501,10 +502,13 @@ private struct HomeLandscapeArtwork: View {
         )
     }
 
-    private func poster(showFallbackIcon: Bool) -> some View {
+    private func poster(showFallbackIcon: Bool, loadIfNeeded: Bool) -> some View {
         let preferred = BetterPosters.url(for: title.imdbID, showTrendTags: false)
         let primaryPoster = title.poster ?? preferred
         let fallbackPoster = primaryPoster == preferred ? nil : preferred
+        let cachedPoster = [primaryPoster, fallbackPoster].lazy.compactMap { $0 }
+            .compactMap { CinemaImageCache.cached($0) }.first
+            .map { Image(decorative: $0, scale: 1) }
 
         return ZStack(alignment: .trailing) {
             if showFallbackIcon {
@@ -513,12 +517,12 @@ private struct HomeLandscapeArtwork: View {
                     .foregroundStyle(.white.opacity(0.20))
                     .frame(width: size.width * 0.43, height: size.height)
             }
-            CachedArtwork(url: primaryPoster) { phase in
+            CachedArtwork(url: loadIfNeeded ? primaryPoster : nil) { phase in
                 if let image = phase.image {
                     posterImage(image)
                 } else {
-                    CachedArtwork(url: phase.error == nil ? nil : fallbackPoster) { fallbackPhase in
-                        if let image = fallbackPhase.image {
+                    CachedArtwork(url: loadIfNeeded && phase.error != nil ? fallbackPoster : nil) { fallbackPhase in
+                        if let image = fallbackPhase.image ?? cachedPoster {
                             posterImage(image)
                         } else {
                             Color.clear
