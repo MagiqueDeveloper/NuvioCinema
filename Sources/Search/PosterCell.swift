@@ -8,8 +8,6 @@ final class PosterCell: UICollectionViewCell {
     private let titleSkeleton = UIView()
     private var loadTask: Task<Void, Never>?
     private var artworkURLs: [URL]?
-    private var artworkMissingHandler: (() -> Void)?
-    private var didConfirmMissingArtwork = false
     private var isSkeleton = false
 
     override var canBecomeFocused: Bool { !isSkeleton && super.canBecomeFocused }
@@ -92,7 +90,7 @@ final class PosterCell: UICollectionViewCell {
         updateFocusAppearance(false)
     }
 
-    func configure(name: String, artworkURLs: [URL], onArtworkMissing: @escaping () -> Void) {
+    func configure(name: String, artworkURLs: [URL]) {
         isSkeleton = false
         isAccessibilityElement = true
         titleSkeleton.isHidden = true
@@ -102,15 +100,8 @@ final class PosterCell: UICollectionViewCell {
 
         var seen = Set<URL>()
         let urls = artworkURLs.filter { seen.insert($0).inserted }
-        if self.artworkURLs == urls {
-            // Updating a display name does not need another artwork request.
-            if loadTask != nil {
-                artworkMissingHandler = onArtworkMissing
-            } else if didConfirmMissingArtwork {
-                onArtworkMissing()
-            }
-            return
-        }
+        // Updating a display name does not need another artwork request.
+        guard self.artworkURLs != urls else { return }
 
         resetArtworkLoad()
         self.artworkURLs = urls
@@ -129,31 +120,22 @@ final class PosterCell: UICollectionViewCell {
         }
         poster.image = nil
         poster.backgroundColor = UIColor(white: 0.16, alpha: 1)
-        artworkMissingHandler = onArtworkMissing
         loadTask = Task { [weak self] in
-            var allMissing = true
             for url in urls {
                 guard self != nil, !Task.isCancelled else { return }
                 do {
                     let image = try await CinemaImageCache.shared.image(for: url)
                     guard let self, !Task.isCancelled else { return }
                     loadTask = nil
-                    artworkMissingHandler = nil
                     showPoster(image)
                     return
-                } catch CinemaImageError.missing {
-                    continue
                 } catch {
-                    allMissing = false
+                    continue
                 }
             }
             guard let self, !Task.isCancelled else { return }
-            let reportMissing = artworkMissingHandler
             loadTask = nil
-            artworkMissingHandler = nil
-            didConfirmMissingArtwork = allMissing
             showPlaceholder()
-            if allMissing { reportMissing?() }
         }
     }
 
@@ -161,8 +143,6 @@ final class PosterCell: UICollectionViewCell {
         loadTask?.cancel()
         loadTask = nil
         artworkURLs = nil
-        artworkMissingHandler = nil
-        didConfirmMissingArtwork = false
     }
 
     private func showPoster(_ image: CGImage) {

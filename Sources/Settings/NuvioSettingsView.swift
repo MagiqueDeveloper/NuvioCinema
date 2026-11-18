@@ -103,6 +103,21 @@ struct NuvioSettingsView: View {
                 .font(.system(size: 23))
                 .foregroundStyle(.secondary)
         }
+        if !account.failedSyncSections.isEmpty {
+            let names = account.failedSyncSections.map(\.name).formatted(.list(type: .and))
+            Text("Couldn’t update \(names). Select Sync Now to retry.")
+                .font(.system(size: 23))
+                .foregroundStyle(.secondary)
+        }
+        if account.playbackUploadFailed {
+            Text("Playback updates couldn’t sync. Select Sync Now to retry.")
+                .font(.system(size: 23))
+                .foregroundStyle(.secondary)
+        } else if account.pendingPlaybackCount > 0 {
+            Text("Playback updates pending.")
+                .font(.system(size: 23))
+                .foregroundStyle(.secondary)
+        }
     }
 
     private var linkAccount: some View {
@@ -157,7 +172,7 @@ struct NuvioSettingsView: View {
                 .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text(currentProfile?.name ?? String(localized: "Nuvio Account"))
+                Text(currentProfile?.name ?? account.profileAwaitingPIN?.name ?? String(localized: "Nuvio Account"))
                     .font(.system(size: 32, weight: .semibold))
                     .accessibilityAddTraits(.isHeader)
 
@@ -174,6 +189,12 @@ struct NuvioSettingsView: View {
 
             Spacer(minLength: 24)
 
+            if let profile = account.profileAwaitingPIN {
+                NavigationLink(value: Page.unlockProfile(profile.id)) {
+                    Label("Unlock Profile", systemImage: "lock")
+                }
+                .buttonStyle(.borderedProminent)
+            }
             Button(action: account.sync) {
                 Label("Sync Now", systemImage: "arrow.clockwise")
             }
@@ -188,6 +209,8 @@ struct NuvioSettingsView: View {
     private var syncStatus: some View {
         if account.isSyncing {
             Text("Updating Nuvio data…")
+        } else if account.profileAwaitingPIN != nil {
+            Text("Unlock your profile or choose another in Profiles.")
         } else if let date = account.lastSync {
             Text("Last synced \(date, format: .dateTime.month(.abbreviated).day().hour().minute())")
         } else {

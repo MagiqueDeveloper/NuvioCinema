@@ -1,6 +1,6 @@
 import Foundation
 
-enum SubtitleCaptionFormatting {
+private enum SubtitleCaptionFormatting {
     private static let annotationPattern = #"\[[^\[\]\v]*\]"#
     private static let annotation = try! NSRegularExpression(pattern: annotationPattern)
     private static let doubleDash = try! NSRegularExpression(pattern: #"(?<!-)--(?!-)"#)
@@ -78,7 +78,10 @@ enum SubtitleCaptionFormatting {
             }
 
             if character.isLetter {
-                result.append(capitalizeNext ? String(character).uppercased() : String(character))
+                // Mixed-case words can be intentional, even at the start of a cue.
+                let shouldCapitalize = capitalizeNext && !characters[(index + 1)...]
+                    .prefix(while: \.isLetter).contains(where: \.isUppercase)
+                result.append(shouldCapitalize ? String(character).uppercased() : String(character))
                 capitalizeNext = false
                 atLineStart = false
             } else {
@@ -156,20 +159,18 @@ enum SubtitleCaptionFormatting {
 /// note glyph and reads it as the nearest Latin character, and it often drops a bracket
 /// at the edge of a tightly cropped cue.
 enum SubtitleOCRCleanup {
-    /// Read as a note at either edge of a line.
-    private static let strongNotes: Set<String> = ["♪", "♪♪", "♫", "♬", "&", "&&", "J", "JJ", "#", "##", "¢"]
-    /// Real words or initials too, so read as a note only next to other lyric context.
-    private static let weakNotes: Set<String> = ["s", "S", "ss", "d", "f", "j"]
+    private static let musicGlyphs: Set<Character> = ["♪", "♫", "♬"]
+    private static let possibleNotes: Set<String> = ["&", "&&", "J", "JJ", "#", "##", "¢", "s", "S", "ss", "d", "f", "j"]
     private static let dashes: Set<String> = ["-", "—", "–"]
-    private static let bracketOpenStandIns: Set<Character> = ["l", "|", "I", "1"]
-    private static let pipeAsI = try! NSRegularExpression(pattern: #"\|(?=[\p{Ll}'’\s]|$)"#)
+    private static let pipeAsI = try! NSRegularExpression(pattern: #"(?<!\S)\|(?=['’]|\s|$)"#)
 
     static func cleaned(_ text: String) -> String {
         var inLyric = false
-        return text.split(whereSeparator: \.isNewline)
+        let repaired = text.split(whereSeparator: \.isNewline)
             .map { cleanedLine(String($0), inLyric: &inLyric) }
             .filter { !$0.isEmpty }
             .joined(separator: "\n")
+        return SubtitleCaptionFormatting.formatted(repaired)
     }
 
     private static func cleanedLine(_ line: String, inLyric: inout Bool) -> String {
@@ -178,9 +179,7 @@ enum SubtitleOCRCleanup {
         let start = dashes.contains(tokens[0]) ? 1 : 0
         repairNotes(&tokens, from: start, inLyric: &inLyric)
 
-        var result = tokens.joined(separator: " ")
-        result = repairBrackets(result, open: "[", close: "]", openStandIns: bracketOpenStandIns, closeStandIns: ["|"])
-        result = repairBrackets(result, open: "(", close: ")", openStandIns: [], closeStandIns: [])
+        let result = repairBrackets(tokens.joined(separator: " "))
         return pipeAsI.stringByReplacingMatches(
             in: result, range: NSRange(result.startIndex..., in: result), withTemplate: "I"
         )
@@ -188,32 +187,22 @@ enum SubtitleOCRCleanup {
 
     private static func repairNotes(_ tokens: inout [String], from start: Int, inLyric: inout Bool) {
         guard start < tokens.count else { return }
-        var leading = false
-        if strongNotes.contains(tokens[start]) || weakNotes.contains(tokens[start]) {
-            tokens[start] = "♪"
-            leading = true
-        }
         let last = tokens.count - 1
-        var trailing = false
-        if last > start, strongNotes.contains(tokens[last])
-            || ((leading || inLyric) && weakNotes.contains(tokens[last])) {
+        let startsWithNote = tokens[start].allSatisfy { musicGlyphs.contains($0) }
+        let endsWithNote = last > start && tokens[last].allSatisfy { musicGlyphs.contains($0) }
+        if (inLyric || endsWithNote), possibleNotes.contains(tokens[start]) {
+            tokens[start] = "♪"
+        }
+        let repairsEnd = last > start && (startsWithNote || inLyric) && possibleNotes.contains(tokens[last])
+        if repairsEnd {
             tokens[last] = "♪"
-            trailing = true
         }
-        if trailing || (leading && last == start) {
-            inLyric = false
-        } else if leading {
-            inLyric = true
-        }
+        inLyric = (startsWithNote || inLyric) && !endsWithNote && !repairsEnd
     }
 
-    private static func repairBrackets(
-        _ line: String,
-        open: Character,
-        close: Character,
-        openStandIns: Set<Character>,
-        closeStandIns: Set<Character>
-    ) -> String {
+    /// A pipe touching the annotation can be a misread bracket. When the boundary
+    /// is missing entirely, keep the reading so dialogue is never pulled into an annotation.
+    private static func repairBrackets(_ line: String) -> String {
         var chars = Array(line)
         var prefix = 0
         if let first = chars.first, dashes.contains(String(first)) {
@@ -221,22 +210,16 @@ enum SubtitleOCRCleanup {
             while prefix < chars.count, chars[prefix] == " " { prefix += 1 }
         }
 
-        // "crunching]" or "- lcrunching]" → "[crunching]" / "- [crunching]"
-        if let firstClose = chars.firstIndex(of: close), firstClose > prefix, !chars[..<firstClose].contains(open) {
-            if openStandIns.contains(chars[prefix]), prefix + 1 < firstClose, chars[prefix + 1].isLowercase {
-                chars[prefix] = open
-            } else {
-                chars.insert(open, at: prefix)
-            }
+        if let firstClose = chars.firstIndex(of: "]"), prefix + 1 < firstClose,
+           chars[prefix] == "|", chars[prefix + 1].isLetter,
+           !chars[prefix..<firstClose].contains("[") {
+            chars[prefix] = "["
         }
 
-        // "[sighs" or "[sighs|" → "[sighs]"
-        if let lastOpen = chars.lastIndex(of: open), chars.count - lastOpen > 1, !chars[lastOpen...].contains(close) {
-            if let last = chars.last, closeStandIns.contains(last), chars.count - lastOpen > 2 {
-                chars[chars.count - 1] = close
-            } else {
-                chars.append(close)
-            }
+        if let lastOpen = chars.lastIndex(of: "["), chars.count - lastOpen > 2,
+           chars.last == "|", chars[chars.count - 2].isLetter,
+           !chars[lastOpen...].contains("]") {
+            chars[chars.count - 1] = "]"
         }
         return String(chars)
     }

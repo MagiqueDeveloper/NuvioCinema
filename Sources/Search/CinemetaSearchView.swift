@@ -68,7 +68,6 @@ final class SearchViewController: UIViewController, UISearchResultsUpdating {
         // The container presents its search controller, so its focus updates can bypass this controller.
         guard isTabActive,
               let context = notification.userInfo?[UIFocusSystem.focusUpdateContextUserInfoKey] as? UIFocusUpdateContext else { return }
-        results.schedulePosterUpdate()
         guard isSearchInput(context.nextFocusedItem), !isSearchInput(context.previouslyFocusedItem) else { return }
         scheduleSearchInputActivation()
     }
@@ -106,18 +105,16 @@ private final class SearchResultsController: UICollectionViewController, UIColle
     private var isActive = false
     private var resultsByID: [String: CinemetaSearchResult] = [:]
     private var names: [String: String] = [:]
-    private var hasFailure = false
-    private var searchFinished = false
+    private var catalog: CinemetaCatalog?
+    private var isRetrying = false
     private var searchGeneration = UUID()
-    private var missingPosterIDs = Set<String>()
-    private var hasScheduledPosterUpdate = false
     private var gridStatus: GridStatus?
-    private var selectedResultID: String?
     private var restoringResultID: String?
 
     private struct GridStatus: Equatable {
         let message: String
         var canRetry = false
+        var isRetrying = false
     }
 
     init(titles: CinemaTitleNavigation) {
@@ -147,12 +144,7 @@ private final class SearchResultsController: UICollectionViewController, UIColle
                 cell.showSkeleton()
                 return
             }
-            let generation = searchGeneration
-            cell.configure(name: names[id] ?? result.title.name, artworkURLs: result.searchPosterURLs) { [weak self] in
-                guard let self, searchGeneration == generation, resultsByID[id] != nil else { return }
-                missingPosterIDs.insert(id)
-                schedulePosterUpdate()
-            }
+            cell.configure(name: names[id] ?? result.title.name, artworkURLs: result.searchPosterURLs)
         }
         dataSource = UICollectionViewDiffableDataSource(collectionView: collectionView) { view, indexPath, id in
             view.dequeueConfiguredReusableCell(using: registration, for: indexPath, item: id)
@@ -171,13 +163,13 @@ private final class SearchResultsController: UICollectionViewController, UIColle
         guard isActive != active else { return }
         isActive = active
         if active {
-            if !query.isEmpty && !searchFinished {
-                startSearch()
-            } else {
-                schedulePosterUpdate()
-            }
+            if !query.isEmpty && catalog == nil { startSearch() }
         } else {
             searchTask?.cancel()
+            if isRetrying {
+                isRetrying = false
+                updateStatus(hasResults: !resultsByID.isEmpty)
+            }
         }
     }
 
@@ -192,11 +184,8 @@ private final class SearchResultsController: UICollectionViewController, UIColle
         searchTask?.cancel()
         let generation = UUID()
         searchGeneration = generation
-        missingPosterIDs.removeAll()
-        hasScheduledPosterUpdate = false
-        selectedResultID = nil
-        searchFinished = false
-        hasFailure = false
+        catalog = nil
+        isRetrying = false
         loadViewIfNeeded()
         applyResults()
         collectionView.setContentOffset(CGPoint(x: -collectionView.adjustedContentInset.left,
@@ -205,64 +194,78 @@ private final class SearchResultsController: UICollectionViewController, UIColle
         let term = query
         searchTask = Task { [weak self] in
             guard (try? await Task.sleep(for: .milliseconds(300))) != nil else { return }
-            let catalog = await CinemetaClient().load(query: term)
+            let result = await CinemetaClient().load(query: term)
             guard !Task.isCancelled, let self, isActive, searchGeneration == generation else { return }
-            var seen = Set<String>()
-            let results = catalog.rankedResults(for: term).filter { seen.insert($0.id).inserted }
-            let knownMissing = await CinemaImageCache.shared.knownMissingURLs(in: Set(results.flatMap(\.searchPosterURLs)))
-            guard !Task.isCancelled, isActive, searchGeneration == generation else { return }
-            hasFailure = catalog.hasFailure
-            searchFinished = true
-            applyResults(results.filter { result in
-                let urls = result.searchPosterURLs
-                return urls.isEmpty || !urls.allSatisfy { knownMissing.contains($0) }
-            })
+            show(result)
         }
     }
 
-    func schedulePosterUpdate() {
-        guard isActive, !missingPosterIDs.isEmpty, !hasScheduledPosterUpdate else { return }
-        hasScheduledPosterUpdate = true
+    private func retrySearch() {
+        guard isActive, !isRetrying, let previous = catalog, previous.hasFailure else { return }
+        isRetrying = true
+        updateStatus(hasResults: !resultsByID.isEmpty)
+        let term = query
         let generation = searchGeneration
-        DispatchQueue.main.async { [weak self] in
-            guard let self, searchGeneration == generation else { return }
-            hasScheduledPosterUpdate = false
-            guard isActive else { return }
-            removeMissingPosters()
+        searchTask = Task { [weak self] in
+            let result = await CinemetaClient().retrySearch(query: term, retaining: previous)
+            guard !Task.isCancelled, let self, isActive, searchGeneration == generation else { return }
+            isRetrying = false
+            show(result, preservingPosition: true)
         }
     }
 
-    private func removeMissingPosters() {
-        var removing = missingPosterIDs
-        // Let the currently focused card stay in place until the remote moves away.
-        if let focusedCell = UIFocusSystem.focusSystem(for: collectionView)?.focusedItem as? PosterCell,
-           let path = collectionView.indexPath(for: focusedCell), let id = dataSource.itemIdentifier(for: path) {
-            removing.remove(id)
-        }
-        if let selectedResultID { removing.remove(selectedResultID) }
-        guard !removing.isEmpty else { return }
-        missingPosterIDs.subtract(removing)
-        let remaining = dataSource.snapshot().itemIdentifiers.compactMap { id in
-            removing.contains(id) ? nil : resultsByID[id]
-        }
-        applyResults(remaining)
+    private func show(_ catalog: CinemetaCatalog, preservingPosition: Bool = false) {
+        self.catalog = catalog
+        var seen = Set<String>()
+        let ranked = catalog.rankedResults(for: query).filter { seen.insert($0.id).inserted }
+        applyResults(ranked, preservingPosition: preservingPosition)
     }
 
-    private func applyResults(_ results: [CinemetaSearchResult] = []) {
+    private func applyResults(_ results: [CinemetaSearchResult] = [], preservingPosition: Bool = false) {
+        let previousOffset = collectionView.contentOffset
+        let focusSystem = preservingPosition ? UIFocusSystem.focusSystem(for: collectionView) : nil
+        let focusedPath = (focusSystem?.focusedItem as? PosterCell).flatMap { collectionView.indexPath(for: $0) }
+        let anchorPath = focusedPath ?? collectionView.indexPathsForVisibleItems.min()
+        let anchor = preservingPosition ? anchorPath.flatMap { path in
+            dataSource.itemIdentifier(for: path).flatMap { id in
+                collectionView.layoutAttributesForItem(at: path).map { (id: id, y: $0.frame.minY) }
+            }
+        } : nil
+        let focusedID = focusedPath.flatMap { dataSource.itemIdentifier(for: $0) }
         let newNames = CinemetaSearchResult.disambiguatedNames(for: results)
         let previousIDs = Set(dataSource.snapshot().itemIdentifiers)
         resultsByID = Dictionary(uniqueKeysWithValues: results.map { ($0.id, $0) })
 
         var snapshot = NSDiffableDataSourceSnapshot<Int, String>()
         snapshot.appendSections([0])
-        let showsSkeleton = isActive && !query.isEmpty && !searchFinished && results.isEmpty
+        let showsSkeleton = isActive && !query.isEmpty && catalog == nil && results.isEmpty
         snapshot.appendItems(showsSkeleton ? (0..<12).map { "skeleton-\($0)" } : results.map(\.id))
         snapshot.reconfigureItems(results.map(\.id).filter { previousIDs.contains($0) && names[$0] != newNames[$0] })
         names = newNames
-        let previousStatus = gridStatus
-        gridStatus = statusForResults(hasResults: !results.isEmpty)
+        restoringResultID = focusedID
+        defer { restoringResultID = nil }
         dataSource.apply(snapshot, animatingDifferences: false)
+        updateStatus(hasResults: !results.isEmpty)
+        if let anchor, let path = dataSource.indexPath(for: anchor.id) {
+            collectionView.layoutIfNeeded()
+            if let frame = collectionView.layoutAttributesForItem(at: path)?.frame {
+                let insets = collectionView.adjustedContentInset
+                let minimum = -insets.top
+                let maximum = max(minimum, collectionView.contentSize.height - collectionView.bounds.height + insets.bottom)
+                let y = min(maximum, max(minimum, previousOffset.y + frame.minY - anchor.y))
+                collectionView.setContentOffset(CGPoint(x: previousOffset.x, y: y), animated: false)
+                if focusedID == anchor.id, titles.screens.isEmpty,
+                   let cell = collectionView.cellForItem(at: path), !cell.isFocused {
+                    focusSystem?.requestFocusUpdate(to: collectionView)
+                    focusSystem?.updateFocusIfNeeded()
+                }
+            }
+        }
+    }
 
+    private func updateStatus(hasResults: Bool) {
+        let previousStatus = gridStatus
+        gridStatus = statusForResults(hasResults: hasResults)
         if previousStatus != gridStatus {
             collectionView.collectionViewLayout.invalidateLayout()
             for footer in collectionView.visibleSupplementaryViews(ofKind: UICollectionView.elementKindSectionFooter) {
@@ -274,12 +277,12 @@ private final class SearchResultsController: UICollectionViewController, UIColle
     }
 
     private func statusForResults(hasResults: Bool) -> GridStatus? {
-        guard !query.isEmpty, searchFinished else { return nil }
-        if hasFailure {
+        guard !query.isEmpty, let catalog else { return nil }
+        if catalog.hasFailure {
             let message = hasResults
                 ? String(localized: "Some search results couldn’t load.")
                 : String(localized: "Couldn’t load search results.")
-            return GridStatus(message: message, canRetry: true)
+            return GridStatus(message: message, canRetry: true, isRetrying: isRetrying)
         }
         guard !hasResults else { return nil }
         return GridStatus(message: String(localized: "No results for “\(query)”."))
@@ -288,8 +291,8 @@ private final class SearchResultsController: UICollectionViewController, UIColle
     private func configureStatus(_ footer: SearchGridStatus) {
         footer.isHidden = gridStatus == nil
         guard let gridStatus else { return }
-        footer.configure(gridStatus.message, canRetry: gridStatus.canRetry)
-        footer.retryAction = { [weak self] in self?.startSearch() }
+        footer.configure(gridStatus.message, canRetry: gridStatus.canRetry, isRetrying: gridStatus.isRetrying)
+        footer.retryAction = { [weak self] in self?.retrySearch() }
     }
 
     override func indexPathForPreferredFocusedView(in collectionView: UICollectionView) -> IndexPath? {
@@ -316,12 +319,9 @@ private final class SearchResultsController: UICollectionViewController, UIColle
         let offset = collectionView.contentOffset.y + collectionView.adjustedContentInset.top
         let resultIDs = dataSource.snapshot().itemIdentifiers
         let generation = searchGeneration
-        selectedResultID = id
         titles.show(onDismiss: { [weak self] in
             guard let self, searchGeneration == generation else { return }
             restoreResultFocus(for: id, offset: offset, resultIDs: resultIDs)
-            selectedResultID = nil
-            schedulePosterUpdate()
         }) { close in
             TitleDetailsView(title: result.title, kind: result.kind, onDismiss: close)
         }
@@ -387,8 +387,9 @@ private final class SearchGridStatus: UICollectionReusableView {
     @available(*, unavailable)
     required init?(coder: NSCoder) { fatalError("Search status is created in code") }
 
-    func configure(_ message: String, canRetry: Bool = false) {
+    func configure(_ message: String, canRetry: Bool, isRetrying: Bool) {
         label.text = message
         retry.isHidden = !canRetry
+        retry.setTitle(isRetrying ? String(localized: "Retrying…") : String(localized: "Try Again"), for: .normal)
     }
 }

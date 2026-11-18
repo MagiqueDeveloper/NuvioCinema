@@ -58,7 +58,7 @@ Generate the workspace from the repository root.
 Scripts/prepare-upstream-player --generate
 ```
 
-The script checks out the pinned NuvioTVOS revision, applies Cinema’s player patches, and copies Cinema’s Swift sources into the generated workspace.
+The script checks out the pinned NuvioTVOS revision, applies Cinema’s player patches in numeric order, and copies Cinema’s Swift sources into the generated workspace. When the patch set or upstream revision changes, it prepares a fresh checkout before replacing the old one. Previous checkouts are saved under `build/upstream-player-previous.*`.
 
 ### Run in the simulator
 
@@ -105,7 +105,7 @@ If your signer changes the bundle IDs, keep the extension ID under the app’s b
 
 ## Contributing
 
-Cinema’s Swift code lives in [`Sources/`](Sources), grouped by feature. Changes to the bundled player go in [`Scripts/Patches/`](Scripts/Patches). The [Build tvOS workflow](.github/workflows/build.yml) compiles an unsigned Release build for Apple TV hardware.
+Cinema’s Swift code lives in [`Sources/`](Sources), grouped by feature. Changes to the bundled player go in [`Scripts/Patches/`](Scripts/Patches). Run the `NuvioTV` scheme’s Test action on an Apple TV simulator to run the Cinema tests. The [Build tvOS workflow](.github/workflows/build.yml) runs these tests and compiles an unsigned Release build for Apple TV hardware.
 
 Check UI changes with an Apple TV remote or the simulator. For a playback issue, include the tvOS version, player backend, and steps to reproduce it. Remove account details and private add-on URLs from logs before sharing them. Debug builds log public artwork and metadata cache hits, request counts, bytes, and rate limits under `PublicNetwork`.
 

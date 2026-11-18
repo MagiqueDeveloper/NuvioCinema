@@ -50,9 +50,9 @@ struct NuvioAddon: Decodable, Identifiable, Sendable {
 }
 
 struct NuvioProgress: Decodable, Equatable, Identifiable, Sendable {
-    let id: String
+    fileprivate let serverID: String?
     let contentID: String
-    let contentType: String
+    fileprivate let rawContentType: String
     let title: String?
     let season: Int?
     let episode: Int?
@@ -61,13 +61,21 @@ struct NuvioProgress: Decodable, Equatable, Identifiable, Sendable {
     fileprivate let lastWatched: Int64
     let progressKey: String?
 
+    var id: String {
+        if let serverID { return serverID }
+        if let progressKey { return "\(contentType):\(progressKey)" }
+        if let season, let episode { return "\(contentType):\(contentID)_s\(season)e\(episode)" }
+        return "\(contentType):\(contentID)"
+    }
+    var contentType: String { normalizedNuvioContentType(rawContentType) }
     var fraction: Double { duration > 0 ? min(1, max(0, Double(position) / Double(duration))) : 0 }
     var updatedAt: Date { Date(timeIntervalSince1970: Double(lastWatched) / 1_000) }
 
     private enum CodingKeys: String, CodingKey {
-        case id, title, season, episode, position, duration
+        case title, season, episode, position, duration
+        case serverID = "id"
         case contentID = "content_id"
-        case contentType = "content_type"
+        case rawContentType = "content_type"
         case lastWatched = "last_watched"
         case progressKey = "progress_key"
     }
@@ -76,18 +84,19 @@ struct NuvioProgress: Decodable, Equatable, Identifiable, Sendable {
 struct NuvioHistory: Decodable, Identifiable, Sendable {
     let id: String
     let contentID: String
-    let contentType: String
+    fileprivate let rawContentType: String
     let title: String
     let season: Int?
     let episode: Int?
     fileprivate let watched: Int64
 
+    var contentType: String { normalizedNuvioContentType(rawContentType) }
     var watchedAt: Date { Date(timeIntervalSince1970: Double(watched) / 1_000) }
 
     private enum CodingKeys: String, CodingKey {
         case id, title, season, episode
         case contentID = "content_id"
-        case contentType = "content_type"
+        case rawContentType = "content_type"
         case watched = "watched_at"
     }
 }
@@ -95,11 +104,12 @@ struct NuvioHistory: Decodable, Identifiable, Sendable {
 struct NuvioLibraryItem: Decodable, Identifiable, Sendable {
     let id: String
     let contentID: String
-    let contentType: String
+    private let rawContentType: String
     let name: String
     private let posterAddress: String?
     private let added: Int64
 
+    var contentType: String { normalizedNuvioContentType(rawContentType) }
     var title: String { name }
     var addedAt: Date { Date(timeIntervalSince1970: Double(added) / 1_000) }
     var poster: URL? {
@@ -111,9 +121,17 @@ struct NuvioLibraryItem: Decodable, Identifiable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, name
         case contentID = "content_id"
-        case contentType = "content_type"
+        case rawContentType = "content_type"
         case posterAddress = "poster"
         case added = "added_at"
+    }
+}
+
+private func normalizedNuvioContentType(_ type: String) -> String {
+    switch type.lowercased() {
+    case "tv", "series": "series"
+    case "movie": "movie"
+    default: type
     }
 }
 
@@ -148,7 +166,7 @@ struct NuvioProgressUpdate: Codable, Sendable {
     var key: String { "\(contentType):\(progressKey)" }
 
     func row(id: String? = nil, title: String? = nil) -> NuvioProgress {
-        NuvioProgress(id: id ?? key, contentID: contentID, contentType: contentType, title: title, season: season,
+        NuvioProgress(serverID: id ?? key, contentID: contentID, rawContentType: contentType, title: title, season: season,
                       episode: episode, position: position, duration: duration, lastWatched: timestamp, progressKey: progressKey)
     }
 
@@ -175,7 +193,7 @@ struct NuvioWatchedUpdate: Codable, Sendable {
     let timestamp: Int64
 
     func row(key: String, id: String? = nil) -> NuvioHistory {
-        NuvioHistory(id: id ?? key, contentID: contentID, contentType: contentType, title: title,
+        NuvioHistory(id: id ?? key, contentID: contentID, rawContentType: contentType, title: title,
                      season: season, episode: episode, watched: timestamp)
     }
 
@@ -356,7 +374,7 @@ struct NuvioCloud: Sendable {
     }
 
     func progress(profile: Int, session current: NuvioSession) async throws -> [NuvioProgress] {
-        try await rpc("sync_pull_watch_progress", body: ["p_profile_id": profile, "p_limit": 200], session: current)
+        try await rpc("sync_pull_watch_progress", body: ["p_profile_id": profile], session: current)
     }
 
     func history(profile: Int, session current: NuvioSession) async throws -> [NuvioHistory] {
@@ -401,7 +419,19 @@ struct NuvioCloud: Sendable {
     }
 
     func library(profile: Int, session current: NuvioSession) async throws -> [NuvioLibraryItem] {
-        try await rpc("sync_pull_library", body: ["p_profile_id": profile, "p_limit": 200, "p_offset": 0], session: current)
+        let pageSize = 200
+        var library: [NuvioLibraryItem] = []
+        var seen = Set<NuvioLibraryItem.ID>()
+        var offset = 0
+        while true {
+            let rows: [NuvioLibraryItem] = try await rpc("sync_pull_library", body: [
+                "p_profile_id": profile, "p_limit": pageSize, "p_offset": offset
+            ], session: current)
+            let additionalRows = rows.filter { seen.insert($0.id).inserted }
+            library += additionalRows
+            guard rows.count == pageSize, !additionalRows.isEmpty else { return library }
+            offset += rows.count
+        }
     }
 
     func verifyPIN(_ pin: String, profile: Int, session current: NuvioSession) async throws -> NuvioPINResult {

@@ -4,7 +4,7 @@ set -eu
 revision=735adf8859462b5beb47dbc96a51c75ded15c685
 repository=https://github.com/bobsupra/NuvioTVOS.git
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-checkout="$root/.upstream-player"
+destination="$root/.upstream-player"
 seed=
 generate=false
 
@@ -37,28 +37,77 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
-if [ ! -d "$checkout/.git" ]; then
-    [ ! -e "$checkout" ] || die "Expected a Git checkout at $checkout."
-    if [ -n "$seed" ]; then
-        [ "$(git -C "$seed" rev-parse HEAD)" = "$revision" ] || die "Seed must be at $revision."
-        mkdir "$checkout"
-        cp -cR "$seed/.git" "$checkout/.git"
-        git -C "$checkout" checkout-index -a --prefix="$checkout/"
-    else
-        git init -q "$checkout"
-        git -C "$checkout" remote add origin "$repository"
+# Hold the same lock while inspecting the fingerprint, preparing, and publishing.
+if [ "${NUVIO_PREPARE_LOCKED_ROOT:-}" != "$root" ]; then
+    mkdir -p "$root/build"
+    set --
+    if [ -n "$seed" ]; then set -- --checkout "$seed"; fi
+    if [ "$generate" = true ]; then set -- "$@" --generate; fi
+    exec lockf -k "$root/build/.prepare-upstream-player.lock" \
+        env NUVIO_PREPARE_LOCKED_ROOT="$root" "$root/Scripts/prepare-upstream-player" "$@"
+fi
+
+if [ -e "$destination" ] && [ ! -d "$destination/.git" ]; then
+    die "Expected a Git checkout at $destination."
+fi
+if [ -n "$seed" ]; then
+    [ "$(git -C "$seed" rev-parse HEAD)" = "$revision" ] || die "Seed must be at $revision."
+fi
+
+fingerprint=$(python3 - "$revision" "$root/Scripts/Patches" <<'PY'
+import hashlib
+import pathlib
+import sys
+
+revision, directory = sys.argv[1:]
+digest = hashlib.sha256(revision.encode())
+for patch in sorted(pathlib.Path(directory).glob("*.patch")):
+    digest.update(b"\0" + patch.name.encode() + b"\0")
+    digest.update(hashlib.sha256(patch.read_bytes()).digest())
+print(digest.hexdigest())
+PY
+)
+
+checkout="$destination"
+staging=
+previous=
+cleanup() {
+    if [ -n "$previous" ] && [ -d "$previous/.git" ] && [ ! -e "$destination" ]; then
+        mv "$previous" "$destination" || printf 'Previous checkout is at %s\n' "$previous" >&2
     fi
-fi
+    if [ -n "$staging" ]; then rm -rf "$staging"; fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
 
-if ! git -C "$checkout" cat-file -e "$revision^{commit}" 2>/dev/null; then
-    git -C "$checkout" fetch --depth=1 origin "$revision"
-fi
-if [ "$(git -C "$checkout" rev-parse --verify HEAD 2>/dev/null || true)" != "$revision" ]; then
+if [ "$(cat "$destination/.git/nuviocinema-patches" 2>/dev/null || true)" != "$fingerprint" ] ||
+    [ "$(git -C "$destination" rev-parse --verify HEAD 2>/dev/null || true)" != "$revision" ]; then
+    staging=$(mktemp -d "$root/build/prepare-player.XXXXXX")
+    checkout="$staging/checkout"
+    reference="$seed"
+    if [ -z "$reference" ] && git -C "$destination" cat-file -e "$revision^{commit}" 2>/dev/null; then
+        reference="$destination"
+    fi
+    git init -q "$checkout"
+    git -C "$checkout" remote add origin "$repository"
+    if [ -n "$reference" ]; then
+        # A sparse, shallow seed may lack objects outside the player paths. Copy
+        # its object database instead of asking upload-pack to pack the whole tree.
+        git_directory=$(git -C "$reference" rev-parse --path-format=absolute --git-common-dir)
+        cp -cR "$git_directory/objects/." "$checkout/.git/objects/"
+        if [ -f "$git_directory/shallow" ]; then cp "$git_directory/shallow" "$checkout/.git/shallow"; fi
+        if [ "$(git -C "$reference" config --bool core.sparseCheckout || true)" = true ]; then
+            git -C "$checkout" sparse-checkout set --sparse-index .github MPVKit ThirdParty Vendor tvosApp
+        fi
+    else
+        git -C "$checkout" fetch --quiet --depth=1 --no-tags origin "$revision"
+    fi
     git -C "$checkout" checkout --quiet --detach "$revision"
-fi
 
-if git -C "$checkout" config --bool core.sparseCheckout | grep -qx true; then
-    git -C "$checkout" sparse-checkout add MPVKit ThirdParty Vendor tvosApp
+    if [ -f "$destination/tvosApp/Configurations/Signing.local.xcconfig" ]; then
+        cp "$destination/tvosApp/Configurations/Signing.local.xcconfig" "$checkout/tvosApp/Configurations/"
+    fi
+    if [ -d "$destination/tvosApp/NuvioTV.xcworkspace" ]; then generate=true; fi
 fi
 
 for path in Tuist.swift tvosApp/Project.swift tvosApp/NuvioTV/Info.plist MPVKit/Package.swift \
@@ -66,13 +115,11 @@ for path in Tuist.swift tvosApp/Project.swift tvosApp/NuvioTV/Info.plist MPVKit/
     [ -f "$checkout/$path" ] || die "Upstream checkout is missing $path."
 done
 
-for patch in "$root"/Scripts/Patches/*.patch; do
-    if git -C "$checkout" apply --check "$patch" 2>/dev/null; then
-        git -C "$checkout" apply "$patch"
-    elif ! git -C "$checkout" apply --reverse --check "$patch"; then
-        die "Could not apply $(basename "$patch") to the pinned player."
-    fi
-done
+if [ -n "$staging" ]; then
+    for patch in "$root"/Scripts/Patches/*.patch; do
+        git -C "$checkout" apply "$patch" || die "Could not apply $(basename "$patch") to the pinned player."
+    done
+fi
 
 python3 - "$root" "$checkout" "$revision" <<'PY'
 import pathlib
@@ -111,15 +158,18 @@ project = replace_once(project, '    resources: [\n        "NuvioTV/Images.xcass
                         '        .folderReference(path: "NuvioTV/CinemaResources/ThirdPartyNotices"),')
 project = replace_once(project, '            "ENABLE_BITCODE": "NO",',
                         '            "ENABLE_BITCODE": "NO",\n'
+                        '            "PRODUCT_MODULE_NAME": "NuvioTV",\n'
                         '            "EXCLUDED_ARCHS[sdk=appletvsimulator*]": "x86_64",\n'
                         '            "SWIFT_ACTIVE_COMPILATION_CONDITIONS": "$(inherited) NUVIO_UPSTREAM_PLAYER",')
-target_start = project.index('let unitTestsTarget: Target')
-target_end = project.index('// MARK: - Project\n', target_start)
-project = project[:target_start] + project[target_end:]
+test_sources_start = project.index('    // These five files exist on disk')
+test_sources_end = project.index('    dependencies:', test_sources_start)
+project = project[:test_sources_start] + '    sources: ["CinemaTests/**/*.swift"],\n' + project[test_sources_end:]
+ui_tests_start = project.index('// UI flows have separate data/setup requirements')
+ui_tests_end = project.index('// MARK: - Project\n', ui_tests_start)
+project = project[:ui_tests_start] + project[ui_tests_end:]
+project = project.replace('"NuvioTVTests"', '"CinemaTests"')
 project = replace_once(project, '    targets: [appTarget, topShelfTarget, unitTestsTarget, uiTestsTarget],',
-                        '    targets: [appTarget, topShelfTarget],')
-project = replace_once(project,
-    '            testAction: .targets(\n                ["NuvioTVTests"],\n                configuration: "Debug"\n            ),\n', '')
+                        '    targets: [appTarget, topShelfTarget, unitTestsTarget],')
 project = replace_once(project,
     '''        .scheme(
             name: "NuvioTV-UI",
@@ -152,7 +202,8 @@ info["NSAppTransportSecurity"] = {"NSAllowsLocalNetworking": True}
 
 source_overlay = app / "CinemaSources"
 resource_overlay = app / "CinemaResources"
-for folder in (source_overlay, resource_overlay):
+test_overlay = checkout / "tvosApp/CinemaTests"
+for folder in (source_overlay, resource_overlay, test_overlay):
     if folder.exists():
         shutil.rmtree(folder)
     folder.mkdir()
@@ -163,6 +214,11 @@ for path in sorted(source_root.rglob("*.swift")):
     if path.is_relative_to(legacy_playback):
         continue
     destination = source_overlay / path.relative_to(source_root)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(path, destination)
+
+for path in sorted((root / "Tests").rglob("*.swift")):
+    destination = test_overlay / path.relative_to(root / "Tests")
     destination.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, destination)
 
@@ -293,15 +349,16 @@ top_shelf_provider = replace_once(top_shelf_provider, '''        // One button, 
         }
 ''')
 catalog_models_path = "tvosApp/NuvioTV/Sources/Models/CatalogModels.swift"
-catalog_models = upstream(catalog_models_path).decode()
-catalog_models = replace_once(catalog_models, '''    static func writeTopShelfFeed() {
+catalog_models = (checkout / catalog_models_path).read_text()
+original_top_shelf_writer = '''    static func writeTopShelfFeed() {
         guard TopShelfFeedStore.isAvailable else { return }
         topShelfSnapshotLock.lock()
         defer { topShelfSnapshotLock.unlock() }
         guard TraktSettingsStore.watchProgressSource == .nuvioSync else { return }
         writeTopShelfFeedLocked(from: items())
     }
-''', '''    static func writeTopShelfFeed() {
+'''
+cinema_top_shelf_writer = '''    static func writeTopShelfFeed() {
         #if !NUVIO_UPSTREAM_PLAYER
         guard TopShelfFeedStore.isAvailable else { return }
         topShelfSnapshotLock.lock()
@@ -310,7 +367,9 @@ catalog_models = replace_once(catalog_models, '''    static func writeTopShelfFe
         writeTopShelfFeedLocked(from: items())
         #endif
     }
-''')
+'''
+if cinema_top_shelf_writer not in catalog_models:
+    catalog_models = replace_once(catalog_models, original_top_shelf_writer, cinema_top_shelf_writer)
 for path in ("tvosApp/NuvioTV/NuvioTV.entitlements", "tvosApp/TopShelf/TopShelf.entitlements"):
     entitlements = {"com.apple.security.application-groups": ["group.com.nuviocinema.app"]}
     (checkout / path).write_bytes(plistlib.dumps(entitlements))
@@ -361,21 +420,29 @@ PY
 if [ "$generate" = true ]; then
     tuist_bin=${NUVIO_TUIST_BIN:-tuist}
     command -v "$tuist_bin" >/dev/null || die "Install Tuist or set NUVIO_TUIST_BIN to its executable."
-    "$tuist_bin" generate --path "$checkout/tvosApp" --no-open --no-binary-cache
+    "$tuist_bin" generate --path "$checkout/tvosApp" --no-open --cache-profile none
 fi
 
 workspace="$checkout/tvosApp/NuvioTV.xcworkspace"
 lock_dir="$workspace/xcshareddata/swiftpm"
 lock="$lock_dir/Package.resolved"
 if [ -d "$workspace" ] && [ -f "$checkout/tvosApp/.package.resolved" ]; then
-    if [ -L "$lock" ] && [ "$(readlink "$lock")" != "$checkout/tvosApp/.package.resolved" ]; then
-        # A generated lock should never point at the separate reference checkout.
-        rm "$lock"
-    fi
+    if [ -L "$lock" ]; then rm "$lock"; fi
     if [ ! -e "$lock" ]; then
         mkdir -p "$lock_dir"
         cp "$checkout/tvosApp/.package.resolved" "$lock"
     fi
 fi
 
-printf '%s\n' "$workspace"
+if [ -n "$staging" ]; then
+    printf '%s\n' "$fingerprint" > "$checkout/.git/nuviocinema-patches"
+    if [ -d "$destination/.git" ]; then
+        previous=$(mktemp -d "$root/build/upstream-player-previous.XXXXXX")
+        rmdir "$previous"
+        mv "$destination" "$previous"
+    fi
+    mv "$checkout" "$destination"
+    if [ -n "$previous" ]; then printf 'Previous player checkout saved to %s\n' "$previous" >&2; fi
+fi
+
+printf '%s\n' "$destination/tvosApp/NuvioTV.xcworkspace"

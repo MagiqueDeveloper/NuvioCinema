@@ -8,7 +8,7 @@ struct AddonStream: Identifiable, Sendable {
         case video(URL), external(URL)
     }
 
-    let id: UUID
+    var id: UUID
     let addon: String
     let name: String
     let description: String?
@@ -20,6 +20,21 @@ struct AddonStream: Identifiable, Sendable {
     let destination: Destination
     let requestHeaders: [String: String]
     var focusKeys: [FocusKey] = []
+
+    var playbackSourceID: String {
+        let url: URL
+        let kind: String
+        switch destination {
+        case .video(let value): (kind, url) = ("video", value)
+        case .external(let value): (kind, url) = ("external", value)
+        }
+        let headers = requestHeaders.map {
+            ($0.key.lowercased(), $0.value.trimmingCharacters(in: .whitespaces))
+        }.sorted { ($0.0, $0.1) < ($1.0, $1.1) }
+        let parts = [kind, url.absoluteString] + headers.flatMap { [$0.0, $0.1] }
+        let key = parts.map { "\($0.utf8.count):\($0)" }.joined()
+        return "cinema-\(SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined())"
+    }
 
     var prefersAether: Bool {
         guard case .video(let url) = destination else { return false }
@@ -68,6 +83,7 @@ struct AddonStreamResults: Sendable {
     let streams: [AddonStream]
     let failedAddons: Int
     let unsupportedStreams: Int
+    var isComplete = true
 
     func focusKeys(for stream: AddonStream) -> [AddonStream.FocusKey] {
         // Remember only keys that distinguish this row in the old list. The replacement list
@@ -130,31 +146,65 @@ struct AddonStreams: Sendable {
     }
 
     func load(addons: [NuvioAddon], kind: CinemetaKind, videoIDs: [String]) async -> AddonStreamResults {
-        let active = addons.filter(\.enabled).sorted { ($0.sortOrder, $0.id) < ($1.sortOrder, $1.id) }
-        var results: [ProviderResult] = []
+        var result = AddonStreamResults(streams: [], failedAddons: 0, unsupportedStreams: 0)
+        for await update in updates(addons: addons, kind: kind, videoIDs: videoIDs) {
+            result = update
+        }
+        return result
+    }
 
-        // Limit concurrent requests while keeping the user's configured source order.
-        for batchStart in stride(from: 0, to: active.count, by: 4) {
-            if Task.isCancelled { break }
-            let batchEnd = min(batchStart + 4, active.count)
-            let batch = await withTaskGroup(of: (Int, ProviderResult).self) { group in
-                for index in batchStart..<batchEnd {
-                    let addon = active[index]
-                    group.addTask { (index, await load(addon: addon, kind: kind, videoIDs: videoIDs)) }
-                }
-                var values: [(Int, ProviderResult)] = []
-                for await value in group { values.append(value) }
-                return values.sorted { $0.0 < $1.0 }.map(\.1)
+    func updates(addons: [NuvioAddon], kind: CinemetaKind, videoIDs: [String]) -> AsyncStream<AddonStreamResults> {
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let task = Task {
+                await loadProviders(addons: addons, kind: kind, videoIDs: videoIDs, into: continuation)
+                continuation.finish()
             }
-            results.append(contentsOf: batch)
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func loadProviders(addons: [NuvioAddon], kind: CinemetaKind, videoIDs: [String],
+                               into continuation: AsyncStream<AddonStreamResults>.Continuation) async {
+        let active = addons.filter(\.enabled).sorted { ($0.sortOrder, $0.id) < ($1.sortOrder, $1.id) }
+        guard !active.isEmpty else {
+            continuation.yield(AddonStreamResults(streams: [], failedAddons: 0, unsupportedStreams: 0))
+            return
         }
 
-        var seen = Set<StreamIdentity>()
-        let streams = results.flatMap(\.streams).filter {
-            seen.insert(StreamIdentity(destination: $0.destination, requestHeaders: $0.requestHeaders)).inserted
+        await withTaskGroup(of: (Int, ProviderResult).self) { group in
+            var results = Array<ProviderResult?>(repeating: nil, count: active.count)
+            var idsBySource: [String: UUID] = [:]
+            var next = min(4, active.count)
+            for index in 0..<next {
+                group.addTask { (index, await load(addon: active[index], kind: kind, videoIDs: videoIDs)) }
+            }
+            var pending = active.count
+            for await (index, result) in group {
+                guard !Task.isCancelled else { return }
+                if next < active.count {
+                    let index = next
+                    group.addTask { (index, await load(addon: active[index], kind: kind, videoIDs: videoIDs)) }
+                    next += 1
+                }
+                pending -= 1
+                results[index] = result
+                let finished = results.compactMap { $0 }
+                var seen = Set<String>()
+                let streams = finished.flatMap(\.streams).compactMap { stream -> AddonStream? in
+                    let key = stream.playbackSourceID
+                    guard seen.insert(key).inserted else { return nil }
+                    var row = stream
+                    // An earlier provider can replace a duplicate's metadata without replacing the focused row.
+                    row.id = idsBySource[key, default: stream.id]
+                    idsBySource[key] = row.id
+                    return row
+                }
+                continuation.yield(AddonStreamResults(
+                    streams: streams, failedAddons: finished.filter(\.failed).count,
+                    unsupportedStreams: finished.reduce(0) { $0 + $1.unsupported }, isComplete: pending == 0
+                ))
+            }
         }
-        return AddonStreamResults(streams: streams, failedAddons: results.filter(\.failed).count,
-                                  unsupportedStreams: results.reduce(0) { $0 + $1.unsupported })
     }
 
     private func load(addon: NuvioAddon, kind: CinemetaKind, videoIDs: [String]) async -> ProviderResult {
@@ -280,11 +330,6 @@ struct AddonStreams: Sendable {
         var streams: [AddonStream] = []
         var unsupported = 0
         var failed = false
-    }
-
-    private struct StreamIdentity: Hashable {
-        let destination: AddonStream.Destination
-        let requestHeaders: [String: String]
     }
 
     private struct Manifest: Decodable {

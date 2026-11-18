@@ -49,17 +49,29 @@ struct HeroCarousel {
         case unavailable
 
         nonisolated static func load(_ url: URL) async -> Self {
-            do {
-                return .image(try await CinemaImageCache.shared.image(for: url))
-            } catch {
-                return .unavailable
+            let delays: [Duration] = [.zero, .seconds(1), .seconds(3)]
+            for delay in delays {
+                do {
+                    if delay > .zero { try await Task.sleep(for: delay) }
+                    return .image(try await CinemaImageCache.shared.image(for: url))
+                } catch let error as URLError where error.code != .cancelled {
+                    continue
+                } catch CinemaImageError.response(let status) where status == 408 || (500..<600).contains(status) {
+                    continue
+                } catch CinemaImageError.throttled {
+                    continue
+                } catch {
+                    return .unavailable
+                }
             }
+            return .unavailable
         }
     }
 
-    struct BackdropSlice {
+    struct BackdropSlice: Equatable {
         let index: Int
         let coverage: Range<Double>
+        let horizontalOffset: Double
     }
 
     struct Banner {
@@ -73,6 +85,11 @@ struct HeroCarousel {
             startControlPoint: UnitPoint(x: 0.24, y: 0),
             endControlPoint: UnitPoint(x: 0.26, y: 1)
         )
+        private static let slideCurve = UnitCurve.bezier(
+            startControlPoint: UnitPoint(x: 0.32, y: 0),
+            endControlPoint: UnitPoint(x: 0.48, y: 1)
+        )
+        private static let artworkTravel = 0.05
 
         let id = UUID()
         let outgoingArtwork: [BackdropSlice]
@@ -81,9 +98,9 @@ struct HeroCarousel {
         let start: ContinuousClock.Instant
         let isInterruption: Bool
 
-        private var wipeDelay: Duration { isInterruption ? .zero : .milliseconds(90) }
+        private var wipeDelay: Duration { isInterruption ? .zero : .milliseconds(75) }
         private var fadeOutDuration: Duration { isInterruption ? .milliseconds(45) : wipeDelay }
-        private var wipeDuration: Duration { isInterruption ? .milliseconds(175) : .milliseconds(345) }
+        private var wipeDuration: Duration { isInterruption ? .milliseconds(340) : .milliseconds(600) }
         private var fadeInDuration: Duration { isInterruption ? .milliseconds(95) : .milliseconds(175) }
         private var wipeEnd: Duration { wipeDelay + wipeDuration }
         var duration: Duration { wipeEnd + fadeInDuration }
@@ -99,22 +116,23 @@ struct HeroCarousel {
             return Banner(index: index, opacity: Self.revealCurve.value(at: fadeIn))
         }
 
-        func outgoingCoverage(at now: ContinuousClock.Instant) -> Range<Double> {
-            let elapsed = start.duration(to: now) - wipeDelay
-            let progress = Self.revealCurve.value(at: Self.fraction(elapsed, of: wipeDuration))
-            return step < 0 ? progress..<1 : 0..<(1 - progress)
-        }
-
         func backdrop(at now: ContinuousClock.Instant, entering index: Int) -> [BackdropSlice] {
-            let visible = outgoingCoverage(at: now)
+            let elapsed = start.duration(to: now) - wipeDelay
+            let progress = Self.slideCurve.value(at: Self.fraction(elapsed, of: wipeDuration))
+            let visible = step < 0 ? progress..<1 : 0..<(1 - progress)
+            let travel = step < 0 ? -Self.artworkTravel : Self.artworkTravel
             let remaining = outgoingArtwork.compactMap { slice -> BackdropSlice? in
                 let lower = max(slice.coverage.lowerBound, visible.lowerBound)
                 let upper = min(slice.coverage.upperBound, visible.upperBound)
-                return lower < upper ? BackdropSlice(index: slice.index, coverage: lower..<upper) : nil
+                guard lower < upper else { return nil }
+                let offset = slice.horizontalOffset * (1 - progress) - travel * progress
+                // The wipe hides the displaced edges, including when a slide is interrupted.
+                return BackdropSlice(index: slice.index, coverage: lower..<upper,
+                                     horizontalOffset: min(lower, max(upper - 1, offset)))
             }
             let incoming = step < 0 ? 0..<visible.lowerBound : visible.upperBound..<1
             guard !incoming.isEmpty else { return remaining }
-            let slice = BackdropSlice(index: index, coverage: incoming)
+            let slice = BackdropSlice(index: index, coverage: incoming, horizontalOffset: travel * (1 - progress))
             return step < 0 ? [slice] + remaining : remaining + [slice]
         }
 
@@ -140,7 +158,8 @@ struct HeroCarousel {
         var next = self
         next.index = destination
         next.slide = if animated {
-            Slide(outgoingArtwork: slide?.backdrop(at: now, entering: index) ?? [BackdropSlice(index: index, coverage: 0..<1)],
+            Slide(outgoingArtwork: slide?.backdrop(at: now, entering: index)
+                    ?? [BackdropSlice(index: index, coverage: 0..<1, horizontalOffset: 0)],
                   outgoingBanner: banner(at: now), step: step, start: now, isInterruption: slide != nil)
         } else {
             nil
@@ -148,17 +167,6 @@ struct HeroCarousel {
         return next
     }
 
-    func isReady(at index: Int, waitsForLogo: Bool) -> Bool {
-        let title = entries[index].title
-        let urls = waitsForLogo ? [title.background, title.logo] : [title.background]
-        return urls.compactMap { $0 }.allSatisfy { artwork[$0] != nil }
-    }
-
-    func hasUsableBackdrop(at index: Int) -> Bool {
-        guard let url = entries[index].title.background,
-              case .image? = artwork[url] else { return false }
-        return true
-    }
 }
 
 struct HomeView: View {
@@ -207,13 +215,12 @@ struct HomeView: View {
         isActive && scenePhase == .active && titles.screens.isEmpty
     }
 
-    private var canApplyCatalog: Bool {
-        isAvailable && detailOrigin == nil && focusedItem == nil && carousel.slide == nil
-    }
-
     private var canApplyContinueWatching: Bool {
-        if case .poster? = focusedItem { return false }
-        return isAvailable && detailOrigin == nil && carousel.slide == nil
+        guard isAvailable, detailOrigin == nil, carousel.slide == nil else { return false }
+        if case let .poster(shelf, _)? = focusedItem {
+            return shelf != .continueWatching && continueWatching.isEmpty == account.continueWatching.isEmpty
+        }
+        return true
     }
 
     private var preferredReturnFocus: HomeFocusTarget? {
@@ -253,12 +260,10 @@ struct HomeView: View {
         .task(id: request) {
             await refreshCatalog(for: request)
         }
-        .onChange(of: canApplyCatalog) { _, canApply in
-            if canApply, let pendingCatalog {
-                self.pendingCatalog = nil
-                applyCatalog(pendingCatalog)
-            }
-        }
+        .onChange(of: isAvailable) { _, _ in reconcilePendingCatalog() }
+        .onChange(of: focusedItem) { _, _ in reconcilePendingCatalog() }
+        .onChange(of: preferredReturnFocus) { _, _ in reconcilePendingCatalog() }
+        .onChange(of: carousel.slide?.id) { _, _ in reconcilePendingCatalog() }
         .onChange(of: canApplyContinueWatching) { _, canApply in
             if canApply { continueWatching = account.continueWatching }
         }
@@ -290,7 +295,7 @@ struct HomeView: View {
 
         return ScrollView {
             VStack(alignment: .leading, spacing: heroGap) {
-                if catalog?.isEmpty == false || !continueWatching.isEmpty {
+                if hasHero || catalog?.isEmpty == false || !continueWatching.isEmpty {
                     if hasHero {
                         FeaturedHero(
                             height: heroHeight,
@@ -307,6 +312,7 @@ struct HomeView: View {
                     VStack(alignment: .leading, spacing: 22) {
                         CatalogShelves(
                             collections: collections,
+                            shelfOrder: catalog?.shelfOrder ?? [],
                             genrePreviews: catalog?.genrePreviews ?? [:],
                             continueWatching: continueWatching,
                             viewport: shelves,
@@ -317,7 +323,7 @@ struct HomeView: View {
                             onSelect: openShelfItem,
                             onWatchAction: performWatchAction
                         )
-                        if catalog == nil {
+                        if catalog?.isComplete != true {
                             HomeShelfSkeleton(viewport: shelves)
                         } else if catalog?.hasFailure == true {
                             CatalogStatus(message: "Some Home collections couldn’t load.", retry: retry)
@@ -325,7 +331,7 @@ struct HomeView: View {
                     }
                     .padding(.bottom, 52)
                     .frame(minHeight: height, alignment: .topLeading)
-                } else if let catalog {
+                } else if let catalog, catalog.isComplete {
                     CatalogStatus(
                         message: catalog.hasFailure ? "Couldn’t load Home collections." : "No titles available.",
                         retry: retry
@@ -494,15 +500,14 @@ struct HomeView: View {
                 if completedRequest == request.retryCount, let lastRefresh {
                     try await clock.sleep(until: lastRefresh.advanced(by: refreshInterval))
                 }
-                let updated = await CinemetaClient().loadHome()
+                let previous = pendingCatalog ?? catalog
+                let updated = await CinemetaClient().loadHome { partial in
+                    guard !Task.isCancelled, isAvailable, retryCount == request.retryCount else { return }
+                    applyCatalog(partial.preservingAvailableCollections(from: previous))
+                }
                 try Task.checkCancellation()
                 guard isAvailable, retryCount == request.retryCount else { return }
-                if catalog == nil || canApplyCatalog {
-                    pendingCatalog = nil
-                    applyCatalog(updated)
-                } else {
-                    pendingCatalog = updated
-                }
+                applyCatalog(updated.preservingAvailableCollections(from: previous))
                 lastRefresh = clock.now
                 completedRequest = request.retryCount
             }
@@ -511,17 +516,34 @@ struct HomeView: View {
         }
     }
 
-    private func applyCatalog(_ updated: HomeCatalog) {
-        let next = updated.preservingAvailableCollections(from: catalog)
-        catalog = next
+    private func reconcilePendingCatalog() {
+        if isAvailable, let pendingCatalog { applyCatalog(pendingCatalog) }
+    }
 
+    private func applyCatalog(_ next: HomeCatalog) {
+        let heldFocus = preferredReturnFocus ?? focusedItem
+        let protectedCatalog: HomeCatalog?
+        if let catalog, case let .poster(shelf, id)? = heldFocus {
+            protectedCatalog = next.preservingFocus(on: shelf, entryID: id, from: catalog)
+        } else {
+            protectedCatalog = nil
+        }
         let entries = next.featuredEntries
-        if entries.map(\.id) == carousel.entries.map(\.id) {
+        let currentID = carousel.entry?.id
+        let changesCarousel = entries.map(\.id) != carousel.entries.map(\.id)
+        let removesFocusedHero = (heldFocus == .hero || heldFocus == .nextFeatured)
+            && (!entries.contains { $0.id == currentID } || (heldFocus == .nextFeatured && entries.count < 2))
+        let movesFocusedShelf = heldFocus?.isPoster == true && entries.isEmpty != carousel.entries.isEmpty
+        let protectsCarousel = changesCarousel && (carousel.slide != nil || removesFocusedHero || movesFocusedShelf)
+        pendingCatalog = protectedCatalog != nil || protectsCarousel ? next : nil
+        catalog = protectedCatalog ?? next
+        guard !protectsCarousel else { return }
+
+        if !changesCarousel {
             carousel.entries = entries
             return
         }
 
-        let currentID = carousel.entry?.id
         let artworkURLs = Set(entries.flatMap { [$0.title.background, $0.title.logo].compactMap { $0 } })
         carousel = HeroCarousel(
             entries: entries,
@@ -545,8 +567,6 @@ private struct FeaturedHero: View {
     @Environment(\.accessibilityVoiceOverEnabled) private var voiceOverEnabled
     @State private var isVisible = false
     @State private var startedAt: ContinuousClock.Instant?
-    @State private var pendingSteps: [Int] = []
-    @State private var pendingAutoAdvance = false
 
     private let clock = ContinuousClock()
     private let interval: Duration = .seconds(8)
@@ -556,7 +576,7 @@ private struct FeaturedHero: View {
 
     var body: some View {
         let entry = carousel.entry
-        let urls = entries.flatMap { [$0.title.background, $0.title.logo].compactMap { $0 } }
+        let urls = Set(entries.flatMap { [$0.title.background, $0.title.logo].compactMap { $0 } })
         let slide = carousel.slide
         let rotationEntryID = canRotate ? entry?.id : nil
 
@@ -592,14 +612,8 @@ private struct FeaturedHero: View {
             }
         }
         .onScrollVisibilityChange(threshold: 0.45) { isVisible = $0 }
-        .onChange(of: isActive) { _, active in
-            if !active { clearPendingMoves() }
-        }
-        .onChange(of: isFocused || !isVisible) { _, suppressesRotation in
-            if suppressesRotation { pendingAutoAdvance = false }
-        }
         .task(id: urls) {
-            let missingURLs = Set(urls).filter { carousel.artwork[$0] == nil }
+            let missingURLs = urls.filter { carousel.artwork[$0] == nil }
             await withTaskGroup(of: (URL, HeroCarousel.Artwork).self) { group in
                 for url in missingURLs {
                     group.addTask { (url, await HeroCarousel.Artwork.load(url)) }
@@ -607,7 +621,6 @@ private struct FeaturedHero: View {
                 for await (url, artwork) in group {
                     guard !Task.isCancelled else { return }
                     carousel.artwork[url] = artwork
-                    advancePendingMoves()
                 }
             }
         }
@@ -621,8 +634,7 @@ private struct FeaturedHero: View {
                 try await clock.sleep(until: start.advanced(by: interval))
                 try Task.checkCancellation()
                 guard canRotate, startedAt == start, carousel.entry?.id == rotationEntryID else { return }
-                pendingAutoAdvance = true
-                advancePendingMoves()
+                move(1)
             } catch {
                 // A different title or an offscreen hero cancels the countdown.
             }
@@ -639,20 +651,13 @@ private struct FeaturedHero: View {
             }
         }
         .onChange(of: reduceMotion) { _, enabled in
-            if enabled {
-                carousel.slide = nil
-                pendingAutoAdvance = false
-                advancePendingMoves()
-            }
-        }
-        .onChange(of: entries.map(\.id)) { _, _ in
-            clearPendingMoves()
+            if enabled { carousel.slide = nil }
         }
     }
 
     private var canRotate: Bool {
         entries.count > 1 && isActive && !isFocused && isVisible && scenePhase == .active
-            && !reduceMotion && !voiceOverEnabled && carousel.slide == nil && pendingSteps.isEmpty && !pendingAutoAdvance
+            && !reduceMotion && !voiceOverEnabled && carousel.slide == nil
     }
 
     private var progress: Double {
@@ -662,39 +667,9 @@ private struct FeaturedHero: View {
 
     private func move(_ step: Int) {
         guard isActive, entries.count > 1 else { return }
-        pendingAutoAdvance = false
-        pendingSteps.append(step)
-        advancePendingMoves()
-    }
-
-    private func clearPendingMoves() {
-        pendingSteps.removeAll()
-        pendingAutoAdvance = false
-    }
-
-    private func advancePendingMoves() {
-        guard isActive, entries.count > 1 else { return }
-        while let step = pendingSteps.first {
-            guard advance(step, manually: true) else { return }
-            pendingSteps.removeFirst()
-        }
-        if pendingAutoAdvance, advance(1, manually: false) {
-            pendingAutoAdvance = false
-        }
-    }
-
-    // A false result leaves the move pending until backdrop loading finishes.
-    private func advance(_ step: Int, manually: Bool) -> Bool {
-        for distance in 1..<entries.count {
-            let nextIndex = (carousel.index + step * distance + entries.count) % entries.count
-            guard carousel.isReady(at: nextIndex, waitsForLogo: !manually) else { return false }
-            guard carousel.hasUsableBackdrop(at: nextIndex) else { continue }
-
-            startedAt = nil
-            carousel = carousel.transition(to: nextIndex, step: step, at: clock.now, animated: !reduceMotion)
-            return true
-        }
-        return true
+        let nextIndex = (carousel.index + step + entries.count) % entries.count
+        startedAt = nil
+        carousel = carousel.transition(to: nextIndex, step: step, at: clock.now, animated: !reduceMotion)
     }
 
     private func indicators(activeIndex: Int, rotates: Bool) -> some View {
@@ -854,18 +829,11 @@ struct HomeHeroBackdrop: View {
             let visibleHeight = artworkHeight - (artworkHeight - gapHeight) * position.shelfProgress
 
             TimelineView(.animation(paused: carousel.slide == nil)) { _ in
-                ZStack {
+                if let slide = carousel.slide {
+                    let slices = slide.backdrop(at: ContinuousClock().now, entering: carousel.index)
+                    slidingArtwork(slices, size: geometry.size)
+                } else {
                     artwork(for: carousel.entry, size: geometry.size)
-
-                    if let slide = carousel.slide {
-                        let coverage = slide.outgoingCoverage(at: ContinuousClock().now)
-                        if !coverage.isEmpty {
-                            outgoingArtwork(slide.outgoingArtwork, size: geometry.size)
-                                .mask(alignment: slide.step < 0 ? .trailing : .leading) {
-                                    Rectangle().frame(width: geometry.size.width * (coverage.upperBound - coverage.lowerBound))
-                                }
-                        }
-                    }
                 }
             }
             .overlay {
@@ -892,33 +860,34 @@ struct HomeHeroBackdrop: View {
         .accessibilityHidden(true)
     }
 
-    private func outgoingArtwork(_ slices: [HeroCarousel.BackdropSlice], size: CGSize) -> some View {
+    private func slidingArtwork(_ slices: [HeroCarousel.BackdropSlice], size: CGSize) -> some View {
         ZStack {
-            ForEach(Array(slices.enumerated()), id: \.offset) { offset, slice in
+            ForEach(Array(slices.enumerated()), id: \.offset) { _, slice in
                 if carousel.entries.indices.contains(slice.index) {
-                    let entry = carousel.entries[slice.index]
-                    if offset == 0 {
-                        artwork(for: entry, size: size)
-                    } else {
-                        // Layer adjacent slices to keep the full-size image crop and avoid visible seams.
-                        artwork(for: entry, size: size)
-                            .mask(alignment: .trailing) {
-                                Rectangle().frame(width: size.width * (1 - slice.coverage.lowerBound))
-                            }
-                    }
+                    let left = size.width * slice.coverage.lowerBound
+                    let right = size.width * slice.coverage.upperBound
+                    let maskWidth = min(size.width, right + 1) - left
+                    artwork(for: carousel.entries[slice.index], size: size,
+                            horizontalOffset: size.width * slice.horizontalOffset)
+                        .mask {
+                            // Overlap the adjacent masks under the next slice to avoid a hairline.
+                            Rectangle().frame(width: maskWidth, height: size.height)
+                                .position(x: left + maskWidth / 2, y: size.height / 2)
+                        }
                 }
             }
         }
     }
 
     @ViewBuilder
-    private func artwork(for entry: CinemetaSearchResult?, size: CGSize) -> some View {
+    private func artwork(for entry: CinemetaSearchResult?, size: CGSize, horizontalOffset: CGFloat = 0) -> some View {
         if let url = entry?.title.background, case let .image(image)? = carousel.artwork[url] {
             Image(decorative: image, scale: 1)
                 .resizable()
                 .scaledToFill()
                 .frame(width: size.width, height: size.height, alignment: .top)
                 .clipped()
+                .offset(x: horizontalOffset)
         } else {
             CinemaStyle.background
         }

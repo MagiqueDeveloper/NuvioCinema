@@ -1,0 +1,390 @@
+diff --git a/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift b/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift
+--- a/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift
+@@ -136,6 +136,7 @@
+     /// Retain ownership across PiP and later switches to a non-torrent source.
+     var torrentStreamSourceURL: URL?
+     private(set) var playbackCompletionTracker: PlaybackCompletionTracker?
++    var cinemaProgress: CinemaPlaybackProgressSession?
+ 
+     static func shouldUseHybridDiskCache(isEnabled: Bool, request: PlaybackLoadRequest) -> Bool {
+         isEnabled
+@@ -537,6 +538,8 @@
+     }
+ 
+     func stopAll() {
++        cinemaProgress?.stopPictureInPicture(coordinator: self)
++        cinemaProgress?.flush()
+         PlaybackWakeLock.release(ownerID: wakeLockOwnerID)
+         userStopped = true
+         loadGeneration += 1
+diff --git a/tvosApp/NuvioTV/Sources/Models/CatalogModels.swift b/tvosApp/NuvioTV/Sources/Models/CatalogModels.swift
+--- a/tvosApp/NuvioTV/Sources/Models/CatalogModels.swift
++++ b/tvosApp/NuvioTV/Sources/Models/CatalogModels.swift
+@@ -1737,9 +1737,13 @@
+ }
+ 
+ struct NuvioStream: Identifiable, Codable, Equatable, Sendable {
++    /// Cinema direct sources include normalized request headers in their identity.
++    let cinemaSourceID: String?
++
+     /// Stable identity for lists and focus. Prefer URL / torrent key; never mint a
+     /// fresh UUID on each access (that forces full SwiftUI list rebuilds).
+     var id: String {
++        if let cinemaSourceID { return cinemaSourceID }
+         let parsed = TorrentSourceParser.parse(
+             url: url,
+             infoHash: infoHash,
+@@ -1815,7 +1819,8 @@
+         httpHeaders: [String: String]? = nil,
+         trickplayURL: URL? = nil,
+         notPlayable: Bool? = nil,
+-        debridCacheStatusUnavailable: Bool? = nil
++        debridCacheStatusUnavailable: Bool? = nil,
++        cinemaSourceID: String? = nil
+     ) {
+         let parsed = TorrentSourceParser.parse(
+             url: url,
+@@ -1840,6 +1845,7 @@
+         self.trickplayURL = trickplayURL
+         self.notPlayable = notPlayable
+         self.debridCacheStatusUnavailable = debridCacheStatusUnavailable
++        self.cinemaSourceID = cinemaSourceID
+     }
+ 
+     /// Explicit availability notice from a source add-on. Ordinary titles, filenames, and add-on names
+diff --git a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+--- a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+@@ -566,6 +566,7 @@
+     private var activePlaybackOrigin: PlaybackOrigin = .main
+     private(set) var activeBingeGroup: String?
+     private var activeAddonName: String?
++    var cinemaActiveAddon: String? { activeAddonName }
+     private var activeProviderName: String?
+     private var activeFilename: String?
+     private var activeCacheFileIdentity: PlaybackCacheFileIdentity?
+@@ -777,7 +778,10 @@
+     /// Re-resolves a fresh stream for the current title/episode when a link
+     /// expires or a source fails. `excludedURLs` are links already tried this
+     /// session so failover never loops a dead source. Nil disables recovery.
+-    var reloadCurrentStream: ((_ episode: NuvioVideo?, _ excludedURLs: [String]) async -> PreparedNextStream?)?
++    var reloadCurrentStream: ((_ episode: NuvioVideo?, _ exclusions: [String]) async -> PreparedNextStream?)?
++    var cinemaNextEpisode: ((NuvioVideo) -> NuvioVideo?)?
++    private var cinemaDetachedForPiP = false
++    var cinemaSubtitleLoader: ((NuvioVideo?, AddonStream) async -> [NuvioSubtitle])?
+     /// Streams playable sources into the Sources panel as add-ons respond.
+     var fetchPlaybackSources: ((_ contentId: String, _ type: String) -> AsyncStream<[NuvioStream]>)?
+     /// Resolves a user-picked source into a ready stream (debrid + URL).
+@@ -803,6 +807,10 @@
+     @Published var playerToast: PlayerToastItem?
+     /// URLs that failed to load/play this session (watchdog, mpv error, slate).
+     private var failedStreamURLs: Set<String> = []
++    private var activeFailoverKey: String? {
++        if sessionCoordinator.cinemaProgress != nil { return activeSourceID }
++        return activeStreamURL
++    }
+     private var currentLoadStarted = false
+     private struct VMOnlyErrorRecoveryProbe {
+         let errorMessage: String
+@@ -1047,7 +1055,7 @@
+                reloadAttempts < Self.maxReloadAttempts,
+                !isFailingOver,
+                !didShutdown {
+-                if let url = activeStreamURL { failedStreamURLs.insert(url) }
++                if let key = activeFailoverKey { failedStreamURLs.insert(key) }
+                 if let meta = activeMeta {
+                     let numbers = resolvedEpisodeNumbers
+                     LastPlaybackStreamStore.remove(metaId: meta.id, season: numbers?.season, episode: numbers?.episode)
+@@ -1174,6 +1182,7 @@
+         let coordinator = sessionCoordinator
+         let poll = pollTimer
+         let hide = controlsHideTimer
++        let cinemaDetachedForPiP = cinemaDetachedForPiP
+         trailerResolveTask?.cancel()
+         trickplayResolveTask?.cancel()
+         subtitleFetchTask?.cancel()
+@@ -1189,7 +1198,7 @@
+         Task { @MainActor in
+             poll?.invalidate()
+             hide?.invalidate()
+-            if !PictureInPictureManager.shared.isPictureInPictureActive {
++            if !cinemaDetachedForPiP, !PictureInPictureManager.shared.isPictureInPictureActive {
+                 coordinator.stopAll()
+             }
+         }
+@@ -1241,6 +1250,9 @@
+         if !isStandalonePlaybackSession, adoptsPictureInPictureSession,
+            let activeCoord = pipManager.activeCoordinator,
+            pipManager.activeContext?.url == url,
++           sessionCoordinator.cinemaProgress == nil
++            || sessionCoordinator.cinemaProgress?.matches(activeCoord.cinemaProgress) == true,
++           sessionCoordinator.cinemaProgress == nil || pipManager.activeContext?.sourceID == sourceID,
+            pipManager.isPictureInPictureActive
+             || pipManager.isRestoringUIInProgress
+             || sessionCoordinator === activeCoord {
+@@ -1248,6 +1260,7 @@
+                 activeCacheFileIdentity = pipManager.activeContext?.cacheFileIdentity
+             }
+             if activeSourceID == nil { activeSourceID = pipManager.activeContext?.sourceID }
++            activeCoord.cinemaProgress?.stopPictureInPicture(coordinator: activeCoord)
+             self.sessionCoordinator = activeCoord
+             bindSessionCoordinatorCallbacks()
+             self.activeEngineKind = activeCoord.activeBackend
+@@ -1845,6 +1858,27 @@
+             return
+         }
+ 
++        if let cinemaSubtitleLoader, let url = activeStreamURL.flatMap(URL.init(string:)) {
++            let sourceID = activeSourceID
++            let episode = currentEpisodeVideo
++            let stream = AddonStream(
++                id: UUID(), addon: activeAddonName ?? "", name: "", description: nil,
++                filename: filename ?? activeFilename, videoHash: videoHash ?? activeVideoHash,
++                videoSize: videoSize ?? activeVideoSize, notWebReady: false, subtitles: [],
++                destination: .video(url), requestHeaders: activeHTTPHeaders
++            )
++            isLoadingExternalSubtitles = true
++            subtitleFetchTask = Task { @MainActor [weak self] in
++                let tracks = await cinemaSubtitleLoader(episode, stream)
++                guard !Task.isCancelled, let self, self.activeSourceID == sourceID,
++                      self.currentEpisodeVideo?.id == episode?.id else { return }
++                self.mergeExternalSubtitles(tracks)
++                self.isLoadingExternalSubtitles = false
++                self.subtitleFetchTask = nil
++            }
++            return
++        }
++
+         var effectiveHash = videoHash ?? activeVideoHash
+         var effectiveSize = videoSize ?? activeVideoSize
+         let effFilename = filename ?? effectiveFilename
+@@ -2251,7 +2285,7 @@
+         nextUpProgressWindowDeadline = nil
+         nextEpisodeAutoPlayDeadline = nil
+         isAutoPlayCancelled = false
+-        nextEpisode = Self.nextEpisode(after: resolvedCurrentEpisode, in: episodes)
++        nextEpisode = nextEpisodeForPlayback(after: resolvedCurrentEpisode)
+         updatePlaybackAction()
+ 
+         if let meta = activeMeta, let urlString = activeStreamURL, let url = URL(string: urlString) {
+@@ -2365,6 +2399,11 @@
+                 activeMeta, episode: episode, room: media
+               ) else { return false }
+         return expected.key == media.key
++    }
++
++    private func nextEpisodeForPlayback(after current: NuvioVideo?) -> NuvioVideo? {
++        if let current, let cinemaNextEpisode { return cinemaNextEpisode(current) }
++        return Self.nextEpisode(after: current, in: seriesEpisodes)
+     }
+ 
+     private static func nextEpisode(after current: NuvioVideo?, in episodes: [NuvioVideo]) -> NuvioVideo? {
+@@ -3003,6 +3042,7 @@
+     /// link reload, which resumes from `resumeFrom`).
+     private func replaceStream(prepared: PreparedNextStream, episode: NuvioVideo?, resumeFrom: Double?) {
+         guard let meta = activeMeta else { return }
++        sessionCoordinator.cinemaProgress?.flush()
+         PlaybackTimelineRecorder.record(.playbackLoadRequested, engine: activeEngineKind)
+         cancelSourcesFetch()
+         if let episode, episode.id != currentEpisodeVideo?.id {
+@@ -3014,7 +3054,9 @@
+             subtitle: prepared.subtitleLine,
+             httpHeaders: prepared.httpHeaders,
+             externalSubtitles: prepared.subtitles,
+-            resumeFrom: resumeFrom,
++            resumeFrom: episode.flatMap { next in
++                sessionCoordinator.cinemaProgress.map { Double($0.savedResume(for: next) ?? 0) / 1_000 }
++            } ?? resumeFrom,
+             currentEpisode: episode ?? currentEpisodeVideo,
+             preserveSessionPreferences: true
+         )
+@@ -3036,7 +3078,7 @@
+         if let episode {
+             pendingLoadingEpisode = nil
+             currentEpisodeVideo = episode
+-            nextEpisode = Self.nextEpisode(after: episode, in: seriesEpisodes)
++            nextEpisode = nextEpisodeForPlayback(after: episode)
+             isAutoPlayCancelled = false
+             fetchExternalSubtitles(
+                 contentId: episode.id,
+@@ -3073,6 +3115,15 @@
+         videoNaturalSize = .zero
+         if pollTimer == nil { startPolling() }
+         startLoadWatchdog()
++        if sessionCoordinator.cinemaProgress != nil {
++            PictureInPictureManager.shared.registerSession(coordinator: sessionCoordinator, context: ActivePlaybackContext(
++                url: prepared.url, meta: meta, subtitle: prepared.subtitleLine, httpHeaders: prepared.httpHeaders,
++                sourceID: activeSourceID, externalSubtitles: prepared.subtitles, episodes: seriesEpisodes,
++                currentEpisode: currentEpisodeVideo, autoPlayNextEnabled: autoPlayNextEnabled,
++                autoPlayNextCountdownSeconds: autoPlayNextCountdownSeconds, playbackOrigin: activePlaybackOrigin,
++                filename: prepared.filename, videoSize: prepared.videoSize, videoHash: prepared.videoHash
++            ))
++        }
+     }
+ 
+     /// Silently recovers from an expired link / dead source: fetches another
+@@ -3083,7 +3134,7 @@
+             surfaceExpiredStreamError()
+             return
+         }
+-        if let url = activeStreamURL { failedStreamURLs.insert(url) }
++        if let key = activeFailoverKey { failedStreamURLs.insert(key) }
+         if let meta = activeMeta {
+             let numbers = resolvedEpisodeNumbers
+             LastPlaybackStreamStore.remove(metaId: meta.id, season: numbers?.season, episode: numbers?.episode)
+@@ -3182,7 +3233,7 @@
+                 return
+             }
+             if let url = self.activeStreamURL {
+-                self.failedStreamURLs.insert(url)
++                if let key = self.activeFailoverKey { self.failedStreamURLs.insert(key) }
+             }
+             if let meta = self.activeMeta {
+                 let numbers = self.resolvedEpisodeNumbers
+@@ -3239,7 +3290,7 @@
+     /// the same way a failed stream does.
+     private func handleUsenetDamage(_ url: URL) {
+         guard activeStreamURL == url.absoluteString, !didShutdown, !isFailingOver else { return }
+-        failedStreamURLs.insert(url.absoluteString)
++        if let key = activeFailoverKey { failedStreamURLs.insert(key) }
+         attemptFailover(
+             reason: L10n.string("usenet_error_damaged", fallback: "This Usenet release is too damaged to play, and no other source worked."),
+             toast: L10n.string("usenet_switching_damaged", fallback: "Release damaged — switching source")
+@@ -3279,7 +3330,7 @@
+ 
+         let decision = LiveStreamFailoverPolicy.decide(
+             isLive: isLiveStream,
+-            currentURL: activeStreamURL,
++            currentURL: activeFailoverKey,
+             retriedURLs: retriedLiveURLs,
+             failedURLs: failedStreamURLs
+         )
+@@ -3782,7 +3833,7 @@
+                    reloadCurrentStream != nil,
+                    reloadAttempts < Self.maxReloadAttempts,
+                    !didShutdown {
+-                    if let url = activeStreamURL { failedStreamURLs.insert(url) }
++                    if let key = activeFailoverKey { failedStreamURLs.insert(key) }
+                     if let meta = activeMeta {
+                         let numbers = resolvedEpisodeNumbers
+                         LastPlaybackStreamStore.remove(metaId: meta.id, season: numbers?.season, episode: numbers?.episode)
+@@ -3972,7 +4023,7 @@
+                 status = .error(c.currentErrorMessage)
+                 return
+             }
+-            if let url = activeStreamURL { failedStreamURLs.insert(url) }
++            if let key = activeFailoverKey { failedStreamURLs.insert(key) }
+             if let meta = activeMeta {
+                 let numbers = resolvedEpisodeNumbers
+                 LastPlaybackStreamStore.remove(metaId: meta.id, season: numbers?.season, episode: numbers?.episode)
+@@ -4118,6 +4169,23 @@
+         case .idle, .buffering, .ended, .error(_):
+             scenePauseIntentPending = false
+             scenePauseAlreadyNotified = false
++        }
++
++        if let cinemaProgress = sessionCoordinator.cinemaProgress,
++           hasRenderedFirstFrame, hasPresentedCurrentLoad, !isAwaitingStreamStart, !isLiveStream,
++           !isReplacementSlate, !didDetectReplacementStream, !isPreSeekSettlingSample,
++           !isScrubbing, !isHoldingSeek, pendingSeekDelta == 0, seekDebounceTask == nil,
++           !isSwitchingSource, !isReloadingStream, !isFailingOver, !sessionCoordinator.isProgressSaveSuspended,
++           !c.isPlayerLoading, c.currentErrorMessage.isEmpty {
++            if c.hasCoherentTimeSample, latestStatus == .playing, c.isPlayerPlaying, !c.isAtEndOfFile {
++                cinemaProgress.sample(latestTime.current, duration: latestTime.duration,
++                                      episode: currentEpisodeVideo, checkpoint: .periodic)
++            } else if latestStatus == .ended, c.isAtEndOfFile {
++                cinemaProgress.sample(latestTime.current, duration: latestTime.duration,
++                                      episode: currentEpisodeVideo, checkpoint: .ended)
++            } else if latestStatus == .paused, previousStatus != .paused {
++                cinemaProgress.flush()
++            }
+         }
+ 
+         updatePlaybackDebugHUD(from: c)
+@@ -4819,6 +4887,28 @@
+         }
+     }
+ 
++    func detachCinemaForPictureInPicture() {
++        cinemaDetachedForPiP = true
++        pollTimer?.invalidate()
++        pollTimer = nil
++        controlsHideTimer?.invalidate()
++        controlsHideTimer = nil
++        cancelPauseOverlaySchedule()
++        cancelPendingAdvanceResolution()
++        subtitleFetchTask?.cancel()
++        subtitleFetchTask = nil
++        isLoadingExternalSubtitles = false
++        cancelSourcesFetch()
++        clearCinemaSourceResolvers()
++    }
++
++    private func clearCinemaSourceResolvers() {
++        resolveNextStream = nil
++        reloadCurrentStream = nil
++        fetchPlaybackSources = nil
++        resolvePlaybackStream = nil
++    }
++
+     func shutdown() {
+         shutdown(preservingPictureInPicture: true)
+     }
+@@ -4837,6 +4927,7 @@
+         detachWatchPartyPlayerBridge()
+         cancelPendingAdvanceResolution()
+         didShutdown = true
++        if sessionCoordinator.cinemaProgress != nil { clearCinemaSourceResolvers() }
+         dismissPlaybackAction()
+         resetAudioSync()
+         contentWarningsGeneration &+= 1
+@@ -5145,6 +5236,11 @@
+         // 32 minutes remaining after seeking to 5 minutes remaining).
+         lastStablePlaybackTime = snapshot
+         explicitSeekProgressCheckpoint = (snapshot, Date())
++        if hasRenderedFirstFrame, !isLiveStream, !didDetectReplacementStream, !loadedStreamLooksLikeReplacement(),
++           !isAwaitingStreamStart, !isSwitchingSource, !isReloadingStream, !sessionCoordinator.isProgressSaveSuspended {
++            sessionCoordinator.cinemaProgress?.sample(target, duration: snapshot.duration,
++                                                      episode: currentEpisodeVideo, checkpoint: .seek)
++        }
+     }
+ 
+     private func playbackDidSuspend(positionMs: Int64, durationMs: Int64) {
+@@ -7660,7 +7756,7 @@
+     }
+ 
+     var panelEpisodes: [NuvioVideo] {
+-        guard let current = currentEpisodeVideo else { return seriesEpisodes }
++        guard cinemaNextEpisode == nil, let current = currentEpisodeVideo else { return seriesEpisodes }
+         // Same season first (current season), then the rest in order.
+         let season = current.season
+         let same = seriesEpisodes.filter { $0.season == season }
+diff --git a/tvosApp/NuvioTV/Sources/UI/Player/SidePanels.swift b/tvosApp/NuvioTV/Sources/UI/Player/SidePanels.swift
+--- a/tvosApp/NuvioTV/Sources/UI/Player/SidePanels.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/SidePanels.swift
+@@ -519,7 +519,14 @@
+                     onLoad()
+                     seedSourceFocus(proxy: proxy)
+                 }
+-                .onChange(of: sources.map(\.id)) { _, _ in
++                .onChange(of: sources.map(\.id)) { _, sourceIDs in
++                    if case .source(let id) = focus, let index = sourceIDs.firstIndex(of: id) {
++                        if index >= visibleSourceLimit {
++                            visibleSourceLimit = index + 10
++                            DispatchQueue.main.async { proxy.scrollTo(id, anchor: .center) }
++                        }
++                        return
++                    }
+                     seedSourceFocus(proxy: proxy)
+                 }
+                 .onChange(of: isLoading) { _, _ in
+@@ -547,7 +554,7 @@
+             proxy.scrollTo(target, anchor: .center)
+         }
+         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+-            guard let target = targetSourceID else { return }
++            if case .source(let id) = focus, id != target { return }
+             focus = .source(target)
+             withAnimation(.easeInOut(duration: 0.15)) {
+                 proxy.scrollTo(target, anchor: .center)

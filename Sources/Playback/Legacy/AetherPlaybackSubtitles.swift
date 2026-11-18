@@ -295,7 +295,7 @@ struct AetherPlaybackSubtitleOverlay: View {
 
     private func caption(_ text: String, width: CGFloat) -> some View {
         let size = max(25, width * 0.023) * (captionSize.scale ?? captionStyle.sizeScale)
-        return Text(verbatim: SubtitleCaptionFormatting.formatted(text))
+        return Text(verbatim: text)
             .font(.system(size: size, weight: .medium))
             .foregroundStyle(.white)
             .multilineTextAlignment(.center)
@@ -434,13 +434,16 @@ private final class LegacyBitmapCaptions: ObservableObject {
         } catch {
             return nil
         }
-        let text = SubtitleOCRCleanup.cleaned(joinedLines(request.results ?? []))
+        let isRightToLeft = language.map { Locale.Language(identifier: $0).characterDirection == .rightToLeft } ?? false
+        let text = SubtitleOCRCleanup.cleaned(joinedLines(request.results ?? [], isRightToLeft: isRightToLeft))
         return text.isEmpty ? nil : text
     }
 
     /// Group observations that share a row, so one line split into pieces stays one line,
-    /// then read rows top to bottom and pieces left to right.
-    private nonisolated static func joinedLines(_ observations: [VNRecognizedTextObservation]) -> String {
+    /// then read rows top to bottom and fragments in the track's reading direction.
+    private nonisolated static func joinedLines(
+        _ observations: [VNRecognizedTextObservation], isRightToLeft: Bool
+    ) -> String {
         var rows: [(box: CGRect, pieces: [(x: CGFloat, text: String)])] = []
         for observation in observations.sorted(by: { $0.boundingBox.midY > $1.boundingBox.midY }) {
             guard let text = observation.topCandidates(1).first?.string
@@ -458,7 +461,7 @@ private final class LegacyBitmapCaptions: ObservableObject {
             rows.append((box, [(box.minX, text)]))
         }
         return rows.map { row in
-            row.pieces.sorted { $0.x < $1.x }.map(\.text).joined(separator: " ")
+            row.pieces.sorted { isRightToLeft ? $0.x > $1.x : $0.x < $1.x }.map(\.text).joined(separator: " ")
         }.joined(separator: "\n")
     }
 }

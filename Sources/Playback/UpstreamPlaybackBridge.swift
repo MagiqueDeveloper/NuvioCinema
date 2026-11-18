@@ -12,9 +12,6 @@ struct UpstreamPlaybackBridge: View {
 
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var viewModel: PlayerViewModel
-    @State private var recorder = PlaybackProgressRecorder()
-    @State private var recordingEpisode: NuvioVideo?
-    @State private var isMounted = false
     @State private var restoreID = UUID()
 
     init(url: URL, request: TitlePlaybackRequest, stream: AddonStream, account: NuvioAccount,
@@ -28,14 +25,34 @@ struct UpstreamPlaybackBridge: View {
         self.onClose = onClose
         self.onOpenPlaybackTitle = onOpenPlaybackTitle
         self.onRestorePlayer = onRestorePlayer
-        _viewModel = StateObject(wrappedValue: Self.makeViewModel(for: request))
+        _viewModel = StateObject(wrappedValue: Self.makeViewModel(for: request, account: account))
     }
 
-    private static func makeViewModel(for request: TitlePlaybackRequest) -> PlayerViewModel {
+    private static func makeViewModel(for request: TitlePlaybackRequest, account: NuvioAccount) -> PlayerViewModel {
         let viewModel = PlayerViewModel()
         let accountID = request.accountID ?? ""
         let profileID = request.profileID.map(String.init) ?? "guest"
         viewModel.configureTitleSubtitlePreferences(profileScope: "\(accountID.utf8.count):\(accountID):\(profileID)")
+        viewModel.sessionCoordinator.cinemaProgress = CinemaPlaybackProgressSession(request: request, account: account)
+        viewModel.cinemaNextEpisode = { current in
+            guard let episode = request.episodeGuide.first(where: {
+                $0.season == current.season && $0.episode == current.episode
+            }) else { return nil }
+            return request.followingEpisodes(after: episode).first.map(Self.video)
+        }
+        viewModel.cinemaSubtitleLoader = { episode, stream in
+            let videoIDs: [String]
+            if let episode, episode.id != request.selectedEpisode?.id,
+               let item = request.episodeGuide.first(where: { $0.id == episode.id }) {
+                videoIDs = request.videoIDs(for: item)
+            } else {
+                videoIDs = request.videoIDs
+            }
+            let tracks = await AddonStreams().subtitles(
+                addons: request.addons, kind: request.kind, videoIDs: videoIDs, stream: stream
+            )
+            return Self.subtitles(tracks)
+        }
         return viewModel
     }
 
@@ -48,18 +65,25 @@ struct UpstreamPlaybackBridge: View {
     }
 
     private var episodes: [NuvioVideo] {
-        [currentEpisode].compactMap { $0 } + request.followingEpisodes.map(Self.video)
+        var playable = request.playableEpisodes.map(Self.video)
+        if let currentEpisode {
+            if let index = playable.firstIndex(where: {
+                $0.season == currentEpisode.season && $0.episode == currentEpisode.episode
+            }) {
+                playable[index] = currentEpisode
+            } else {
+                playable.insert(currentEpisode, at: 0)
+            }
+        }
+        return playable
     }
 
-    private var activeEpisodeID: String? {
-        viewModel.panelCurrentEpisodeId ?? currentEpisode?.id
+    private var activeEpisode: NuvioVideo? {
+        episodes.first { $0.id == viewModel.panelCurrentEpisodeId } ?? currentEpisode
     }
 
-    private var canRecordProgress: Bool {
-        viewModel.hasRenderedFirstFrame && !viewModel.isAwaitingStreamStart && !viewModel.isScrubbing
-            && !viewModel.isHoldingSeek && !viewModel.isSwitchingSource && !viewModel.isReloadingStream
-            && !viewModel.didDetectReplacementStream && !viewModel.isLiveStream
-            && !viewModel.sessionCoordinator.isProgressSaveSuspended
+    private var progress: CinemaPlaybackProgressSession? {
+        viewModel.sessionCoordinator.cinemaProgress
     }
 
     private var meta: NuvioMeta {
@@ -86,7 +110,7 @@ struct UpstreamPlaybackBridge: View {
             resumeFrom: request.position > 0 || request.startsFromBeginning ? Double(request.position) / 1_000 : nil,
             addonName: stream.addon, provider: "Direct",
             filename: stream.filename, videoSize: stream.videoSize, videoHash: stream.videoHash,
-            sourceID: url.absoluteString, episodes: episodes, currentEpisode: currentEpisode,
+            sourceID: stream.playbackSourceID, episodes: episodes, currentEpisode: currentEpisode,
             resolveNextStream: episodes.count > 1 ? resolveNextStream : nil,
             reloadCurrentStream: reloadCurrentStream,
             fetchPlaybackSources: fetchPlaybackSources,
@@ -98,26 +122,11 @@ struct UpstreamPlaybackBridge: View {
             onRemoteBack: close
         )
         .environment(\.cinemaPlaybackArtwork, request.startupArtwork)
-        .onAppear { isMounted = true }
-        .onReceive(viewModel.clock.$position) { position in
-            guard viewModel.status == .playing, canRecordProgress else { return }
-            sample(position, duration: viewModel.clock.duration, checkpoint: .periodic)
-        }
-        .onReceive(viewModel.$status) { status in
-            guard canRecordProgress else { return }
-            if status == .ended {
-                sample(viewModel.clock.position, duration: viewModel.clock.duration, checkpoint: .ended)
-            } else if status == .paused {
-                sample(viewModel.clock.position, duration: viewModel.clock.duration, checkpoint: .flush)
-            }
-        }
         .onChange(of: scenePhase) { _, phase in
-            if phase != .active { flushProgress() }
+            if phase != .active { progress?.flush() }
         }
-        .task { await mergeInitialSubtitles() }
         .onDisappear {
-            isMounted = false
-            flushProgress()
+            progress?.flush()
             let manager = PictureInPictureManager.shared
             if !manager.isPictureInPictureActive {
                 UpstreamPiPRestore.remove(owner: restoreID, from: manager)
@@ -125,45 +134,22 @@ struct UpstreamPlaybackBridge: View {
         }
     }
 
-    private func sample(_ position: Double, duration: Double, checkpoint: PlaybackCheckpoint) {
-        let activeEpisode = episodes.first { $0.id == activeEpisodeID } ?? currentEpisode
-        if activeEpisode?.id != recordingEpisode?.id {
-            flushProgress()
-            recordingEpisode = activeEpisode
-            recorder = PlaybackProgressRecorder()
-        }
-        let initialPosition = activeEpisode?.id == currentEpisode?.id ? request.position : 0
-        recorder.sample(position, duration: duration, initialPosition: initialPosition, checkpoint: checkpoint,
-                        using: writeProgress)
-    }
-
-    private func flushProgress() {
-        recorder.flush(using: writeProgress)
-    }
-
-    private func writeProgress(_ position: Int64, _ duration: Int64, _ completed: Bool) {
-        guard let profileID = request.profileID, request.accountID == account.playbackAccountID else { return }
-        let episode = recordingEpisode ?? currentEpisode
-        account.recordPlayback(
-            contentID: request.contentID, kind: request.kind, title: request.title,
-            season: episode?.season, episode: episode?.episode, position: position,
-            duration: duration, completed: completed, profileID: profileID
-        )
-    }
-
     private func close() {
-        flushProgress()
+        progress?.flush()
         let manager = PictureInPictureManager.shared
         if manager.isPictureInPictureActive,
            manager.activeCoordinator === viewModel.sessionCoordinator, let onRestorePlayer {
+            progress?.startPictureInPicture(coordinator: viewModel.sessionCoordinator, episode: activeEpisode)
             UpstreamPiPRestore.install(owner: restoreID, manager: manager, request: request, stream: stream,
+                                       addon: viewModel.cinemaActiveAddon ?? stream.addon,
                                        restore: onRestorePlayer)
+            viewModel.detachCinemaForPictureInPicture()
         }
         onClose(sourceRequest(), nil)
     }
 
     private func returnToSources() {
-        flushProgress()
+        progress?.flush()
         if case .error = viewModel.status {
             onClose(sourceRequest(), String(localized: "This source couldn’t play on Apple TV. Try another source or refresh the links."))
         } else {
@@ -172,71 +158,61 @@ struct UpstreamPlaybackBridge: View {
     }
 
     private func openPlaybackTitle() {
-        flushProgress()
+        progress?.flush()
         onOpenPlaybackTitle()
     }
 
     private func sourceRequest() -> TitlePlaybackRequest {
-        // During a switch the recorder still belongs to the previous episode until
-        // the replacement stream produces a valid time sample.
-        let position = recordingEpisode?.id == activeEpisodeID ? recorder.resumePosition : nil
-        if let episode = request.followingEpisodes.first(where: { $0.id == activeEpisodeID }),
-           let advanced = request.advancing(to: episode, position: position ?? 0) {
-            return advanced
+        let episode = activeEpisode
+        let position = progress?.resumePosition(for: episode)
+        if episode?.id != currentEpisode?.id,
+           let selected = request.episodeGuide.first(where: { $0.id == episode?.id }) {
+            return request.changingEpisode(to: selected, position: position ?? progress?.savedResume(for: episode) ?? 0)
         }
         var updated = request
-        updated.position = position ?? request.position
+        if let position {
+            updated.position = position
+            updated.startsFromBeginning = position == 0
+        }
         return updated
     }
 
-    private func mergeInitialSubtitles() async {
-        let tracks = await AddonStreams().subtitles(
-            addons: request.addons, kind: request.kind, videoIDs: request.videoIDs, stream: stream
-        )
-        guard !Task.isCancelled, isMounted, !viewModel.isSwitchingSource, !viewModel.isReloadingStream,
-              viewModel.panelCurrentEpisodeId == currentEpisode?.id,
-              viewModel.sessionCoordinator.lastRequest?.videoURL == url else { return }
-        viewModel.mergeExternalSubtitles(Self.subtitles(tracks))
-    }
-
     private func resolveNextStream(_ episode: NuvioVideo, _ startupToken: UUID?) async -> PreparedNextStream? {
+        let activeAddon = viewModel.cinemaActiveAddon ?? stream.addon
         let result = await findSources(for: episode.id)
-        let preferred = result.first { $0.addon == stream.addon } ?? result.first
+        let preferred = result.first { $0.addon == activeAddon } ?? result.first
         guard !Task.isCancelled, let preferred else { return nil }
-        return await prepare(preferred, videoIDs: videoIDs(for: episode.id), subtitle: Self.episodeLabel(episode))
+        return prepare(preferred, subtitle: Self.episodeLabel(episode))
     }
 
-    private func reloadCurrentStream(_ episode: NuvioVideo?, _ excludedURLs: [String]) async -> PreparedNextStream? {
+    private func reloadCurrentStream(_ episode: NuvioVideo?, _ excludedSourceIDs: [String]) async -> PreparedNextStream? {
         let result = await findSources(for: episode?.id ?? request.contentID)
-        let excluded = Set(excludedURLs)
-        let alternative = result.first {
-            guard case .video(let url) = $0.destination else { return false }
-            return !excluded.contains(url.absoluteString)
-        }
+        let excluded = Set(excludedSourceIDs)
+        let alternative = result.first { !excluded.contains($0.playbackSourceID) }
         guard !Task.isCancelled, let alternative else { return nil }
-        return await prepare(alternative, videoIDs: videoIDs(for: episode?.id ?? request.contentID),
-                             subtitle: episode.map(Self.episodeLabel) ?? "")
+        return prepare(alternative, subtitle: episode.map(Self.episodeLabel) ?? "")
     }
 
     private func fetchPlaybackSources(_ contentID: String, _ type: String) -> AsyncStream<[NuvioStream]> {
         AsyncStream { continuation in
             let task = Task { @MainActor in
-                let result = await findSources(for: contentID)
-                guard !Task.isCancelled else {
-                    continuation.finish()
-                    return
+                defer { continuation.finish() }
+                let updates = AddonStreams().updates(
+                    addons: request.addons, kind: request.kind, videoIDs: videoIDs(for: contentID)
+                )
+                for await update in updates {
+                    guard !Task.isCancelled else { return }
+                    let sources = update.streams.compactMap { stream -> NuvioStream? in
+                        guard case .video(let url) = stream.destination else { return nil }
+                        return NuvioStream(
+                            url: url.absoluteString, name: stream.name, description: stream.description, addonName: stream.addon,
+                            subtitles: Self.subtitles(stream.subtitles, source: stream.addon), filename: stream.filename,
+                            videoSize: stream.videoSize, videoHash: stream.videoHash, httpHeaders: stream.requestHeaders,
+                            cinemaSourceID: stream.playbackSourceID
+                        )
+                    }
+                    continuation.yield(sources)
                 }
-                var seen = Set<URL>()
-                let sources = result.compactMap { stream -> NuvioStream? in
-                    guard case .video(let url) = stream.destination, seen.insert(url).inserted else { return nil }
-                    return NuvioStream(
-                        url: url.absoluteString, name: stream.name, description: stream.description, addonName: stream.addon,
-                        subtitles: Self.subtitles(stream.subtitles, source: stream.addon), filename: stream.filename,
-                        videoSize: stream.videoSize, videoHash: stream.videoHash, httpHeaders: stream.requestHeaders
-                    )
-                }
-                continuation.yield(sources)
-                continuation.finish()
             }
             continuation.onTermination = { _ in task.cancel() }
         }
@@ -252,7 +228,7 @@ struct UpstreamPlaybackBridge: View {
             subtitles: source.subtitles.compactMap(Self.addonSubtitle), destination: .video(sourceURL),
             requestHeaders: source.httpHeaders ?? [:]
         )
-        return await prepare(selected, videoIDs: videoIDs(for: contentID), subtitle: subtitle)
+        return prepare(selected, subtitle: subtitle)
     }
 
     private func findSources(for contentID: String) async -> [AddonStream] {
@@ -264,26 +240,22 @@ struct UpstreamPlaybackBridge: View {
     }
 
     private func videoIDs(for contentID: String) -> [String] {
-        guard let episode = request.followingEpisodes.first(where: { $0.id == contentID }) else {
+        guard contentID != currentEpisode?.id, let episode = request.episodeGuide.first(where: { $0.id == contentID }) else {
             return request.videoIDs
         }
         return request.videoIDs(for: episode)
     }
 
-    private func prepare(_ stream: AddonStream, videoIDs: [String], subtitle: String) async -> PreparedNextStream? {
+    private func prepare(_ stream: AddonStream, subtitle: String) -> PreparedNextStream? {
         guard case .video(let sourceURL) = stream.destination else { return nil }
-        let matches = await AddonStreams().subtitles(
-            addons: request.addons, kind: request.kind, videoIDs: videoIDs, stream: stream
-        )
-        guard !Task.isCancelled else { return nil }
         var seen = Set<String>()
-        let subtitles = (Self.subtitles(stream.subtitles, source: stream.addon) + Self.subtitles(matches))
+        let subtitles = Self.subtitles(stream.subtitles, source: stream.addon)
             .filter { seen.insert($0.url).inserted }
         return PreparedNextStream(
             url: sourceURL, httpHeaders: stream.requestHeaders, subtitleLine: subtitle,
             subtitles: subtitles, streamName: stream.name, streamDescription: stream.description,
             filename: stream.filename, addonName: stream.addon, videoSize: stream.videoSize, videoHash: stream.videoHash,
-            provider: "Direct", sourceID: sourceURL.absoluteString
+            provider: "Direct", sourceID: stream.playbackSourceID
         )
     }
 
@@ -314,11 +286,119 @@ struct UpstreamPlaybackBridge: View {
 }
 
 @MainActor
+final class CinemaPlaybackProgressSession {
+    private let request: TitlePlaybackRequest
+    private weak var account: NuvioAccount?
+    private var recordingEpisode: NuvioVideo?
+    private var recorder = PlaybackProgressRecorder()
+    private var initialPosition: Int64
+    private var pipTask: Task<Void, Never>?
+    private var pipEpisode: NuvioVideo?
+
+    init(request: TitlePlaybackRequest, account: NuvioAccount) {
+        self.request = request
+        self.account = account
+        initialPosition = request.position
+    }
+
+    var isCurrentProfile: Bool {
+        guard let account else { return false }
+        return account.playbackAccountID == request.accountID && account.profileID == request.profileID
+    }
+
+    func matches(_ session: CinemaPlaybackProgressSession?) -> Bool {
+        guard let session else { return false }
+        return request.accountID == session.request.accountID && request.profileID == session.request.profileID
+            && request.contentID == session.request.contentID && request.kind == session.request.kind
+    }
+
+    func savedResume(for episode: NuvioVideo?) -> Int64? {
+        guard isCurrentProfile, let account else { return nil }
+        return TitlePlaybackRequest.resumePosition(for: account.progress(
+            for: request.contentID, kind: request.kind, season: episode?.season, episode: episode?.episode
+        ))
+    }
+
+    func resumePosition(for episode: NuvioVideo?) -> Int64? {
+        recordingEpisode?.id == episode?.id ? recorder.resumePosition : nil
+    }
+
+    func sample(_ position: Double, duration: Double, episode: NuvioVideo?, checkpoint: PlaybackCheckpoint) {
+        guard isCurrentProfile else { return }
+        if recordingEpisode?.id != episode?.id {
+            flush()
+            recordingEpisode = episode
+            recorder = PlaybackProgressRecorder()
+            if episode?.season == request.season && episode?.episode == request.episodeNumber {
+                initialPosition = request.position
+            } else {
+                initialPosition = savedResume(for: episode) ?? 0
+            }
+        }
+        recorder.sample(position, duration: duration, initialPosition: initialPosition, checkpoint: checkpoint,
+                        using: write)
+    }
+
+    func flush() {
+        recorder.flush(using: write)
+    }
+
+    private func write(_ position: Int64, _ duration: Int64, _ completed: Bool) {
+        guard isCurrentProfile, let account, let profileID = request.profileID else { return }
+        account.recordPlayback(
+            contentID: request.contentID, kind: request.kind, title: request.title,
+            season: recordingEpisode?.season, episode: recordingEpisode?.episode, position: position,
+            duration: duration, completed: completed, profileID: profileID
+        )
+    }
+
+    func startPictureInPicture(coordinator: PlaybackSessionCoordinator, episode: NuvioVideo?) {
+        pipTask?.cancel()
+        pipEpisode = episode
+        pipTask = Task { @MainActor [weak self, weak coordinator] in
+            while !Task.isCancelled {
+                guard let coordinator, let self,
+                      PictureInPictureManager.shared.activeCoordinator === coordinator else { return }
+                self.samplePictureInPicture(coordinator: coordinator)
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
+    }
+
+    func stopPictureInPicture(coordinator: PlaybackSessionCoordinator) {
+        guard pipTask != nil else { return }
+        pipTask?.cancel()
+        pipTask = nil
+        samplePictureInPicture(coordinator: coordinator)
+        pipEpisode = nil
+        flush()
+    }
+
+    private func samplePictureInPicture(coordinator: PlaybackSessionCoordinator) {
+        guard isCurrentProfile, !coordinator.isProgressSaveSuspended,
+              coordinator.lastRequest?.isLiveStream == false else { return }
+        let engine = coordinator.activeEngine
+        engine.refreshPlaybackState()
+        guard engine.hasCoherentTimeSample, !engine.isPlayerLoading, engine.currentErrorMessage.isEmpty else { return }
+        let checkpoint: PlaybackCheckpoint
+        if engine.isPlayerEnded && engine.isAtEndOfFile {
+            checkpoint = .ended
+        } else if engine.isPlayerPlaying {
+            checkpoint = .periodic
+        } else {
+            checkpoint = .flush
+        }
+        sample(Double(engine.positionMs) / 1_000, duration: Double(engine.durationMs) / 1_000,
+               episode: pipEpisode, checkpoint: checkpoint)
+    }
+}
+
+@MainActor
 private enum UpstreamPiPRestore {
     private static var owner: UUID?
 
     static func install(
-        owner: UUID, manager: PictureInPictureManager, request: TitlePlaybackRequest, stream: AddonStream,
+        owner: UUID, manager: PictureInPictureManager, request: TitlePlaybackRequest, stream: AddonStream, addon: String,
         restore: @escaping (AddonStream, TitlePlaybackRequest) -> Bool
     ) {
         self.owner = owner
@@ -327,7 +407,9 @@ private enum UpstreamPiPRestore {
                 completion(false)
                 return
             }
-            guard let restored = restoredSession(context: context, request: request, stream: stream, manager: manager),
+            guard manager.activeCoordinator?.cinemaProgress?.isCurrentProfile == true,
+                  let restored = restoredSession(context: context, request: request, stream: stream,
+                                                 addon: addon, manager: manager),
                   restore(restored.stream, restored.request) else {
                 remove(owner: owner, from: manager)
                 completion(false)
@@ -339,6 +421,7 @@ private enum UpstreamPiPRestore {
         manager.onDidStopPiPWithoutRestoring = { [weak manager] in
             guard let manager, self.owner == owner else { return }
             if let coordinator = manager.activeCoordinator {
+                coordinator.cinemaProgress?.stopPictureInPicture(coordinator: coordinator)
                 PlaybackWakeLock.release(ownerID: coordinator.wakeLockOwnerID)
             }
             remove(owner: owner, from: manager)
@@ -353,7 +436,7 @@ private enum UpstreamPiPRestore {
     }
 
     private static func restoredSession(
-        context: ActivePlaybackContext, request: TitlePlaybackRequest, stream: AddonStream,
+        context: ActivePlaybackContext, request: TitlePlaybackRequest, stream: AddonStream, addon: String,
         manager: PictureInPictureManager
     ) -> (stream: AddonStream, request: TitlePlaybackRequest)? {
         guard context.meta.id == request.contentID, UpstreamPlaybackBridge.isHTTPS(context.url) else { return nil }
@@ -361,14 +444,14 @@ private enum UpstreamPiPRestore {
         var restoredRequest = request
         if let current = context.currentEpisode,
            current.season != request.season || current.episode != request.episodeNumber {
-            guard let episode = request.followingEpisodes.first(where: { $0.id == current.id }),
-                  let advanced = request.advancing(to: episode, position: position) else { return nil }
-            restoredRequest = advanced
+            guard let episode = request.episodeGuide.first(where: { $0.id == current.id }) else { return nil }
+            restoredRequest = request.changingEpisode(to: episode, position: position)
         }
         restoredRequest.position = position
+        restoredRequest.startsFromBeginning = position == 0
         let restoredStream = AddonStream(
             id: stream.destination == .video(context.url) ? stream.id : UUID(),
-            addon: stream.addon, name: stream.name, description: stream.description,
+            addon: addon, name: stream.name, description: stream.description,
             filename: context.filename, videoHash: context.videoHash, videoSize: context.videoSize,
             notWebReady: stream.notWebReady,
             subtitles: context.externalSubtitles.compactMap(UpstreamPlaybackBridge.addonSubtitle),

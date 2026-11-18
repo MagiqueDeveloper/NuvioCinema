@@ -104,7 +104,14 @@ actor CinemaMetadataCache {
         }
 
         let fileName = key.fileName
-        let (entry, onDisk) = cachedEntry(type, fileName: fileName, policy: policy)
+        let (stored, onDisk) = cachedEntry(type, fileName: fileName, policy: policy)
+        let entry: Entry?
+        if policy == .title, let stored, let value = stored.value as? Value, !canStore(value) {
+            remove(fileName, policy: policy)
+            entry = nil
+        } else {
+            entry = stored
+        }
         if let entry, let value = entry.value as? Value, entry.response.freshness.expiresAt > .now {
             CinemaNetworkMetrics.recordCacheHit(for: key.url, resource: .metadata, tier: onDisk ? .disk : .memory)
             return (value, entry.response.freshness.expiresAt)

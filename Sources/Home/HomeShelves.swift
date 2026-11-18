@@ -188,6 +188,7 @@ private struct ContinueWatchingMenu: View {
 
 struct CatalogShelves: View {
     let collections: [HomeCollection]
+    let shelfOrder: [HomeCollection.ID]
     let genrePreviews: [HomeGenre: [CinemetaSearchResult]]
     let continueWatching: [CinemaContinueWatchingItem]
     let viewport: HomeShelfViewport
@@ -199,19 +200,18 @@ struct CatalogShelves: View {
     let onWatchAction: (ContinueWatchingAction, CinemaContinueWatchingItem) -> Void
 
     var body: some View {
+        let collectionsByID = Dictionary(uniqueKeysWithValues: collections.map { ($0.id, $0) })
         LazyVStack(alignment: .leading, spacing: 32) {
             if !continueWatching.isEmpty {
                 shelf(.continueWatching, items: continueWatching.map(HomeShelfItem.watching))
             }
-            ForEach(collections.prefix(3)) { collection in
-                shelf(collection.id, items: collection.entries.map(HomeShelfItem.title))
-            }
-            if !collections.isEmpty {
-                let genres = HomeGenre.allCases.map { HomeShelfItem.genre($0, preview: genrePreviews[$0] ?? []) }
-                shelf(.genres, items: genres)
-            }
-            ForEach(collections.dropFirst(3)) { collection in
-                shelf(collection.id, items: collection.entries.map(HomeShelfItem.title))
+            ForEach(shelfOrder, id: \.self) { id in
+                if id == .genres {
+                    let genres = HomeGenre.allCases.map { HomeShelfItem.genre($0, preview: genrePreviews[$0] ?? []) }
+                    shelf(id, items: genres)
+                } else if let collection = collectionsByID[id] {
+                    shelf(id, items: collection.entries.map(HomeShelfItem.title))
+                }
             }
         }
     }

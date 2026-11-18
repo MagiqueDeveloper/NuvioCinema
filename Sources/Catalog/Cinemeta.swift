@@ -9,9 +9,11 @@ enum CinemetaKind: String, CaseIterable, Identifiable, Sendable {
 struct CinemetaTitle: Decodable, Identifiable, Sendable {
     let id: String
     let name: String
+    private let metadataType: String?
     let description: String?
     let releaseInfo: String?
     let imdbID: String?
+    let tmdbID: String?
     let poster: URL?
     let background: URL?
     let logo: URL?
@@ -31,8 +33,10 @@ struct CinemetaTitle: Decodable, Identifiable, Sendable {
     let trailers: [CinemaTrailer]
 
     private enum CodingKeys: String, CodingKey {
-        case id, name, description, releaseInfo, poster, background, logo, genres, runtime
+        case id, name, type, description, releaseInfo, poster, background, logo, genres, runtime
         case imdbID = "imdb_id"
+        case tmdbID = "tmdb_id"
+        case alternateTMDBID = "tmdbId"
         case imdbRating
         case released, contentRating, certification, ratings, country, countries, language, languages, status, awards
         case videos
@@ -43,11 +47,17 @@ struct CinemetaTitle: Decodable, Identifiable, Sendable {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
         id = try fields.decode(String.self, forKey: .id)
         name = try fields.decode(String.self, forKey: .name)
+        metadataType = try? fields.decode(String.self, forKey: .type)
         description = Self.text(in: fields, key: .description)
         releaseInfo = Self.text(in: fields, key: .releaseInfo)
         let providedIMDbID = try? fields.decode(String.self, forKey: .imdbID)
         let links = (try? fields.decode([CreditLink].self, forKey: .links)) ?? []
-        imdbID = Self.validIMDbID(providedIMDbID) ?? Self.validIMDbID(id) ?? links.compactMap(\.imdbID).first
+        imdbID = Self.validIMDbID(id) ?? Self.validIMDbID(providedIMDbID) ?? links.compactMap(\.imdbID).first
+        tmdbID = Self.validTMDBID(id, requiresPrefix: true) ?? [CodingKeys.tmdbID, .alternateTMDBID].lazy.compactMap { key in
+            let value = (try? fields.decode(String.self, forKey: key))
+                ?? (try? fields.decode(Int.self, forKey: key)).map(String.init)
+            return Self.validTMDBID(value)
+        }.first
         poster = Self.artworkURL(try? fields.decode(String.self, forKey: .poster))
         background = Self.artworkURL(try? fields.decode(String.self, forKey: .background))
         logo = Self.artworkURL(try? fields.decode(String.self, forKey: .logo))
@@ -105,6 +115,25 @@ struct CinemetaTitle: Decodable, Identifiable, Sendable {
         let digits = imdbID.utf8.dropFirst(2)
         guard !digits.isEmpty, digits.allSatisfy({ (48...57).contains($0) }) else { return nil }
         return imdbID
+    }
+
+    private static func validTMDBID(_ value: String?, requiresPrefix: Bool = false) -> String? {
+        guard let value else { return nil }
+        let hasPrefix = value.hasPrefix("tmdb:")
+        guard !requiresPrefix || hasPrefix else { return nil }
+        let digits = hasPrefix ? value.utf8.dropFirst(5) : value.utf8.dropFirst(0)
+        guard !digits.isEmpty, digits.allSatisfy({ (48...57).contains($0) }) else { return nil }
+        let significant = digits.drop(while: { $0 == 48 })
+        guard !significant.isEmpty else { return nil }
+        return "tmdb:" + String(decoding: significant, as: UTF8.self)
+    }
+
+    func matchesDetails(for contentID: String, kind: CinemetaKind) -> Bool {
+        guard metadataType == nil || metadataType == kind.rawValue else { return false }
+        if let requestedTMDB = Self.validTMDBID(contentID, requiresPrefix: true) {
+            return tmdbID == requestedTMDB
+        }
+        return imdbID == contentID
     }
 
     fileprivate static func artworkURL(_ value: String?) -> URL? {
@@ -356,13 +385,19 @@ struct HomeCatalog: Sendable {
     let featuredEntries: [CinemetaSearchResult]
     let collections: [HomeCollection]
     let genrePreviews: [HomeGenre: [CinemetaSearchResult]]
+    let isComplete: Bool
+    let shelfOrder: [HomeCollection.ID]
+    private let rowOrder: [HomeCollection.ID]
 
     var hasFailure: Bool { rows.contains(where: \.hasFailure) }
-    var isEmpty: Bool { collections.isEmpty }
+    var isEmpty: Bool { collections.isEmpty && featuredEntries.isEmpty }
 
-    init(rows: [HomeCollection], featuredEntries: [CinemetaSearchResult]) {
+    init(rows: [HomeCollection], featuredEntries: [CinemetaSearchResult],
+         rowOrder: [HomeCollection.ID], isComplete: Bool) {
         self.rows = rows
         self.featuredEntries = featuredEntries
+        self.rowOrder = rowOrder
+        self.isComplete = isComplete
 
         // Allocate chart and release titles first so broader rows can fill from deeper in their feeds.
         var used = Set(featuredEntries.map(\.catalogID))
@@ -377,18 +412,68 @@ struct HomeCatalog: Sendable {
             }
         }
         collections = rows.compactMap { selection[$0.id] }
+        shelfOrder = Self.withGenreBrowser(rowOrder).filter { selection[$0] != nil || ($0 == .genres && !selection.isEmpty) }
         genrePreviews = Self.makeGenrePreviews(rows: rows, visibleRows: collections)
     }
 
     func preservingAvailableCollections(from previous: Self?) -> Self {
-        guard hasFailure, let previous else { return self }
-        let rows = rows.map { row in
-            guard row.hasFailure,
-                  let cached = previous.rows.first(where: { $0.id == row.id && !$0.entries.isEmpty }) else { return row }
-            return HomeCollection(id: row.id, entries: cached.entries, hasFailure: true)
+        guard (!isComplete || hasFailure), let previous else { return self }
+        let currentRows = Dictionary(uniqueKeysWithValues: rows.map { ($0.id, $0) })
+        let previousRows = Dictionary(uniqueKeysWithValues: previous.rows.map { ($0.id, $0) })
+        let rows = rowOrder.compactMap { id -> HomeCollection? in
+            guard let row = currentRows[id] else { return isComplete ? nil : previousRows[id] }
+            guard row.hasFailure, row.entries.isEmpty, let cached = previousRows[id] else { return row }
+            return HomeCollection(id: id, entries: cached.entries, hasFailure: true)
         }
         let featured = featuredEntries.isEmpty ? previous.featuredEntries : featuredEntries
-        return HomeCatalog(rows: rows, featuredEntries: featured)
+        return HomeCatalog(rows: rows, featuredEntries: featured, rowOrder: rowOrder, isComplete: isComplete)
+    }
+
+    func preservingFocus(on shelf: HomeCollection.ID, entryID: String, from previous: Self) -> Self? {
+        guard let previousIndex = previous.shelfOrder.firstIndex(of: shelf) else { return nil }
+        let prefix = Array(previous.shelfOrder.prefix(through: previousIndex))
+        let scheduled = Self.withGenreBrowser(rowOrder)
+        let suffix = if let index = shelfOrder.firstIndex(of: shelf) {
+            Array(shelfOrder.suffix(from: index + 1))
+        } else if let index = scheduled.firstIndex(of: shelf) {
+            Array(scheduled.suffix(from: index + 1)).filter { shelfOrder.contains($0) }
+        } else {
+            shelfOrder.filter { previous.shelfOrder.suffix(from: previousIndex + 1).contains($0) }
+        }
+        let preservedOrder = prefix + suffix.filter { !prefix.contains($0) }
+        let updated = Dictionary(uniqueKeysWithValues: collections.map { ($0.id, $0) })
+        let former = Dictionary(uniqueKeysWithValues: previous.collections.map { ($0.id, $0) })
+        var preservedEntries = false
+        let preservedCollections = preservedOrder.compactMap { id -> HomeCollection? in
+            guard id == shelf, let row = former[id] else { return updated[id] ?? former[id] }
+            let entries = updated[id]?.entries ?? []
+            guard let index = row.entries.firstIndex(where: { $0.id == entryID }),
+                  entries.firstIndex(where: { $0.id == entryID }) != index else { return updated[id] ?? row }
+            preservedEntries = true
+            let prefix = row.entries.prefix(through: index)
+            let replacements = Dictionary(uniqueKeysWithValues: entries.map { ($0.id, $0) })
+            let heldIDs = Set(prefix.map(\.id))
+            return HomeCollection(id: id, entries: prefix.map { replacements[$0.id] ?? $0 }
+                + entries.filter { !heldIDs.contains($0.id) }, hasFailure: updated[id]?.hasFailure ?? row.hasFailure)
+        }
+        guard preservedOrder != shelfOrder || preservedEntries else { return nil }
+        return HomeCatalog(base: self, collections: preservedCollections, shelfOrder: preservedOrder)
+    }
+
+    private init(base: Self, collections: [HomeCollection], shelfOrder: [HomeCollection.ID]) {
+        rows = base.rows
+        rowOrder = base.rowOrder
+        isComplete = base.isComplete
+        featuredEntries = base.featuredEntries
+        self.collections = collections
+        self.shelfOrder = shelfOrder
+        genrePreviews = Self.makeGenrePreviews(rows: rows, visibleRows: collections)
+    }
+
+    private static func withGenreBrowser(_ rowOrder: [HomeCollection.ID]) -> [HomeCollection.ID] {
+        var order = rowOrder
+        order.insert(.genres, at: min(3, order.count))
+        return order
     }
 
     private static func makeGenrePreviews(
@@ -551,16 +636,87 @@ struct CinemetaClient: Sendable {
         return await CinemetaCatalog(movies: movies, series: series)
     }
 
-    func loadHome(on date: Date = .now) async -> HomeCatalog {
-        async let popular = load()
-        async let favorites = betterPostersCatalog(movie: "trakt-popular", series: "trakt-popular")
-        async let watching = betterPostersCatalog(movie: "trakt-trending", series: "trakt-trending")
-        async let today = betterPostersCatalog(movie: "tmdb-today", series: "tmdb-today-shows")
-        async let releases = betterPostersCatalog(movie: "tmdb-latest", series: "tmdb-latest-shows")
-        async let genres = genreCollections(on: date)
+    func retrySearch(query: String, retaining previous: CinemetaCatalog) async -> CinemetaCatalog {
+        let filter = ("search", query)
+        async let movies = previous.movies == nil ? catalog(kind: .movie, filter: filter) : previous.movies
+        async let series = previous.series == nil ? catalog(kind: .series, filter: filter) : previous.series
+        return await CinemetaCatalog(movies: movies, series: series)
+    }
 
-        let (popularCatalog, favoriteCatalog, watchingCatalog, todayCatalog, releaseCatalog, genreRows) =
-            await (popular, favorites, watching, today, releases, genres)
+    private enum HomeFeed: Hashable, Sendable {
+        case popular, favorites, watching, today, releases, genre(HomeGenre)
+    }
+
+    private struct HomeFeedResponse: Sendable {
+        let feed: HomeFeed
+        let kind: CinemetaKind
+        let titles: [CinemetaTitle]?
+    }
+
+    func loadHome(on date: Date = .now, onProgress: @MainActor (HomeCatalog) -> Void) async -> HomeCatalog {
+        let genres = HomeGenre.rotation(on: date)
+        let feeds: [HomeFeed] = [.popular, .favorites, .watching, .today, .releases] + genres.map(HomeFeed.genre)
+        return await withTaskGroup(of: HomeFeedResponse.self) { group in
+            for feed in feeds {
+                for kind in CinemetaKind.allCases {
+                    group.addTask {
+                        HomeFeedResponse(feed: feed, kind: kind, titles: await loadHomeFeed(feed, kind: kind))
+                    }
+                }
+            }
+            var responses: [HomeFeed: [CinemetaKind: HomeFeedResponse]] = [:]
+            var remaining = feeds.count * CinemetaKind.allCases.count
+            for await response in group {
+                guard !Task.isCancelled else { break }
+                responses[response.feed, default: [:]][response.kind] = response
+                remaining -= 1
+                if remaining > 0 {
+                    await onProgress(Self.homeCatalog(responses, genres: genres, on: date, isComplete: false))
+                }
+            }
+            return Self.homeCatalog(responses, genres: genres, on: date, isComplete: true)
+        }
+    }
+
+    private func loadHomeFeed(_ feed: HomeFeed, kind: CinemetaKind) async -> [CinemetaTitle]? {
+        switch feed {
+        case .popular:
+            await catalog(kind: kind, filter: nil)
+        case .favorites:
+            await catalog(kind: kind, filter: nil, id: "trakt-popular", source: .betterPosters)
+        case .watching:
+            await catalog(kind: kind, filter: nil, id: "trakt-trending", source: .betterPosters)
+        case .today:
+            await catalog(kind: kind, filter: nil, id: kind == .movie ? "tmdb-today" : "tmdb-today-shows", source: .betterPosters)
+        case .releases:
+            await catalog(kind: kind, filter: nil, id: kind == .movie ? "tmdb-latest" : "tmdb-latest-shows", source: .betterPosters)
+        case .genre(let genre):
+            await loadGenre(genre, kind: kind, skip: 0)
+        }
+    }
+
+    private static func homeCatalog(_ responses: [HomeFeed: [CinemetaKind: HomeFeedResponse]],
+                                    genres: [HomeGenre], on date: Date, isComplete: Bool) -> HomeCatalog {
+        func catalog(_ feed: HomeFeed) -> CinemetaCatalog {
+            CinemetaCatalog(movies: responses[feed]?[.movie]?.titles, series: responses[feed]?[.series]?.titles)
+        }
+
+        func failed(_ feed: HomeFeed, kind: CinemetaKind? = nil) -> Bool {
+            if let kind, let response = responses[feed]?[kind] { return response.titles == nil }
+            if kind != nil { return false }
+            return responses[feed]?.values.contains { $0.titles == nil } ?? false
+        }
+
+        let popularCatalog = catalog(.popular)
+        let favoriteCatalog = catalog(.favorites)
+        let watchingCatalog = catalog(.watching)
+        let todayCatalog = catalog(.today)
+        let releaseCatalog = catalog(.releases)
+        let genreRows = genres.compactMap { genre -> HomeCollection? in
+            let feed = HomeFeed.genre(genre)
+            guard responses[feed] != nil else { return nil }
+            return HomeCollection(id: .genre(genre), entries: mixedEntries(catalog(feed)), hasFailure: failed(feed))
+        }
         let recentTrends = Self.mixedEntries(watchingCatalog)
         let dailyChart = Array(Self.mixedEntries(todayCatalog).prefix(10))
         let newMovies = Self.entries(in: releaseCatalog, kind: .movie)
@@ -577,57 +733,45 @@ struct CinemetaClient: Sendable {
             .sorted { $0.1 > $1.1 }
             .map(\.0)
 
-        let rows = [
-            HomeCollection(id: .watching, entries: recentTrends,
-                           hasFailure: watchingCatalog.hasFailure || recentTrends.isEmpty),
-            HomeCollection(id: .today, entries: ranked, hasFailure: !dailyChartComplete),
-            HomeCollection(id: .newReleases, entries: newMovies, hasFailure: releaseCatalog.movies == nil),
-            HomeCollection(id: .newSeries, entries: newSeries, hasFailure: releaseCatalog.series == nil),
-            HomeCollection(id: .topRated, entries: Self.uniqueEntries(rated, limit: rated.count),
-                           hasFailure: popularCatalog.hasFailure || genreRows.contains(where: \.hasFailure)),
-            HomeCollection(id: .popularSeries, entries: popularSeries,
-                           hasFailure: favoriteCatalog.series == nil && popularCatalog.series == nil),
-            HomeCollection(id: .popularMovies, entries: popularMovies,
-                           hasFailure: favoriteCatalog.movies == nil && popularCatalog.movies == nil),
-        ] + genreRows
+        var rows: [HomeCollection] = []
+        if responses[.watching] != nil {
+            rows.append(HomeCollection(id: .watching, entries: recentTrends,
+                                       hasFailure: failed(.watching) || (isComplete && recentTrends.isEmpty)))
+        }
+        if responses[.today]?.count == CinemetaKind.allCases.count {
+            rows.append(HomeCollection(id: .today, entries: ranked, hasFailure: !dailyChartComplete))
+        }
+        if responses[.releases]?[.movie] != nil {
+            rows.append(HomeCollection(id: .newReleases, entries: newMovies, hasFailure: failed(.releases, kind: .movie)))
+        }
+        if responses[.releases]?[.series] != nil {
+            rows.append(HomeCollection(id: .newSeries, entries: newSeries, hasFailure: failed(.releases, kind: .series)))
+        }
+        if isComplete || !rated.isEmpty {
+            rows.append(HomeCollection(id: .topRated, entries: Self.uniqueEntries(rated, limit: rated.count),
+                                       hasFailure: failed(.popular) || genreRows.contains(where: \.hasFailure)))
+        }
+        if responses[.favorites]?[.series] != nil || responses[.popular]?[.series] != nil {
+            rows.append(HomeCollection(id: .popularSeries, entries: popularSeries,
+                                       hasFailure: failed(.favorites, kind: .series) && failed(.popular, kind: .series)))
+        }
+        if responses[.favorites]?[.movie] != nil || responses[.popular]?[.movie] != nil {
+            rows.append(HomeCollection(id: .popularMovies, entries: popularMovies,
+                                       hasFailure: failed(.favorites, kind: .movie) && failed(.popular, kind: .movie)))
+        }
 
+        let order: [HomeCollection.ID] = [.watching, .today, .newReleases, .newSeries, .topRated,
+                                          .popularSeries, .popularMovies] + genres.map(HomeCollection.ID.genre)
         return HomeCatalog(
-            rows: rows,
+            rows: rows + genreRows,
             featuredEntries: Self.featuredEntries(from: [watchingCatalog, todayCatalog, releaseCatalog, popularCatalog],
-                                                  excluding: Set(ranked.map(\.catalogID)), on: date)
+                                                  excluding: Set(ranked.map(\.catalogID)), on: date),
+            rowOrder: order, isComplete: isComplete
         )
-    }
-
-    func loadGenre(_ genre: HomeGenre, skip: Int = 0) async -> CinemetaCatalog {
-        async let movies = loadGenre(genre, kind: .movie, skip: skip)
-        async let series = loadGenre(genre, kind: .series, skip: skip)
-        return await CinemetaCatalog(movies: movies, series: series)
     }
 
     func loadGenre(_ genre: HomeGenre, kind: CinemetaKind, skip: Int) async -> [CinemetaTitle]? {
         await catalog(kind: kind, filter: ("genre", genre.rawValue), skip: skip)
-    }
-
-    private func genreCollections(on date: Date) async -> [HomeCollection] {
-        let genres = HomeGenre.rotation(on: date)
-        return await withTaskGroup(of: HomeCollection.self) { group in
-            for genre in genres {
-                group.addTask {
-                    let titles = await loadGenre(genre)
-                    return HomeCollection(id: .genre(genre), entries: Self.mixedEntries(titles),
-                                          hasFailure: titles.hasFailure)
-                }
-            }
-            var rows: [HomeCollection.ID: HomeCollection] = [:]
-            for await row in group { rows[row.id] = row }
-            return genres.compactMap { rows[.genre($0)] }
-        }
-    }
-
-    private func betterPostersCatalog(movie: String, series: String) async -> CinemetaCatalog {
-        async let movies = catalog(kind: .movie, filter: nil, id: movie, source: .betterPosters)
-        async let shows = catalog(kind: .series, filter: nil, id: series, source: .betterPosters)
-        return await CinemetaCatalog(movies: movies, series: shows)
     }
 
     private static func mixedEntries(_ catalog: CinemetaCatalog) -> [CinemetaSearchResult] {
@@ -695,23 +839,29 @@ struct CinemetaClient: Sendable {
     }
 
     func details(for title: CinemetaTitle, kind: CinemetaKind) async -> CinemetaTitle? {
-        await details(contentID: title.imdbID ?? title.id, kind: kind)
+        await details(contentID: title.imdbID ?? title.tmdbID ?? title.id, kind: kind)
     }
 
     func details(imdbID id: String, kind: CinemetaKind) async -> CinemetaTitle? {
         guard id.hasPrefix("tt"), id.utf8.count > 2,
               id.utf8.dropFirst(2).allSatisfy({ (48...57).contains($0) }) else { return nil }
-        return await fetch(TitleResponse.self, path: "/meta/\(kind.rawValue)/\(id).json", policy: .title) {
-            $0.meta.id == id || $0.meta.imdbID == id
-        }?.meta
+        return await verifiedDetails(contentID: id, kind: kind, source: .cinemeta)
     }
 
     func details(contentID: String, kind: CinemetaKind) async -> CinemetaTitle? {
         guard contentID.hasPrefix("tmdb:") else { return await details(imdbID: contentID, kind: kind) }
         let digits = contentID.utf8.dropFirst(5)
         guard !digits.isEmpty, digits.allSatisfy({ (48...57).contains($0) }) else { return nil }
-        return await fetch(TitleResponse.self, path: "/meta/\(kind.rawValue)/\(contentID).json",
-                           source: .betterPosters, policy: .title)?.meta
+        return await verifiedDetails(contentID: contentID, kind: kind, source: .betterPosters)
+    }
+
+    private func verifiedDetails(contentID: String, kind: CinemetaKind, source: CatalogSource) async -> CinemetaTitle? {
+        let response = await fetch(TitleResponse.self, path: "/meta/\(kind.rawValue)/\(contentID).json",
+                                   source: source, policy: .title) {
+            $0.meta.matchesDetails(for: contentID, kind: kind)
+        }
+        guard let title = response?.meta, title.matchesDetails(for: contentID, kind: kind) else { return nil }
+        return title
     }
 
     func related(to title: CinemetaTitle, kind: CinemetaKind) async -> [CinemetaTitle] {

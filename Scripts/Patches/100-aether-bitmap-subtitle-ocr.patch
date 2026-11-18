@@ -1,7 +1,7 @@
 diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
 --- a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
 +++ b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
-@@ -5,10 +5,79 @@
+@@ -5,26 +5,116 @@
  /// Phase D: on-device recognition of bitmap subtitle images (PGS / DVB / DVD) into plain-text
  /// cues for the native WebVTT rendition (PiP / AirPlay / external display). Lossy by design;
  /// a failed or empty recognition drops that cue and the rendition just misses the line, the
@@ -9,11 +9,17 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
 +/// fullscreen overlay can use a separate executor for subtitle recognition near the playhead.
  enum SubtitleImageOCR {
      private static let executor = Executor()
+-
+-    /// Vision bounding boxes are normalized with a bottom-left origin; reading order is
+-    /// descending midY. Blank fragments are dropped; nil when nothing readable remains.
+-    nonisolated static func assembleLines(_ observations: [(text: String, midY: CGFloat)]) -> String? {
+-        let lines = observations
+-            .map { (text: $0.text.trimmingCharacters(in: .whitespacesAndNewlines), midY: $0.midY) }
 +    private static let playbackExecutor = Executor()
- 
++
 +    private enum RecognitionUse { case fullscreen, rendition }
 +
-+    typealias PlaybackLine = (candidates: [(text: String, confidence: Float)], midY: CGFloat)
++    typealias PlaybackLine = (candidates: [(text: String, confidence: Float)], box: CGRect)
 +
 +    struct PlaybackReading {
 +        let text: String
@@ -59,30 +65,63 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
 +        guard let observations = recognize(image, at: level, language: language, use: .fullscreen,
 +                                           usesLanguageCorrection: usesLanguageCorrection) else { return nil }
 +        return playbackReading(from: observations.map { observation in
-+            (observation.topCandidates(3).map { ($0.string, $0.confidence) }, observation.boundingBox.midY)
-+        })
++            (observation.topCandidates(3).map { ($0.string, $0.confidence) }, observation.boundingBox)
++        }, language: language)
 +    }
 +
-+    nonisolated static func playbackReading(from observations: [PlaybackLine]) -> PlaybackReading? {
-+        var lines: [(text: String, midY: CGFloat)] = []
++    nonisolated static func playbackReading(from observations: [PlaybackLine], language: String? = nil) -> PlaybackReading? {
++        var lines: [(text: String, box: CGRect)] = []
 +        var isUnambiguous = true
-+        for (candidates, midY) in observations {
++        for (candidates, box) in observations {
 +            guard let top = candidates.first, top.confidence >= 0.70,
 +                  !top.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
 +            if let alternative = candidates.dropFirst().first(where: { $0.text != top.text }),
 +               top.confidence - alternative.confidence < 0.08 {
 +                isUnambiguous = false
 +            }
-+            lines.append((top.text, midY))
++            lines.append((top.text, box))
 +        }
-+        guard let text = assembleLines(lines) else { return nil }
++        guard let text = assembleLines(lines, language: language) else { return nil }
 +        return PlaybackReading(text: text, isUnambiguous: isUnambiguous)
 +    }
 +
-     /// Vision bounding boxes are normalized with a bottom-left origin; reading order is
-     /// descending midY. Blank fragments are dropped; nil when nothing readable remains.
-     nonisolated static func assembleLines(_ observations: [(text: String, midY: CGFloat)]) -> String? {
-@@ -24,7 +93,7 @@
++    /// Vision uses a bottom-left origin. Sort rows from top to bottom and join
++    /// observations that overlap vertically in the track's reading direction.
++    nonisolated static func assembleLines(
++        _ observations: [(text: String, box: CGRect)], language: String? = nil
++    ) -> String? {
++        let fragments = observations
++            .map { (text: $0.text.trimmingCharacters(in: .whitespacesAndNewlines), box: $0.box) }
+             .filter { !$0.text.isEmpty }
+-            .sorted { $0.midY > $1.midY }
+-            .map(\.text)
+-        guard !lines.isEmpty else { return nil }
+-        return lines.joined(separator: "\n")
++            .sorted { $0.box.midY > $1.box.midY }
++        guard !fragments.isEmpty else { return nil }
++
++        var rows: [(box: CGRect, fragments: [(text: String, box: CGRect)])] = []
++        for fragment in fragments {
++            if let index = rows.indices.last {
++                let row = rows[index].box
++                let overlap = min(row.maxY, fragment.box.maxY) - max(row.minY, fragment.box.minY)
++                if overlap > 0.5 * min(row.height, fragment.box.height) {
++                    rows[index].box = row.union(fragment.box)
++                    rows[index].fragments.append(fragment)
++                    continue
++                }
++            }
++            rows.append((fragment.box, [fragment]))
++        }
++
++        let rightToLeft = language.map { Locale.Language(identifier: $0).characterDirection == .rightToLeft } ?? false
++        return rows.map { row in
++            row.fragments.sorted {
++                rightToLeft ? $0.box.maxX > $1.box.maxX : $0.box.minX < $1.box.minX
++            }.map(\.text).joined(separator: " ")
++        }.joined(separator: "\n")
+     }
+ 
      /// Track tags are ISO 639-1/2 ("ger"), Vision wants BCP-47 primary codes ("de"). The engine's
      /// synonym classes resolve the bibliographic 639-2/B forms Foundation cannot ("ger", "fre").
      nonisolated static func recognitionLanguage(forTrackLanguage tag: String?) -> String? {
@@ -91,10 +130,13 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
          if let set = AetherEngine.languageSynonyms.first(where: { $0.contains(raw) }),
             let twoLetter = set.first(where: { $0.count == 2 }) {
              return twoLetter
-@@ -46,6 +115,33 @@
-         return ctx.makeImage()
-     }
- 
+@@ -43,6 +133,33 @@
+         ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+         ctx.fill(CGRect(x: 0, y: 0, width: w, height: h))
+         ctx.draw(image, in: CGRect(x: 0, y: 0, width: w, height: h))
++        return ctx.makeImage()
++    }
++
 +    /// Dark glyphs on a padded white canvas, scaled up when small, which Vision reads best.
 +    /// Bitmap cues are cropped tight to the glyphs, so without padding an edge character
 +    /// such as "[" is lost. Flattening onto black and inverting turns the white fill dark
@@ -119,13 +161,10 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
 +        ctx.setBlendMode(.difference)
 +        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
 +        ctx.fill(canvas)
-+        return ctx.makeImage()
-+    }
-+
-     /// Vision synchronously waits for work of its own. Keep that wait on a real thread, not a
-     /// Swift cooperative worker (including Task.detached), so recognition cannot exhaust the
-     /// executor. Admission is process-wide and stays occupied until the native call returns,
-@@ -76,46 +172,44 @@
+         return ctx.makeImage()
+     }
+ 
+@@ -76,46 +193,44 @@
      /// evidence, it is the state the process stays in, and the alternative is paying a minute of
      /// stall per cue to learn it again.
      private nonisolated static func recognizeSynchronously(_ image: CGImage, language: String?) -> String? {
@@ -136,15 +175,8 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
 -        markAccurateUnavailable()
 -        guard let observations = recognize(flat, at: .fast, language: language) else { return nil }
 -        return assembleLines(observations)
-+        guard let prepared = preparedForRecognition(image) else { return nil }
-+        let accurate = accurateIsUnavailable ? nil : recognize(prepared, at: .accurate, language: language)
-+        guard let observations = accurate ?? recognize(prepared, at: .fast, language: language) else { return nil }
-+        return assembleLines(observations.compactMap { observation in
-+            guard let top = observation.topCandidates(1).first else { return nil }
-+            return (top.string, observation.boundingBox.midY)
-+        })
-     }
- 
+-    }
+-
 -    /// nil when the REQUEST failed, which is what the fallback turns on. An empty array is a
 -    /// request that ran and read nothing, which is an ordinary outcome for a subtitle bitmap and
 -    /// says nothing about the model.
@@ -152,6 +184,15 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
 -    /// The language is resolved per level on purpose: `.fast` supports six languages against the
 -    /// accurate model's thirty-three, so outside those six the pin is simply dropped. Unpinned
 -    /// recognition of a line beats no line.
++        guard let prepared = preparedForRecognition(image) else { return nil }
++        let accurate = accurateIsUnavailable ? nil : recognize(prepared, at: .accurate, language: language)
++        guard let observations = accurate ?? recognize(prepared, at: .fast, language: language) else { return nil }
++        return assembleLines(observations.compactMap { observation in
++            guard let top = observation.topCandidates(1).first else { return nil }
++            return (top.string, observation.boundingBox)
++        }, language: language)
++    }
++
 +    /// Fullscreen can fall back to the bitmap if the requested language is unsupported.
 +    /// Native renditions need text and can still try an unpinned language.
      private nonisolated static func recognize(_ image: CGImage,
@@ -197,7 +238,7 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
      }
  
      /// Recognize a batch of CLOSED cues and append the text results to a native store. Image
-@@ -236,3 +330,10 @@
+@@ -236,3 +351,10 @@
          if first { EngineLog.emit("[SubtitleOCR] degraded: \(reason)", category: .engine) }
      }
  }
@@ -211,26 +252,61 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
 diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/SubtitleOCRTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/SubtitleOCRTests.swift
 --- a/Vendor/AetherEngine/Tests/AetherEngineTests/SubtitleOCRTests.swift
 +++ b/Vendor/AetherEngine/Tests/AetherEngineTests/SubtitleOCRTests.swift
-@@ -28,6 +28,43 @@ struct SubtitleOCRTests {
-         #expect(SubtitleImageOCR.recognitionLanguage(forTrackLanguage: "") == nil)
+@@ -10,13 +10,28 @@
+     @Test("line assembly sorts top line first (Vision origin is bottom-left) and drops blanks")
+     func lineAssembly() {
+         let joined = SubtitleImageOCR.assembleLines([
+-            (text: "bottom line", midY: 0.2),
+-            (text: "   ", midY: 0.9),
+-            (text: "top line", midY: 0.8),
++            (text: "bottom line", box: box(midY: 0.2)),
++            (text: "   ", box: box(midY: 0.9)),
++            (text: "top line", box: box(midY: 0.8)),
+         ])
+         #expect(joined == "top line\nbottom line")
+         #expect(SubtitleImageOCR.assembleLines([]) == nil)
+-        #expect(SubtitleImageOCR.assembleLines([(text: " ", midY: 0.5)]) == nil)
++        #expect(SubtitleImageOCR.assembleLines([(text: " ", box: box(midY: 0.5))]) == nil)
++    }
++
++    @Test("fragments on one row are joined in track reading order")
++    func splitRows() {
++        let fragments = [
++            (text: "right", box: box(midY: 0.81, x: 0.65)),
++            (text: "bottom", box: box(midY: 0.2)),
++            (text: "left", box: box(midY: 0.79, x: 0.12)),
++        ]
++        #expect(SubtitleImageOCR.assembleLines(fragments, language: "en") == "left right\nbottom")
++        #expect(SubtitleImageOCR.assembleLines(fragments, language: "ar") == "right left\nbottom")
++    }
++
++    private func box(midY: CGFloat, x: CGFloat = 0.1) -> CGRect {
++        CGRect(x: x, y: midY - 0.03, width: 0.2, height: 0.06)
      }
  
+     @Test("track languages normalize to alpha-2 for Vision, unknown tags pass through")
+@@ -26,6 +41,43 @@
+         #expect(SubtitleImageOCR.recognitionLanguage(forTrackLanguage: "de") == "de")
+         #expect(SubtitleImageOCR.recognitionLanguage(forTrackLanguage: nil) == nil)
+         #expect(SubtitleImageOCR.recognitionLanguage(forTrackLanguage: "") == nil)
++    }
++
 +    @Test("fullscreen OCR preserves Vision's confidently ranked text")
 +    func preservesConfidentReading() {
 +        let dialogue: [(String, Float)] = [("-I need an explainer", 0.95), ("-1 need an explainer", 0.72)]
 +        let number: [(String, Float)] = [("-1 dB", 0.95), ("-I dB", 0.72)]
-+        #expect(SubtitleImageOCR.playbackReading(from: [(dialogue, 0.5)])?.acceptedText() == "-I need an explainer")
-+        #expect(SubtitleImageOCR.playbackReading(from: [(number, 0.5)])?.acceptedText() == "-1 dB")
++        #expect(SubtitleImageOCR.playbackReading(from: [(dialogue, box(midY: 0.5))])?.acceptedText() == "-I need an explainer")
++        #expect(SubtitleImageOCR.playbackReading(from: [(number, box(midY: 0.5))])?.acceptedText() == "-1 dB")
 +    }
 +
 +    @Test("fullscreen OCR falls back to the bitmap for uncertain readings")
 +    func rejectsUncertainReading() {
 +        let ambiguous: [(String, Float)] = [("-1 need an explainer", 0.92), ("-I need an explainer", 0.89)]
 +        let lowConfidence: [(String, Float)] = [("[beeping]", 0.40)]
-+        let reading = SubtitleImageOCR.playbackReading(from: [(ambiguous, 0.5)])
++        let reading = SubtitleImageOCR.playbackReading(from: [(ambiguous, box(midY: 0.5))])
 +        #expect(reading?.acceptedText() == nil)
 +        #expect(reading?.acceptedText(verifiedBy: reading) == nil)
-+        #expect(SubtitleImageOCR.playbackReading(from: [(lowConfidence, 0.5)]) == nil)
++        #expect(SubtitleImageOCR.playbackReading(from: [(lowConfidence, box(midY: 0.5))]) == nil)
 +        #expect(SubtitleImageOCR.playbackReading(from: []) == nil)
 +    }
 +
@@ -239,19 +315,17 @@ diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/SubtitleOCRTests.swift 
 +        let question = "-So, are you two dating?"
 +        let response = "-Oh, um, we-- I--"
 +        let reading = SubtitleImageOCR.playbackReading(from: [
-+            ([(response, 1), ("-Oh, um, we-- l--", 1)], 0.25),
-+            ([(question, 1), ("-So, are you two dating.", 1)], 0.75)
++            ([(response, 1), ("-Oh, um, we-- l--", 1)], box(midY: 0.25)),
++            ([(question, 1), ("-So, are you two dating.", 1)], box(midY: 0.75))
 +        ])
-+        let verified = SubtitleImageOCR.playbackReading(from: [([(question, 1)], 0.75), ([(response, 1)], 0.25)])
++        let verified = SubtitleImageOCR.playbackReading(from: [([(question, 1)], box(midY: 0.75)), ([(response, 1)], box(midY: 0.25))])
 +        let different = SubtitleImageOCR.playbackReading(from: [
-+            ([(question, 1)], 0.75), ([("-Oh, um, we-- 1--", 1)], 0.25)
++            ([(question, 1)], box(midY: 0.75)), ([("-Oh, um, we-- 1--", 1)], box(midY: 0.25))
 +        ])
-+        let incomplete = SubtitleImageOCR.playbackReading(from: [([(question, 1)], 0.75)])
++        let incomplete = SubtitleImageOCR.playbackReading(from: [([(question, 1)], box(midY: 0.75))])
 +        #expect(reading?.acceptedText(verifiedBy: verified) == "\(question)\n\(response)")
 +        #expect(reading?.acceptedText(verifiedBy: different) == nil)
 +        #expect(reading?.acceptedText(verifiedBy: incomplete) == nil)
-+    }
-+
+     }
+ 
      @Test("flatten produces an opaque black canvas with the source drawn on top")
-     func flatten() throws {
-         // 2x1 image: left pixel white opaque, right pixel fully transparent.

@@ -32,6 +32,7 @@ struct TitleDetailsView: View {
     @FocusState private var focus: FocusTarget?
     @State private var details: CinemetaTitle?
     @State private var loadFailed = false
+    @State private var isLoadingDetails = true
     @State private var loadAttempt = 0
     @State private var selectedSeason: Int?
     @State private var seasonSlideOffset: CGFloat = 0
@@ -63,6 +64,12 @@ struct TitleDetailsView: View {
 
     private enum Section: Hashable { case hero, episodes, trailers }
     private enum FocusRegion: Equatable { case hero, seasonPicker, episodeCards }
+    private struct WatchStateRequest: Hashable {
+        let revision: Int
+        let titleID: String
+        let imdbID: String?
+        let tmdbID: String?
+    }
 
     private var focusRegion: FocusRegion? {
         switch focus {
@@ -102,7 +109,7 @@ struct TitleDetailsView: View {
         return CinemaPlaybackArtwork(backdropURLs: backdropURLs, logoURL: title.logo ?? details?.logo)
     }
 
-    private var watchContentID: String { metadata.imdbID ?? title.imdbID ?? title.id }
+    private var watchContentID: String { metadata.imdbID ?? title.imdbID ?? metadata.tmdbID ?? title.tmdbID ?? title.id }
     private var trailers: [CinemaTrailer] { metadata.trailers.isEmpty ? title.trailers : metadata.trailers }
     private var people: [PersonCredit] {
         let extra = credits?.people ?? []
@@ -266,13 +273,23 @@ struct TitleDetailsView: View {
             credits = loaded
         }
         .task(id: loadAttempt) {
+            account.registerWatchIdentity(for: title, kind: kind)
             let loaded = await CinemetaClient().details(for: title, kind: kind)
             guard !Task.isCancelled else { return }
+            loadFailed = loaded == nil
+            isLoadingDetails = false
             if let loaded {
                 details = loaded
-            } else {
-                loadFailed = true
+                if focus == .retry {
+                    let groups = episodeGroups
+                    focus = displayedSeason(in: groups, currentEpisode: currentEpisode(in: groups))
+                        .map(FocusTarget.season) ?? .play
+                }
             }
+        }
+        .task(id: WatchStateRequest(revision: account.watchStateRevision, titleID: metadata.id,
+                                    imdbID: metadata.imdbID, tmdbID: metadata.tmdbID)) {
+            await account.prepareWatchState(for: metadata, kind: kind)
         }
     }
 
@@ -370,7 +387,7 @@ struct TitleDetailsView: View {
             }
 
             if kind == .movie && loadFailed {
-                Button("Try Again", systemImage: "arrow.clockwise", action: retry)
+                Button(isLoadingDetails ? "Retrying…" : "Try Again", systemImage: "arrow.clockwise", action: retry)
                     .buttonStyle(.bordered)
                     .focused($focus, equals: .retry)
             }
@@ -461,7 +478,7 @@ struct TitleDetailsView: View {
             candidates = [watchContentID, title.id, progress?.contentID].compactMap { $0 }
         }
         var seen = Set<String>()
-        let resumePosition = progress.flatMap { NuvioAccount.hasStarted($0) && $0.fraction < 0.95 ? $0.position : nil }
+        let resumePosition = TitlePlaybackRequest.resumePosition(for: progress)
         let position = startsFromBeginning ? 0 : (resumePosition ?? 0)
         playbackOrigin = origin
         let contentID = progress?.contentID ?? watchContentID
@@ -470,22 +487,18 @@ struct TitleDetailsView: View {
         }, kind: kind, videoIDs: candidates.filter { seen.insert($0).inserted }, position: position, addons: account.addons,
                                            contentID: contentID, season: episode?.season, episodeNumber: episode?.episode,
                                            profileID: account.profileID, accountID: account.playbackAccountID,
-                                           followingEpisodes: episode.map { nextEpisodesForPlayback(after: $0) } ?? [],
+                                           episodeGuide: episode == nil ? [] : sortedEpisodeGuide,
                                            metadata: metadata, selectedEpisode: episode,
                                            startupArtwork: heroArtwork,
                                            startsFromBeginning: startsFromBeginning)
         setPlaybackRequest(request)
     }
 
-    private func nextEpisodesForPlayback(after current: CinemetaEpisode) -> [CinemetaEpisode] {
-        let now = Date.now
+    private var sortedEpisodeGuide: [CinemetaEpisode] {
         var seen = Set<String>()
-        let following = episodes.sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }.filter { episode in
-            guard (episode.season, episode.episode) > (current.season, current.episode),
-                  current.season == 0 ? episode.season == 0 : episode.season > 0 else { return false }
-            return seen.insert("\(episode.season):\(episode.episode)").inserted
+        return episodes.sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }.filter {
+            seen.insert("\($0.season):\($0.episode)").inserted
         }
-        return Array(following.prefix { !$0.isUpcoming(at: now) })
     }
 
     private func dismissPlaybackSources() {
@@ -1116,6 +1129,17 @@ struct TitleDetailsView: View {
         let displayedSeason = displayedSeason(in: groups, currentEpisode: currentEpisode)
         VStack(alignment: .leading, spacing: DetailShelf.sectionGap) {
             sectionHeading("Episodes")
+            if loadFailed {
+                HStack(spacing: 22) {
+                    Text(displayedSeason == nil ? "Couldn’t load episodes." : "Couldn’t refresh episodes.")
+                        .foregroundStyle(.secondary)
+                    Button(isLoadingDetails ? "Retrying…" : "Try Again") {
+                        if selectedSeason == nil { selectedSeason = displayedSeason }
+                        retry()
+                    }
+                    .focused($focus, equals: .retry)
+                }
+            }
             if let season = displayedSeason, let seasonEpisodes = groups[season] {
                 seasonPicker(seasons: seasons, current: season)
                 ZStack {
@@ -1124,16 +1148,13 @@ struct TitleDetailsView: View {
                         .id(season)
                         .transition(seasonShelfTransition)
                 }
-            } else if loadFailed {
-                Text("Couldn’t load episodes.")
-                    .foregroundStyle(.secondary)
-                Button("Try Again", action: retry)
-                    .focused($focus, equals: .retry)
-            } else if details == nil {
-                episodeSkeleton
-            } else {
-                Text("No episodes available.")
-                    .foregroundStyle(.secondary)
+            } else if !loadFailed {
+                if isLoadingDetails {
+                    episodeSkeleton
+                } else {
+                    Text("No episodes available.")
+                        .foregroundStyle(.secondary)
+                }
             }
         }
         .padding(.horizontal, 16)
@@ -1176,7 +1197,8 @@ struct TitleDetailsView: View {
     }
 
     private func retry() {
-        loadFailed = false
+        guard !isLoadingDetails else { return }
+        isLoadingDetails = true
         loadAttempt += 1
     }
 

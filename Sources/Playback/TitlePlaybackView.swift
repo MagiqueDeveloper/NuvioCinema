@@ -20,11 +20,28 @@ struct TitlePlaybackRequest: Identifiable, Sendable {
     let episodeNumber: Int?
     let profileID: Int?
     let accountID: String?
-    let followingEpisodes: [CinemetaEpisode]
+    let episodeGuide: [CinemetaEpisode]
     var metadata: CinemetaTitle? = nil
     var selectedEpisode: CinemetaEpisode? = nil
     var startupArtwork = CinemaPlaybackArtwork(backdropURLs: [], logoURL: nil)
     var startsFromBeginning = false
+
+    var playableEpisodes: [CinemetaEpisode] {
+        let now = Date.now
+        return episodeGuide.filter { !$0.isUpcoming(at: now) }
+    }
+
+    var followingEpisodes: [CinemetaEpisode] {
+        guard let selectedEpisode else { return [] }
+        return followingEpisodes(after: selectedEpisode)
+    }
+
+    func followingEpisodes(after current: CinemetaEpisode, at date: Date = .now) -> [CinemetaEpisode] {
+        Array(episodeGuide.lazy.filter {
+            ($0.season, $0.episode) > (current.season, current.episode)
+                && (current.season == 0 ? $0.season == 0 : $0.season > 0)
+        }.prefix { !$0.isUpcoming(at: date) })
+    }
 
     func videoIDs(for episode: CinemetaEpisode) -> [String] {
         let suffix = ":\(episode.season):\(episode.episode)"
@@ -33,15 +50,18 @@ struct TitlePlaybackRequest: Identifiable, Sendable {
         return ([contentID + suffix, episode.id] + catalogIDs).filter { seen.insert($0).inserted }
     }
 
-    func advancing(to episode: CinemetaEpisode, position: Int64) -> TitlePlaybackRequest? {
-        guard let index = followingEpisodes.firstIndex(where: { $0.id == episode.id }) else { return nil }
+    func changingEpisode(to episode: CinemetaEpisode, position: Int64) -> TitlePlaybackRequest {
         let label = String(localized: "S\(episode.season), E\(episode.episode) · \(episode.name)")
         return TitlePlaybackRequest(title: title, episode: label, kind: kind,
                                     videoIDs: videoIDs(for: episode), position: position, addons: addons,
                                     contentID: contentID, season: episode.season, episodeNumber: episode.episode,
                                     profileID: profileID, accountID: accountID,
-                                    followingEpisodes: Array(followingEpisodes.dropFirst(index + 1)),
-                                    metadata: metadata, selectedEpisode: episode, startupArtwork: startupArtwork)
+                                    episodeGuide: episodeGuide, metadata: metadata, selectedEpisode: episode,
+                                    startupArtwork: startupArtwork, startsFromBeginning: position == 0)
+    }
+
+    @MainActor static func resumePosition(for progress: NuvioProgress?) -> Int64? {
+        progress.flatMap { NuvioAccount.hasStarted($0) && $0.fraction < 0.95 ? $0.position : nil }
     }
 }
 
@@ -97,13 +117,17 @@ struct TitlePlaybackView: View {
             }
         }
         .task(id: loadAttempt) { [loadAttempt, request] in
-            let loaded = await AddonStreams().load(addons: request.addons, kind: request.kind, videoIDs: request.videoIDs)
-            guard !Task.isCancelled, !isClosing, self.loadAttempt == loadAttempt else { return }
-            if let stream = loaded.stream(matching: lastSourceKeys) {
-                rememberSource(stream, in: loaded)
+            for await loaded in AddonStreams().updates(addons: request.addons, kind: request.kind, videoIDs: request.videoIDs) {
+                guard !Task.isCancelled, !isClosing, self.loadAttempt == loadAttempt else { return }
+                let needsFocus = focusedItem == nil || focusedItem == .status || focusedItem == .retry
+                if lastSourceID == nil, let stream = loaded.stream(matching: lastSourceKeys) {
+                    rememberSource(stream, in: loaded)
+                }
+                results = loaded
+                if selected == nil, needsFocus {
+                    focusedItem = loaded.streams.isEmpty && !loaded.isComplete ? .status : preferredFocus
+                }
             }
-            results = loaded
-            if selected == nil { focusedItem = preferredFocus }
         }
         #if !NUVIO_UPSTREAM_PLAYER
         .fullScreenCover(item: $selected, onDismiss: restoreSourceFocus, content: player)
@@ -230,7 +254,7 @@ struct TitlePlaybackView: View {
             Divider()
                 .padding(.horizontal, 42)
 
-            if let results {
+            if let results, !results.streams.isEmpty || results.isComplete {
                 sourceList(results)
             } else {
                 loadingSources
@@ -258,6 +282,10 @@ struct TitlePlaybackView: View {
                             .focused($focusedItem, equals: .source(stream.id))
                             .id(stream.id)
                             .accessibilityHint(stream.destination.isExternal ? Text("Opens in another app") : Text("Plays this source"))
+                        }
+                        if !results.isComplete {
+                            ProgressView("Checking more add-ons…")
+                                .padding(.horizontal, 24)
                         }
                     }
                 }
@@ -413,11 +441,9 @@ struct TitlePlaybackView: View {
             guard let episode = request.followingEpisodes.first else { return }
             let saved = account.progress(for: request.contentID, kind: request.kind,
                                          season: episode.season, episode: episode.episode)
-            let position = saved.flatMap { $0.fraction < 0.95 && NuvioAccount.hasStarted($0) ? $0.position : nil } ?? 0
-            if let next = request.advancing(to: episode, position: position) {
-                updateRequest(next)
-                return
-            }
+            let position = TitlePlaybackRequest.resumePosition(for: saved) ?? 0
+            updateRequest(request.changingEpisode(to: episode, position: position))
+            return
         }
         focusedItem = preferredFocus
         if let playerFailure {
@@ -681,12 +707,15 @@ private struct NativePlaybackScreen: View {
 #endif
 
 enum PlaybackCheckpoint {
-    case periodic, flush, ended
+    case periodic, flush, seek, ended
 }
 
 @MainActor
 final class PlaybackProgressRecorder {
-    private var latest: (position: Int64, duration: Int64)?
+    private var latest: (position: Int64, duration: Int64, explicitSeek: Bool)?
+    private var previousPlaying: (position: Double, duration: Double, uptime: TimeInterval)?
+    private var reachedEndingDuringPlayback = false
+    private var secondsPlayedNearEnd: TimeInterval = 0
     private var lastSaved: Int64?
     private var lastSaveTime = ContinuousClock.now
     private var completed = false
@@ -697,32 +726,67 @@ final class PlaybackProgressRecorder {
     }
 
     func sample(_ position: Double, duration: Double, initialPosition: Int64, checkpoint: PlaybackCheckpoint,
+                uptime: TimeInterval = ProcessInfo.processInfo.systemUptime,
                 using write: (Int64, Int64, Bool) -> Void) {
-        guard !completed, position.isFinite, duration.isFinite, duration > 0, duration < 1_000_000_000 else { return }
+        guard !completed, position.isFinite, position >= 0, duration.isFinite, duration > 0,
+              duration < 1_000_000_000 else { return }
         let length = Int64((duration * 1_000).rounded())
-        if checkpoint == .ended, position / duration >= 0.85 {
+        let fraction = position / duration
+
+        if checkpoint == .seek {
+            previousPlaying = nil
+            reachedEndingDuringPlayback = false
+            secondsPlayedNearEnd = 0
+        } else if checkpoint == .periodic {
+            let previous = previousPlaying
+            previousPlaying = (position, duration, uptime)
+            if let previous, previous.position != position {
+                let elapsed = uptime - previous.uptime
+                let delta = position - previous.position
+                let continuous = elapsed >= 0 && delta > 0 && delta <= min(4 * elapsed + 0.5, 8.5)
+                    && abs(previous.duration - duration) < 2
+                if !continuous {
+                    reachedEndingDuringPlayback = false
+                    secondsPlayedNearEnd = 0
+                } else if fraction >= 0.85 {
+                    if previous.position / previous.duration < 0.85 {
+                        reachedEndingDuringPlayback = true
+                    }
+                    secondsPlayedNearEnd += min(elapsed, delta)
+                }
+            }
+        } else if checkpoint == .flush {
+            previousPlaying = nil
+        }
+
+        let playedThroughCredits = reachedEndingDuringPlayback
+            && checkpoint == .periodic && duration >= 60 && fraction >= 0.90
+        let playedToNaturalEnd = checkpoint == .ended
+            && (reachedEndingDuringPlayback || secondsPlayedNearEnd >= 5)
+            && max(fraction, (previousPlaying?.position ?? 0) / duration) >= 0.85
+        if playedThroughCredits || playedToNaturalEnd {
             completed = true
             write(length, length, true)
             return
         }
-        guard position > 0 else {
-            if checkpoint == .ended { flush(using: write) }
+        if checkpoint == .ended || fraction >= 0.90 {
+            // A seek into the ending leaves the last usable resume point in place.
+            if checkpoint != .periodic { flush(using: write) }
             return
         }
+        guard position > 0 || checkpoint == .seek else { return }
         let offset = Int64((min(position, duration) * 1_000).rounded())
-        if latest == nil, abs(offset - initialPosition) < 2_000 { return }
-        latest = (offset, length)
+        if checkpoint != .seek, latest == nil, abs(offset - initialPosition) < 2_000 { return }
+        latest = (offset, length, checkpoint == .seek)
         if checkpoint != .periodic || lastSaveTime.duration(to: .now) >= .seconds(15) {
             flush(using: write)
         }
     }
 
     func flush(using write: (Int64, Int64, Bool) -> Void) {
-        guard !completed, let latest, latest.position >= 5_000,
+        guard !completed, let latest, latest.position >= 5_000 || latest.explicitSeek,
               latest.position != lastSaved else { return }
-        let reachedCredits = latest.duration >= 60_000 && Double(latest.position) / Double(latest.duration) >= 0.9
-        completed = reachedCredits
-        write(latest.position, latest.duration, reachedCredits)
+        write(latest.position, latest.duration, false)
         lastSaved = latest.position
         lastSaveTime = .now
     }

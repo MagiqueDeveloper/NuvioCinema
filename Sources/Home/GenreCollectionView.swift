@@ -1,5 +1,26 @@
 import SwiftUI
 
+struct GenrePagination {
+    private let pageSize = 50
+    private(set) var offsets: [CinemetaKind: Int] = [.movie: 0, .series: 0]
+    private(set) var failures: Set<CinemetaKind> = []
+    private var seenPages: [CinemetaKind: Set<Set<String>>] = [:]
+
+    var automaticOffsets: [CinemetaKind: Int] { offsets.filter { !failures.contains($0.key) } }
+    var retryOffsets: [CinemetaKind: Int] { offsets.filter { failures.contains($0.key) } }
+
+    mutating func receive(_ ids: Set<String>?, kind: CinemetaKind, skip: Int) {
+        guard offsets[kind] == skip else { return }
+        guard let ids else {
+            failures.insert(kind)
+            return
+        }
+        failures.remove(kind)
+        let isNewPage = !ids.isEmpty && seenPages[kind, default: []].insert(ids).inserted
+        offsets[kind] = isNewPage ? skip + pageSize : nil
+    }
+}
+
 struct GenreCollectionView: View {
     let genre: HomeGenre
     let preview: [CinemetaSearchResult]
@@ -10,10 +31,8 @@ struct GenreCollectionView: View {
     @Namespace private var focusScope
     @FocusState private var focus: FocusTarget?
     @State private var entries: [CinemetaSearchResult]
-    @State private var fetchedIDs: Set<CinemetaSearchResult.ID> = []
-    @State private var offsets: [CinemetaKind: Int] = [.movie: 0, .series: 0]
-    @State private var failures: Set<CinemetaKind> = []
-    @State private var request: LoadRequest? = LoadRequest(offsets: [.movie: 0, .series: 0])
+    @State private var pagination = GenrePagination()
+    @State private var request: LoadRequest? = LoadRequest(offsets: GenrePagination().automaticOffsets)
     @State private var isNearEnd = false
     @State private var postLoadFocus: FocusTarget?
     @State private var restorePosterID: CinemetaSearchResult.ID?
@@ -39,6 +58,7 @@ struct GenreCollectionView: View {
     }
 
     private var isActive: Bool { titles.screens.count == 1 }
+    private var failures: Set<CinemetaKind> { pagination.failures }
 
     init(genre: HomeGenre, preview: [CinemetaSearchResult] = [], onDismiss: @escaping () -> Void) {
         self.genre = genre
@@ -192,7 +212,7 @@ struct GenreCollectionView: View {
                 }
                 Button {
                     guard isActive, !isLoading else { return }
-                    request = LoadRequest(offsets: offsets.filter { failures.contains($0.key) })
+                    request = LoadRequest(offsets: pagination.retryOffsets)
                 } label: {
                     if isLoading {
                         Text("Loading Titles…")
@@ -232,8 +252,9 @@ struct GenreCollectionView: View {
     }
 
     private func loadMoreIfNeeded() {
+        let offsets = pagination.automaticOffsets
         guard isActive, isNearEnd, postLoadFocus == nil, restorePosterID == nil,
-              request == nil, failures.isEmpty, !offsets.isEmpty else { return }
+              request == nil, !offsets.isEmpty else { return }
         request = LoadRequest(offsets: offsets)
     }
 
@@ -252,16 +273,9 @@ struct GenreCollectionView: View {
         var batch: [CinemetaKind: [CinemetaSearchResult]] = [:]
         for (kind, response) in responses {
             guard let skip = request.offsets[kind] else { continue }
-            guard let response else {
-                failures.insert(kind)
-                continue
-            }
-            failures.remove(kind)
-            let fresh = response.map { CinemetaSearchResult(title: $0, kind: kind) }
-                .filter { fetchedIDs.insert($0.id).inserted }
-            batch[kind] = fresh
-            // A page already visible in the preview can still be a new server page.
-            offsets[kind] = fresh.isEmpty ? nil : skip + 50
+            let page = response?.map { CinemetaSearchResult(title: $0, kind: kind) }
+            pagination.receive(page.map { Set($0.map(\.id)) }, kind: kind, skip: skip)
+            batch[kind] = page
         }
         let movies = batch[.movie] ?? []
         let shows = batch[.series] ?? []
