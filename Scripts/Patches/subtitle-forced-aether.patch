@@ -332,7 +332,7 @@
 +        let language = bitmapTrackLanguage
 +        pendingBitmap = cue
 +        bitmapTask = Task { [weak self] in
-+            let text = await cue.image.recognizedPlaybackText(trackLanguage: language)
++            let text = await cue.image.recognizedPlaybackText(trackLanguage: language).map(SubtitleOCRCleanup.cleaned)
 +            guard !Task.isCancelled, let self else { return }
 +            bitmapTask = nil
 +            pendingBitmap = nil

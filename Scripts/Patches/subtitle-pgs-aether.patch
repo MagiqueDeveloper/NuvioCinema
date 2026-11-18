@@ -1,7 +1,7 @@
 diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
 --- a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
 +++ b/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR.swift
-@@ -5,9 +5,74 @@ import Vision
+@@ -5,10 +5,79 @@
  /// Phase D: on-device recognition of bitmap subtitle images (PGS / DVB / DVD) into plain-text
  /// cues for the native WebVTT rendition (PiP / AirPlay / external display). Lossy by design;
  /// a failed or empty recognition drops that cue and the rendition just misses the line, the
@@ -10,7 +10,7 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
  enum SubtitleImageOCR {
      private static let executor = Executor()
 +    private static let playbackExecutor = Executor()
-+
+ 
 +    private enum RecognitionUse { case fullscreen, rendition }
 +
 +    typealias PlaybackLine = (candidates: [(text: String, confidence: Float)], midY: CGFloat)
@@ -29,20 +29,24 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
 +    nonisolated static func recognizeForPlayback(_ image: CGImage, trackLanguage: String?) async -> String? {
 +        let language = recognitionLanguage(forTrackLanguage: trackLanguage)
 +        return await playbackExecutor.run {
-+            guard let flat = flattenedOntoBlack(image) else { return nil }
-+            if let text = recognizePlayback(flat, at: .fast, language: language)?.acceptedText() {
-+                return text
-+            }
-+            guard !accurateIsUnavailable,
-+                  let reading = recognizePlayback(flat, at: .accurate, language: language) else {
-+                return nil
-+            }
-+            if let text = reading.acceptedText() { return text }
++            guard let prepared = preparedForRecognition(image) else { return nil }
++            // A confident fast reading can still drop short words and edge punctuation such
++            // as "[", so read with the accurate model first and keep fast for when it fails.
++            if !accurateIsUnavailable {
++                let reading = recognizePlayback(prepared, at: .accurate, language: language)
++                if !accurateIsUnavailable {
++                    guard let reading else { return nil }
++                    if let text = reading.acceptedText() { return text }
 +
-+            // Vision can assign the same confidence to several accurate candidates, including
-+            // different glyphs. Verify the leading reading without language correction.
-+            let verification = recognizePlayback(flat, at: .accurate, language: language, usesLanguageCorrection: false)
-+            return reading.acceptedText(verifiedBy: verification)
++                    // Vision can assign the same confidence to several accurate candidates,
++                    // including different glyphs. Verify the leading reading without language
++                    // correction.
++                    let verification = recognizePlayback(prepared, at: .accurate, language: language,
++                                                         usesLanguageCorrection: false)
++                    return reading.acceptedText(verifiedBy: verification)
++                }
++            }
++            return recognizePlayback(prepared, at: .fast, language: language)?.acceptedText()
 +        }
 +    }
 +
@@ -74,10 +78,11 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
 +        guard let text = assembleLines(lines) else { return nil }
 +        return PlaybackReading(text: text, isUnambiguous: isUnambiguous)
 +    }
- 
++
      /// Vision bounding boxes are normalized with a bottom-left origin; reading order is
      /// descending midY. Blank fragments are dropped; nil when nothing readable remains.
-@@ -24,7 +89,7 @@ enum SubtitleImageOCR {
+     nonisolated static func assembleLines(_ observations: [(text: String, midY: CGFloat)]) -> String? {
+@@ -24,7 +93,7 @@
      /// Track tags are ISO 639-1/2 ("ger"), Vision wants BCP-47 primary codes ("de"). The engine's
      /// synonym classes resolve the bibliographic 639-2/B forms Foundation cannot ("ger", "fre").
      nonisolated static func recognitionLanguage(forTrackLanguage tag: String?) -> String? {
@@ -86,18 +91,54 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
          if let set = AetherEngine.languageSynonyms.first(where: { $0.contains(raw) }),
             let twoLetter = set.first(where: { $0.count == 2 }) {
              return twoLetter
-@@ -77,45 +142,43 @@ enum SubtitleImageOCR {
+@@ -46,6 +115,33 @@
+         return ctx.makeImage()
+     }
+ 
++    /// Dark glyphs on a padded white canvas, scaled up when small, which Vision reads best.
++    /// Bitmap cues are cropped tight to the glyphs, so without padding an edge character
++    /// such as "[" is lost. Flattening onto black and inverting turns the white fill dark
++    /// and folds the dark outline into the background.
++    nonisolated static func preparedForRecognition(_ image: CGImage) -> CGImage? {
++        let sourceWidth = CGFloat(image.width), sourceHeight = CGFloat(image.height)
++        guard sourceWidth > 0, sourceHeight > 0 else { return nil }
++        let scale = min(3, max(1, 120 / sourceHeight))
++        let padding = max(16, sourceHeight * 0.15) * scale
++        let glyphs = CGRect(x: padding, y: padding, width: sourceWidth * scale, height: sourceHeight * scale)
++        let width = Int((glyphs.width + 2 * padding).rounded(.up))
++        let height = Int((glyphs.height + 2 * padding).rounded(.up))
++        guard let ctx = CGContext(
++            data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
++            space: CGColorSpaceCreateDeviceRGB(),
++            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
++        let canvas = CGRect(x: 0, y: 0, width: width, height: height)
++        ctx.interpolationQuality = .high
++        ctx.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
++        ctx.fill(canvas)
++        ctx.draw(image, in: glyphs)
++        ctx.setBlendMode(.difference)
++        ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
++        ctx.fill(canvas)
++        return ctx.makeImage()
++    }
++
+     /// Vision synchronously waits for work of its own. Keep that wait on a real thread, not a
+     /// Swift cooperative worker (including Task.detached), so recognition cannot exhaust the
+     /// executor. Admission is process-wide and stays occupied until the native call returns,
+@@ -76,46 +172,44 @@
+     /// evidence, it is the state the process stays in, and the alternative is paying a minute of
      /// stall per cue to learn it again.
      private nonisolated static func recognizeSynchronously(_ image: CGImage, language: String?) -> String? {
-         guard let flat = flattenedOntoBlack(image) else { return nil }
+-        guard let flat = flattenedOntoBlack(image) else { return nil }
 -        if !accurateIsUnavailable, let observations = recognize(flat, at: .accurate, language: language) {
 -            return assembleLines(observations)
 -        }
 -        markAccurateUnavailable()
 -        guard let observations = recognize(flat, at: .fast, language: language) else { return nil }
 -        return assembleLines(observations)
-+        let accurate = accurateIsUnavailable ? nil : recognize(flat, at: .accurate, language: language)
-+        guard let observations = accurate ?? recognize(flat, at: .fast, language: language) else { return nil }
++        guard let prepared = preparedForRecognition(image) else { return nil }
++        let accurate = accurateIsUnavailable ? nil : recognize(prepared, at: .accurate, language: language)
++        guard let observations = accurate ?? recognize(prepared, at: .fast, language: language) else { return nil }
 +        return assembleLines(observations.compactMap { observation in
 +            guard let top = observation.topCandidates(1).first else { return nil }
 +            return (top.string, observation.boundingBox.midY)
@@ -156,7 +197,7 @@ diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Subtitles/SubtitleImageOCR
      }
  
      /// Recognize a batch of CLOSED cues and append the text results to a native store. Image
-@@ -236,3 +299,10 @@ enum SubtitleImageOCR {
+@@ -236,3 +330,10 @@
          if first { EngineLog.emit("[SubtitleOCR] degraded: \(reason)", category: .engine) }
      }
  }

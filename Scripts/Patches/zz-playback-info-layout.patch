@@ -267,7 +267,7 @@
 -                .font(.system(size: 15, weight: .regular))
 -                .foregroundColor(Color.white.opacity(0.65))
 +        let isFocused = focusedCardID == id
-+        let usesLightFill = isFocused || (isPrimary && focusedCardID == nil)
++        let usesLightFill = isFocused
 +        return Button(action: action) {
 +            Label(title, systemImage: systemImage)
 +                .font(.system(size: 25, weight: isFocused ? .bold : .semibold))

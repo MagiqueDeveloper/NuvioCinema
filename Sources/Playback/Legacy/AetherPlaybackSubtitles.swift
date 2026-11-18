@@ -235,12 +235,12 @@ struct AetherPlaybackSubtitleOverlay: View {
                         switch bitmapCaptions.result(for: cue.id, image: image) {
                         case .text(let text):
                             caption(text, width: frame.width)
-                        case .unreadable:
+                        case .unreadable, nil:
+                            // Show the bitmap while recognition is pending too, so a cue
+                            // that starts before its text is ready loses no words.
                             let size = bitmapSize(image, in: frame)
                             BitmapSubtitleFallback(image: image.cgImage)
                                 .frame(width: size.width, height: size.height)
-                        case nil:
-                            EmptyView()
                         }
                     } else if let text = cue.text, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         caption(text, width: frame.width)
@@ -413,17 +413,10 @@ private final class LegacyBitmapCaptions: ObservableObject {
     }
 
     private nonisolated static func recognizeSynchronously(_ image: CGImage, language: String?) -> String? {
-        let bounds = CGRect(x: 0, y: 0, width: image.width, height: image.height)
-        guard let context = CGContext(data: nil, width: image.width, height: image.height,
-                                      bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
-                                      bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
-        context.setFillColor(gray: 0, alpha: 1)
-        context.fill(bounds)
-        context.draw(image, in: bounds)
-        guard let flattened = context.makeImage() else { return nil }
+        guard let prepared = BitmapSubtitleFallback.makeRecognitionImage(from: image) else { return nil }
 
         let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .fast
+        request.recognitionLevel = .accurate
         request.usesLanguageCorrection = true
         if let language {
             let primary = Locale.Language(identifier: language).languageCode?.identifier(.alpha2) ?? language
@@ -437,14 +430,36 @@ private final class LegacyBitmapCaptions: ObservableObject {
             }
         }
         do {
-            try VNImageRequestHandler(cgImage: flattened).perform([request])
+            try VNImageRequestHandler(cgImage: prepared).perform([request])
         } catch {
             return nil
         }
-        let lines = (request.results ?? []).sorted { $0.boundingBox.midY > $1.boundingBox.midY }
-            .compactMap { $0.topCandidates(1).first?.string.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        return lines.isEmpty ? nil : lines.joined(separator: "\n")
+        let text = SubtitleOCRCleanup.cleaned(joinedLines(request.results ?? []))
+        return text.isEmpty ? nil : text
+    }
+
+    /// Group observations that share a row, so one line split into pieces stays one line,
+    /// then read rows top to bottom and pieces left to right.
+    private nonisolated static func joinedLines(_ observations: [VNRecognizedTextObservation]) -> String {
+        var rows: [(box: CGRect, pieces: [(x: CGFloat, text: String)])] = []
+        for observation in observations.sorted(by: { $0.boundingBox.midY > $1.boundingBox.midY }) {
+            guard let text = observation.topCandidates(1).first?.string
+                .trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { continue }
+            let box = observation.boundingBox
+            if let last = rows.indices.last {
+                let row = rows[last].box
+                let overlap = min(row.maxY, box.maxY) - max(row.minY, box.minY)
+                if overlap > 0.5 * min(row.height, box.height) {
+                    rows[last].box = row.union(box)
+                    rows[last].pieces.append((box.minX, text))
+                    continue
+                }
+            }
+            rows.append((box, [(box.minX, text)]))
+        }
+        return rows.map { row in
+            row.pieces.sorted { $0.x < $1.x }.map(\.text).joined(separator: " ")
+        }.joined(separator: "\n")
     }
 }
 

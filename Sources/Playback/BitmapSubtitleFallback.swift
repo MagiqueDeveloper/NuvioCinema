@@ -35,6 +35,43 @@ struct BitmapSubtitleFallback: View {
 
     nonisolated static func makeWhiteGlyphs(from image: CGImage) -> CGImage? {
         let source = CIImage(cgImage: image)
+        return renderContext.createCGImage(whiteGlyphs(of: source), from: source.extent)
+    }
+
+    /// Dark glyphs on a padded, opaque white canvas, scaled up when small, which is what
+    /// text recognition reads best. The padding keeps edge characters such as `[` and `♪`
+    /// inside the image, as bitmap cues are cropped tight to the glyphs.
+    nonisolated static func makeRecognitionImage(from image: CGImage) -> CGImage? {
+        let source = CIImage(cgImage: image)
+        let height = source.extent.height
+        guard height > 0, source.extent.width > 0 else { return nil }
+
+        let black = whiteGlyphs(of: source).applyingFilter("CIColorMatrix", parameters: [
+            "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputBVector": CIVector(x: 0, y: 0, z: 0, w: 0),
+            "inputAVector": CIVector(x: 0, y: 0, z: 0, w: 1),
+            "inputBiasVector": CIVector(x: 0, y: 0, z: 0, w: 0)
+        ])
+        let padding = max(16, height * 0.15)
+        let canvas = source.extent.insetBy(dx: -padding, dy: -padding)
+        var prepared = black.composited(over: CIImage(color: .white).cropped(to: canvas))
+            .transformed(by: CGAffineTransform(translationX: -canvas.minX, y: -canvas.minY))
+
+        let scale = min(3, max(1, 120 / height))
+        if scale > 1 {
+            prepared = prepared.applyingFilter("CILanczosScaleTransform", parameters: [
+                kCIInputScaleKey: scale,
+                kCIInputAspectRatioKey: 1
+            ])
+        }
+        let extent = CGRect(x: 0, y: 0, width: canvas.width * scale, height: canvas.height * scale).integral
+        return renderContext.createCGImage(prepared.cropped(to: extent), from: extent)
+    }
+
+    /// White where the source has bright glyph fill, so the dark outline and any fill
+    /// color drop out.
+    nonisolated private static func whiteGlyphs(of source: CIImage) -> CIImage {
         let white = source.applyingFilter("CIColorMatrix", parameters: [
             "inputRVector": CIVector(x: 0, y: 0, z: 0, w: 0),
             "inputGVector": CIVector(x: 0, y: 0, z: 0, w: 0),
@@ -42,9 +79,8 @@ struct BitmapSubtitleFallback: View {
             "inputAVector": CIVector(x: 0.6, y: 0.6, z: 0.6, w: 0),
             "inputBiasVector": CIVector(x: 1, y: 1, z: 1, w: -0.1)
         ])
-        let clipped = white.applyingFilter("CISourceInCompositing", parameters: [
+        return white.applyingFilter("CISourceInCompositing", parameters: [
             kCIInputBackgroundImageKey: source
         ])
-        return renderContext.createCGImage(clipped, from: source.extent)
     }
 }
