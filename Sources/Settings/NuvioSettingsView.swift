@@ -147,6 +147,10 @@ struct NuvioSettingsView: View {
         }
         .frame(width: 420, alignment: .leading)
         .padding(.top, 36)
+        // Span the full height so Left from any row on the page reaches the sidebar,
+        // not only from rows level with the categories.
+        .frame(maxHeight: .infinity, alignment: .top)
+        .contentShape(Rectangle())
         .focusSection()
         // Coming back from the page, land on the current category rather than the nearest row.
         .defaultFocus($sidebarFocus, category, priority: .userInitiated)
