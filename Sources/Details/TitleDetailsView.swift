@@ -41,6 +41,9 @@ struct TitleDetailsView: View {
     @State private var didHandleInitialFocus = false
     @State private var episodeUnavailable = false
     @State private var unavailableEpisodeRelease: Date?
+    /// An episode the catalog dates in the future, which may already be out (catalog air dates can be wrong).
+    @State private var unreleasedEpisode: CinemetaEpisode?
+    @State private var unreleasedOrigin: FocusTarget = .play
     @State private var trailerUnavailable = false
     @State private var portraits: [String: CastPortrait] = [:]
     @State private var showsCredits = false
@@ -246,10 +249,16 @@ struct TitleDetailsView: View {
         }
         #endif
         .alert("Episode Unavailable", isPresented: $episodeUnavailable) {
-            Button("OK", role: .cancel) {}
+            if let episode = unreleasedEpisode {
+                Button("Play Anyway") {
+                    unreleasedEpisode = nil
+                    showPlayback(episode: episode, progress: episodeProgress(episode), origin: unreleasedOrigin)
+                }
+            }
+            Button(unreleasedEpisode == nil ? "OK" : "Cancel", role: .cancel) { unreleasedEpisode = nil }
         } message: {
             if let unavailableEpisodeRelease {
-                Text("This episode airs \(CinemetaEpisode.displayAirDate(unavailableEpisodeRelease)).")
+                Text("This episode is listed to air \(CinemetaEpisode.displayAirDate(unavailableEpisodeRelease)). If it’s already out, Play Anyway looks for it in your add-ons.")
             } else if details == nil && !loadFailed {
                 Text("Episode information hasn’t loaded yet. Choose an episode when it’s available.")
             } else {
@@ -446,7 +455,10 @@ struct TitleDetailsView: View {
         let episode = kind == .series ? heroEpisode() : nil
         guard kind == .movie || episode != nil else {
             let now = Date.now
-            unavailableEpisodeRelease = episodes.compactMap(\.releasedAt).filter { $0 > now }.min()
+            unreleasedEpisode = episodes.filter { $0.isUpcoming(at: now) }
+                .min { ($0.releasedAt ?? .distantFuture, $0.season, $0.episode) < ($1.releasedAt ?? .distantFuture, $1.season, $1.episode) }
+            unavailableEpisodeRelease = unreleasedEpisode?.releasedAt
+            unreleasedOrigin = .play
             episodeUnavailable = true
             return
         }
@@ -455,6 +467,8 @@ struct TitleDetailsView: View {
 
     private func playEpisode(_ episode: CinemetaEpisode) {
         if episode.isUpcoming() {
+            unreleasedEpisode = episode
+            unreleasedOrigin = .episode(episode.id)
             unavailableEpisodeRelease = episode.releasedAt
             episodeUnavailable = true
             return
