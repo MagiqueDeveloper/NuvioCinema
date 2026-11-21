@@ -14,27 +14,34 @@ struct CinemaPlaybackActionButton<Content: View>: View {
     }
 
     var body: some View {
-        if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
-            Button(action: action, label: label)
-                .buttonStyle(.glass)
-                .buttonBorderShape(isNextEpisode ? .roundedRectangle(radius: episodeCornerRadius) : .capsule)
-                .controlSize(.large)
+        // Drawn like the other player buttons (white fill, black text when focused) rather than with the
+        // system `.glass` style, whose own focus highlight ignored `isFocused` and left the label colours wrong.
+        let shape = RoundedRectangle(cornerRadius: isNextEpisode ? episodeCornerRadius : 31, style: .continuous)
+        Button(action: action) {
+            label()
+                .foregroundStyle(isFocused ? Color.black : Color.white)
+                .padding(.horizontal, isNextEpisode ? 12 : 25)
+                .padding(.vertical, isNextEpisode ? 12 : 0)
+                .frame(minHeight: 62)
+                .background { background(in: shape) }
+                .contentShape(shape)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.06 : 1)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
+    }
+
+    @ViewBuilder
+    private func background(in shape: RoundedRectangle) -> some View {
+        if isFocused {
+            shape.fill(Color.white)
+        } else if #available(tvOS 26.0, *), AppleTVCapability.current.supportsLiquidGlass {
+            shape.fill(Color.black.opacity(0.35))
+                .glassEffect(.regular, in: shape)
         } else {
-            let shape = RoundedRectangle(cornerRadius: isNextEpisode ? episodeCornerRadius : 31, style: .continuous)
-            Button(action: action) {
-                label()
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, isNextEpisode ? 12 : 25)
-                    .padding(.vertical, isNextEpisode ? 12 : 0)
-                    .frame(minHeight: 62)
-                    .background(Color.black.opacity(0.80), in: shape)
-                    .overlay {
-                        shape.strokeBorder(.white.opacity(isFocused ? 0.90 : 0.20), lineWidth: isFocused ? 2 : 1)
-                    }
-                    .contentShape(shape)
-            }
-            .buttonStyle(PosterCardButtonStyle())
-            .focusEffectDisabledIfAvailable()
+            shape.fill(Color.black.opacity(0.80))
+                .overlay { shape.strokeBorder(.white.opacity(0.20), lineWidth: 1) }
         }
     }
 }
