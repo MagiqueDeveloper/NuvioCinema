@@ -9,6 +9,9 @@ enum HomeShelfStyle: Equatable {
         case .continueWatching, .today, .newSeries, .popularSeries: self = .backdrop
         case .newReleases, .topRated, .popularMovies: self = .poster
         case .genres: self = .genres
+        case .genrePopularMovies, .genreRecent, .genreAll: self = .poster
+        case .genrePopularSeries: self = .backdrop
+        case .genreAcclaimed: self = .editorial
         case .genre(let genre):
             switch genre {
             case .adventure, .documentary, .fantasy, .scienceFiction: self = .editorial

@@ -7,6 +7,8 @@ enum CinemaStyle {
 
 enum HomeFocusTarget: Hashable {
     case hero, nextFeatured
+    /// Genre page placeholders while titles load or after a failure.
+    case loading, retry
     case poster(HomeCollection.ID, CinemetaSearchResult.ID)
 
     var isPoster: Bool {
@@ -34,7 +36,7 @@ final class HomeHeroScroll {
     }
 }
 
-private struct HomeHeroScrollBehavior: ScrollTargetBehavior {
+struct HomeHeroScrollBehavior: ScrollTargetBehavior {
     let restoredShelfOffset: CGFloat?
 
     func updateTarget(_ target: inout ScrollTarget, context: TargetContext) {
@@ -553,7 +555,7 @@ struct HomeView: View {
     }
 }
 
-private struct FeaturedHero: View {
+struct FeaturedHero: View {
     let height: CGFloat
     let isActive: Bool
     @Binding var carousel: HeroCarousel

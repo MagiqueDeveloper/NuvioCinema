@@ -510,6 +510,9 @@ struct HomeCollection: Identifiable, Sendable {
     enum ID: Hashable, Sendable {
         case continueWatching, watching, today, newReleases, newSeries, topRated
         case genres, genre(HomeGenre), popularMovies, popularSeries
+        // Rows on a genre's own page.
+        case genrePopularMovies(HomeGenre), genrePopularSeries(HomeGenre), genreAcclaimed(HomeGenre)
+        case genreRecent(HomeGenre), genreAll(HomeGenre)
 
         var title: String {
             switch self {
@@ -523,6 +526,11 @@ struct HomeCollection: Identifiable, Sendable {
             case .genre(let genre): genre.title
             case .popularMovies: String(localized: "Popular Movies")
             case .popularSeries: String(localized: "Popular TV Shows")
+            case .genrePopularMovies: String(localized: "Popular Movies")
+            case .genrePopularSeries: String(localized: "Popular TV Shows")
+            case .genreAcclaimed: String(localized: "Critically Acclaimed")
+            case .genreRecent: String(localized: "New & Recent")
+            case .genreAll(let genre): String(localized: "All \(genre.name)")
             }
         }
 
@@ -535,6 +543,7 @@ struct HomeCollection: Identifiable, Sendable {
             case .genre: 4
             case .popularMovies, .popularSeries: 5
             case .genres, .continueWatching: 6
+            case .genrePopularMovies, .genrePopularSeries, .genreAcclaimed, .genreRecent, .genreAll: 7
             }
         }
 

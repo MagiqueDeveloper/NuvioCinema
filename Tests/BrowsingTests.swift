@@ -124,6 +124,48 @@ final class BrowsingTests: XCTestCase {
         XCTAssertEqual(refreshed?.tmdbID, "tmdb:42")
     }
 
+    func testGenreHeroAlternatesKindsAndNeedsArtwork() throws {
+        let movies = try (1...4).map { try entry("tt1\($0)", kind: .movie, artwork: $0 != 2) }
+        let series = try (1...4).map { try entry("tt2\($0)", kind: .series, artwork: true) }
+        let sections = GenrePageSections.make(movies: movies, series: series, currentYear: 2026)
+
+        XCTAssertEqual(sections.hero.map(\.title.id), ["tt11", "tt21", "tt22", "tt13", "tt23"])
+    }
+
+    func testGenreAcclaimedAndRecentRowsRankAndHideShortLists() throws {
+        let movies = try [
+            entry("tt1", kind: .movie, rating: 7.6, year: 2019),
+            entry("tt2", kind: .movie, rating: 8.4, year: 2026),
+            entry("tt3", kind: .movie, rating: 6.1, year: 2025),
+            entry("tt4", kind: .movie, rating: 7.9, year: 2025),
+        ]
+        let series = try [
+            entry("tt5", kind: .series, rating: 9.0, year: 2024),
+            entry("tt6", kind: .series, rating: nil, year: 2026),
+        ]
+        let sections = GenrePageSections.make(movies: movies, series: series, currentYear: 2026)
+
+        XCTAssertEqual(sections.acclaimed.map(\.title.id), ["tt5", "tt2", "tt4", "tt1"])
+        XCTAssertEqual(sections.recent.map(\.title.id), ["tt2", "tt6", "tt3", "tt4"])
+
+        let sparse = GenrePageSections.make(movies: Array(movies.prefix(2)), series: [], currentYear: 2026)
+        XCTAssertTrue(sparse.acclaimed.isEmpty)
+        XCTAssertTrue(sparse.recent.isEmpty)
+    }
+
+    private func entry(_ id: String, kind: CinemetaKind, artwork: Bool = false,
+                       rating: Double? = nil, year: Int? = nil) throws -> CinemetaSearchResult {
+        var fields: [String: Any] = ["id": id, "name": "Title \(id)"]
+        if artwork {
+            fields["background"] = "https://example.com/\(id)-background.jpg"
+            fields["logo"] = "https://example.com/\(id)-logo.png"
+        }
+        if let rating { fields["imdbRating"] = String(rating) }
+        if let year { fields["releaseInfo"] = String(year) }
+        let data = try JSONSerialization.data(withJSONObject: fields)
+        return CinemetaSearchResult(title: try JSONDecoder().decode(CinemetaTitle.self, from: data), kind: kind)
+    }
+
     private func session() -> URLSession {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.protocolClasses = [BrowsingCatalogProtocol.self]
