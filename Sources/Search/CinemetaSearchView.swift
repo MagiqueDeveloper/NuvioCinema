@@ -34,10 +34,18 @@ final class SearchViewController: UIViewController, UISearchResultsUpdating {
         return UISearchContainerViewController(searchController: search)
     }()
 
+    /// tvOS lays out its search screen expecting the container inside a navigation controller, as Apple's
+    /// own search tabs do. Hosted bare, the search field ran past the trailing edge of the keyboard.
+    private lazy var searchNavigation: UINavigationController = {
+        let navigation = UINavigationController(rootViewController: searchContainer)
+        navigation.setNavigationBarHidden(true, animated: false)
+        return navigation
+    }()
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        addChild(searchContainer)
-        let searchView: UIView = searchContainer.view
+        addChild(searchNavigation)
+        let searchView: UIView = searchNavigation.view
         searchView.translatesAutoresizingMaskIntoConstraints = false
         view.addSubview(searchView)
         NSLayoutConstraint.activate([
@@ -46,7 +54,7 @@ final class SearchViewController: UIViewController, UISearchResultsUpdating {
             searchView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             searchView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
         ])
-        searchContainer.didMove(toParent: self)
+        searchNavigation.didMove(toParent: self)
         NotificationCenter.default.addObserver(
             self, selector: #selector(searchFocusDidUpdate(_:)), name: UIFocusSystem.didUpdateNotification, object: nil
         )
