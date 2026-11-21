@@ -54,7 +54,9 @@ final class NuvioAccount {
     private(set) var profileID: Int?
     private(set) var addons: [NuvioAddon] = []
     private(set) var progress: [NuvioProgress] = []
-    private(set) var history: [NuvioHistory] = []
+    private(set) var history: [NuvioHistory] = [] {
+        didSet { latestWatchIndex = nil }
+    }
     private(set) var watchlist: [NuvioLibraryItem] = []
     private(set) var continueWatching: [CinemaContinueWatchingItem] = []
     private(set) var watchStateRevision = 0
@@ -64,6 +66,15 @@ final class NuvioAccount {
     private var contentAliases: [String: Set<String>] = [:]
     private var continueWatchingDismissals: [String: Date] = [:]
     @ObservationIgnored private let cloud: NuvioCloud
+    /// Newest watch date per content, type, season and episode; rebuilt lazily after `history` changes.
+    @ObservationIgnored private var latestWatchIndex: [WatchKey: Date]?
+
+    private struct WatchKey: Hashable {
+        let contentID: String
+        let contentType: String
+        let season: Int?
+        let episode: Int?
+    }
     @ObservationIgnored private let catalog: CinemetaClient
     @ObservationIgnored private var linkTask: Task<Void, Never>?
     @ObservationIgnored private var syncTask: Task<Void, Never>?
@@ -1011,22 +1022,35 @@ final class NuvioAccount {
     }
 
     private func isCompleted(_ progress: NuvioProgress) -> Bool {
-        let aliases = contentAliases[mediaKey(progress.contentID, progress.contentType)] ?? []
-        return history.contains {
-            ($0.contentID == progress.contentID || aliases.contains($0.contentID)) && $0.contentType == progress.contentType
-                && $0.season == progress.season && $0.episode == progress.episode && $0.watchedAt >= progress.updatedAt
+        guard let watched = latestWatch(progress.contentID, type: progress.contentType,
+                                        season: progress.season, episode: progress.episode) else { return false }
+        return watched >= progress.updatedAt
+    }
+
+    private func latestWatch(_ contentID: String, type: String, season: Int?, episode: Int?) -> Date? {
+        let index: [WatchKey: Date]
+        if let latestWatchIndex {
+            index = latestWatchIndex
+        } else {
+            var built: [WatchKey: Date] = [:]
+            for row in history {
+                let key = WatchKey(contentID: row.contentID, contentType: row.contentType, season: row.season, episode: row.episode)
+                built[key] = max(built[key] ?? .distantPast, row.watchedAt)
+            }
+            latestWatchIndex = built
+            index = built
         }
+        let aliases = contentAliases[mediaKey(contentID, type)] ?? []
+        return ([contentID] + aliases).compactMap {
+            index[WatchKey(contentID: $0, contentType: type, season: season, episode: episode)]
+        }.max()
     }
 
     func hasWatched(_ contentID: String, kind: CinemetaKind, season: Int? = nil, episode: Int? = nil) -> Bool {
         let progress = progress(for: contentID, kind: kind, season: season, episode: episode)
         if let progress, progress.fraction >= 0.95 { return true }
-        let aliases = contentAliases[mediaKey(contentID, kind.rawValue)] ?? []
-        return history.contains {
-            ($0.contentID == contentID || aliases.contains($0.contentID))
-                && $0.contentType == kind.rawValue && $0.season == season && $0.episode == episode
-                && $0.watchedAt >= (progress?.updatedAt ?? .distantPast)
-        }
+        guard let watched = latestWatch(contentID, type: kind.rawValue, season: season, episode: episode) else { return false }
+        return watched >= (progress?.updatedAt ?? .distantPast)
     }
 
     func signOut() {

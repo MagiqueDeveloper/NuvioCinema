@@ -72,6 +72,7 @@ actor CinemaMetadataCache {
     private let diskLimit: Int
     private let memory = NSCache<NSString, Entry>()
     private var flights: [Key: Flight] = [:]
+    private var writesSinceTrim = 0
 
     init(directory: URL? = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
         .first?.appendingPathComponent("CinemaMetadata", isDirectory: true), diskLimit: Int = 32 * 1024 * 1024) {
@@ -298,7 +299,10 @@ actor CinemaMetadataCache {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             try bytes.write(to: directory.appendingPathComponent(fileName), options: .atomic)
-            try trimDisk(at: directory)
+            // Listing and statting every file is costly, so trim on the first write and then every 16 writes.
+            let trim = writesSinceTrim == 0
+            writesSinceTrim = (writesSinceTrim + 1) % 16
+            if trim { try trimDisk(at: directory) }
         } catch {
             // Metadata remains usable in memory if tvOS purges or disables the cache directory.
         }

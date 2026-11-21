@@ -21,6 +21,8 @@ actor CastPortraits {
     }
 
     private let cache = NSCache<NSString, CachedPortrait>()
+    /// Names a successful lookup found no free portrait for, so repeat visits don't query them again.
+    private var misses: [String: Date] = [:]
 
     init() {
         cache.countLimit = 256
@@ -32,6 +34,8 @@ actor CastPortraits {
         for name in Set(names).sorted() where !name.contains("|") && !Self.normalizedName(name).isEmpty {
             if let cached = cache.object(forKey: name as NSString), cached.expiresAt > .now {
                 results[name] = cached.value
+            } else if let until = misses[name], until > .now {
+                continue
             } else {
                 pending.append(name)
             }
@@ -53,6 +57,14 @@ actor CastPortraits {
                         cache.setObject(CachedPortrait(portrait, expiresAt: expiresAt), forKey: name as NSString)
                     }
                     results[name] = portrait
+                }
+            }
+            // Only a lookup that succeeded proves a name has no portrait; failed requests are retried next time.
+            if filesExpiry != nil {
+                if misses.count >= 1_024 { misses = misses.filter { $0.value > now } }
+                if misses.count >= 1_024 { misses.removeAll(keepingCapacity: true) }
+                for name in pending[start..<end] where files[name] == nil {
+                    misses[name] = now.addingTimeInterval(6 * 3600)
                 }
             }
         }

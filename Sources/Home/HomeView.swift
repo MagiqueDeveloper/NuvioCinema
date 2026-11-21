@@ -613,15 +613,30 @@ private struct FeaturedHero: View {
         }
         .onScrollVisibilityChange(threshold: 0.45) { isVisible = $0 }
         .task(id: urls) {
-            let missingURLs = urls.filter { carousel.artwork[$0] == nil }
-            await withTaskGroup(of: (URL, HeroCarousel.Artwork).self) { group in
-                for url in missingURLs {
-                    group.addTask { (url, await HeroCarousel.Artwork.load(url)) }
+            // Artwork that failed (for example while offline at launch) is retried later instead of staying blank.
+            for retryDelay in [Duration.zero, .seconds(30), .seconds(120), .seconds(600)] {
+                if retryDelay > .zero {
+                    do { try await Task.sleep(for: retryDelay) } catch { return }
                 }
-                for await (url, artwork) in group {
-                    guard !Task.isCancelled else { return }
-                    carousel.artwork[url] = artwork
+                let missingURLs = urls.filter {
+                    switch carousel.artwork[$0] {
+                    case .image?: false
+                    case .unavailable?: retryDelay > .zero
+                    case nil: true
+                    }
                 }
+                guard retryDelay == .zero || !missingURLs.isEmpty else { return }
+                await withTaskGroup(of: (URL, HeroCarousel.Artwork).self) { group in
+                    for url in missingURLs {
+                        group.addTask { (url, await HeroCarousel.Artwork.load(url)) }
+                    }
+                    for await (url, artwork) in group {
+                        guard !Task.isCancelled else { return }
+                        if case .unavailable = artwork, case .image? = carousel.artwork[url] { continue }
+                        carousel.artwork[url] = artwork
+                    }
+                }
+                guard !Task.isCancelled else { return }
             }
         }
         .task(id: rotationEntryID) {

@@ -19,13 +19,14 @@ actor CinemaImageCache {
     private let diskLimit: Int
     private var requests: [URL: ArtworkRequest] = [:]
     private var missingUntil: [URL: Date] = [:]
+    private var writesSinceTrim = 0
 
     private struct ArtworkRequest {
         let task: Task<CGImage, Error>
         var consumers: Set<UUID>
     }
 
-    private struct StoredArtwork: Codable {
+    private struct StoredArtwork: Codable, Sendable {
         let data: Data
         let freshness: CinemaHTTPFreshness
     }
@@ -84,7 +85,12 @@ actor CinemaImageCache {
 
     private func loadImage(for url: URL) async throws -> CGImage {
         let file = diskURL(for: url)
-        let stored = file.flatMap(readArtwork)
+        // Disk reads and plist decoding run off the actor so they don't hold up other image requests.
+        let stored: StoredArtwork? = if let file {
+            await Task.detached(priority: .utility) { Self.readArtwork(file) }.value
+        } else {
+            nil
+        }
         var cached = Self.memory.artwork(for: url)
         if cached == nil, let stored, let image = await Self.decode(stored.data) {
             cached = DecodedArtwork(image: image, freshness: stored.freshness)
@@ -191,7 +197,7 @@ actor CinemaImageCache {
         return directory?.appendingPathComponent(key)
     }
 
-    private func readArtwork(_ file: URL) -> StoredArtwork? {
+    private nonisolated static func readArtwork(_ file: URL) -> StoredArtwork? {
         guard let data = try? Data(contentsOf: file) else { return nil }
         if let stored = try? PropertyListDecoder().decode(StoredArtwork.self, from: data) { return stored }
         let date = (try? file.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
@@ -202,6 +208,16 @@ actor CinemaImageCache {
 
     private func store(_ artwork: StoredArtwork, at file: URL) {
         guard let directory else { return }
+        // Listing the whole cache folder is costly, so trim on the first write and then every 16 writes.
+        let trim = writesSinceTrim == 0
+        writesSinceTrim = (writesSinceTrim + 1) % 16
+        let diskLimit = diskLimit
+        Task.detached(priority: .utility) {
+            Self.write(artwork, at: file, directory: directory, diskLimit: diskLimit, trim: trim)
+        }
+    }
+
+    private nonisolated static func write(_ artwork: StoredArtwork, at file: URL, directory: URL, diskLimit: Int, trim: Bool) {
         let encoder = PropertyListEncoder()
         encoder.outputFormat = .binary
         guard let data = try? encoder.encode(artwork), data.count <= diskLimit else { return }
@@ -209,6 +225,7 @@ actor CinemaImageCache {
         do {
             try manager.createDirectory(at: directory, withIntermediateDirectories: true)
             try data.write(to: file, options: .atomic)
+            guard trim else { return }
             let keys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey]
             let files = try manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: Array(keys), options: .skipsHiddenFiles)
             let entries = files.compactMap { url -> (URL, Int, Date)? in
