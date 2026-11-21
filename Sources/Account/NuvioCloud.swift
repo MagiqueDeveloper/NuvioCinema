@@ -1,4 +1,5 @@
 import Foundation
+import OSLog
 
 struct NuvioPairing: Sendable {
     let verificationURL: URL
@@ -357,24 +358,26 @@ struct NuvioCloud: Sendable {
     }
 
     func profiles(session current: NuvioSession) async throws -> [NuvioProfile] {
-        let profiles: [NuvioProfile] = try await rpc("sync_pull_profiles", body: [String: String](), session: current)
-        return profiles.sorted { $0.id < $1.id }
+        let profiles: NuvioLossyRows<NuvioProfile> = try await rpc("sync_pull_profiles", body: [String: String](), session: current)
+        return profiles.rows.sorted { $0.id < $1.id }
     }
 
     func addons(profile: Int, usesPrimaryAddons: Bool = false, session current: NuvioSession) async throws -> [NuvioAddon] {
         let owner: String = try await rpc("get_sync_owner", body: [String: String](), session: current)
         guard UUID(uuidString: owner) != nil else { throw NuvioCloudError.invalidResponse }
-        let rows: [NuvioAddon] = try await decode(path: "/rest/v1/addons", query: [
+        let rows: NuvioLossyRows<NuvioAddon> = try await decode(path: "/rest/v1/addons", query: [
             .init(name: "select", value: "id,name,enabled,url,sort_order"),
             .init(name: "user_id", value: "eq.\(owner)"),
             .init(name: "profile_id", value: "eq.\(usesPrimaryAddons ? 1 : profile)"),
             .init(name: "order", value: "sort_order.asc,id.asc")
         ], method: "GET", body: Optional<String>.none, session: current)
-        return rows
+        return rows.rows
     }
 
     func progress(profile: Int, session current: NuvioSession) async throws -> [NuvioProgress] {
-        try await rpc("sync_pull_watch_progress", body: ["p_profile_id": profile], session: current)
+        let rows: NuvioLossyRows<NuvioProgress> = try await rpc("sync_pull_watch_progress", body: ["p_profile_id": profile],
+                                                                session: current)
+        return rows.rows
     }
 
     func history(profile: Int, session current: NuvioSession) async throws -> [NuvioHistory] {
@@ -383,12 +386,13 @@ struct NuvioCloud: Sendable {
         var seen = Set<NuvioHistory.ID>()
         var page = 1
         while true {
-            let rows: [NuvioHistory] = try await rpc("sync_pull_watched_items", body: [
+            let rows: NuvioLossyRows<NuvioHistory> = try await rpc("sync_pull_watched_items", body: [
                 "p_profile_id": profile, "p_page": page, "p_page_size": pageSize
             ], session: current)
-            let additionalRows = rows.filter { seen.insert($0.id).inserted }
+            let additionalRows = rows.rows.filter { seen.insert($0.id).inserted }
             history += additionalRows
-            guard rows.count == pageSize, !additionalRows.isEmpty else { return history }
+            // A page of only undecodable rows still advances; a page of repeats means the server ignored paging.
+            guard rows.count == pageSize, !additionalRows.isEmpty || rows.rows.isEmpty else { return history }
             page += 1
         }
     }
@@ -424,12 +428,12 @@ struct NuvioCloud: Sendable {
         var seen = Set<NuvioLibraryItem.ID>()
         var offset = 0
         while true {
-            let rows: [NuvioLibraryItem] = try await rpc("sync_pull_library", body: [
+            let rows: NuvioLossyRows<NuvioLibraryItem> = try await rpc("sync_pull_library", body: [
                 "p_profile_id": profile, "p_limit": pageSize, "p_offset": offset
             ], session: current)
-            let additionalRows = rows.filter { seen.insert($0.id).inserted }
+            let additionalRows = rows.rows.filter { seen.insert($0.id).inserted }
             library += additionalRows
-            guard rows.count == pageSize, !additionalRows.isEmpty else { return library }
+            guard rows.count == pageSize, !additionalRows.isEmpty || rows.rows.isEmpty else { return library }
             offset += rows.count
         }
     }
@@ -482,9 +486,15 @@ struct NuvioCloud: Sendable {
                                                                body: Body?, session current: NuvioSession? = nil) async throws -> Response {
         let data = try await request(path: path, query: query, method: method,
                                      body: try body.map { try JSONEncoder().encode($0) }, accessToken: current?.accessToken)
-        guard let result = try? JSONDecoder().decode(Response.self, from: data) else { throw NuvioCloudError.invalidResponse }
-        return result
+        do {
+            return try JSONDecoder().decode(Response.self, from: data)
+        } catch {
+            Self.logger.error("Nuvio response for \(path, privacy: .public) could not be decoded: \(String(describing: error), privacy: .public)")
+            throw NuvioCloudError.invalidResponse
+        }
     }
+
+    fileprivate static let logger = Logger(subsystem: "com.nuviocinema.app", category: "NuvioCloud")
 
     private func request(path: String, query: [URLQueryItem], method: String = "POST", body: Data?, accessToken: String?) async throws -> Data {
         var endpoint = URLComponents()
@@ -579,7 +589,7 @@ struct NuvioCloud: Sendable {
         }
     }
 
-    private struct ErrorResponse: Decodable {
+    struct ErrorResponse: Decodable {
         let errorCode: String?
         let code: String?
         let error: String?
@@ -587,6 +597,14 @@ struct NuvioCloud: Sendable {
         enum CodingKeys: String, CodingKey {
             case errorCode = "error_code"
             case code, error
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            errorCode = try? container.decodeIfPresent(String.self, forKey: .errorCode)
+            error = try? container.decodeIfPresent(String.self, forKey: .error)
+            // Supabase Auth sends `code` as the numeric HTTP status; PostgREST sends a string code.
+            code = try? container.decodeIfPresent(String.self, forKey: .code)
         }
     }
 
@@ -623,6 +641,38 @@ struct NuvioCloud: Sendable {
             case keys = "p_keys"
         }
     }
+}
+
+/// Decodes a JSON array, skipping elements that fail to decode so one bad row can't drop a whole sync section.
+struct NuvioLossyRows<Element: Decodable>: Decodable {
+    let rows: [Element]
+    /// The number of elements the server sent, including skipped ones, for paging.
+    let count: Int
+
+    init(from decoder: Decoder) throws {
+        var container = try decoder.unkeyedContainer()
+        var rows: [Element] = []
+        var count = 0
+        var skipped = 0
+        while !container.isAtEnd {
+            count += 1
+            do {
+                rows.append(try container.decode(Element.self))
+            } catch {
+                skipped += 1
+                if skipped == 1 {
+                    NuvioCloud.logger.error("Skipped undecodable \(String(describing: Element.self), privacy: .public) row: \(String(describing: error), privacy: .public)")
+                }
+                _ = try container.decode(NuvioSkippedRow.self)
+            }
+        }
+        self.rows = rows
+        self.count = count
+    }
+}
+
+private struct NuvioSkippedRow: Decodable {
+    init(from decoder: Decoder) throws {}
 }
 
 fileprivate actor NuvioPairingPoll {

@@ -674,7 +674,7 @@ struct CinemetaClient: Sendable {
                     await onProgress(Self.homeCatalog(responses, genres: genres, on: date, isComplete: false))
                 }
             }
-            return Self.homeCatalog(responses, genres: genres, on: date, isComplete: true)
+            return Self.homeCatalog(responses, genres: genres, on: date, isComplete: remaining == 0)
         }
     }
 

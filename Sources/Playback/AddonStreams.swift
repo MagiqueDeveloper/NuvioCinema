@@ -217,10 +217,7 @@ struct AddonStreams: Sendable {
             var failed = false
             for id in videoIDs where manifest.supports(kind: kind, id: id) {
                 try Task.checkCancellation()
-                let url = manifestURL.deletingLastPathComponent()
-                    .appendingPathComponent("stream")
-                    .appendingPathComponent(kind.rawValue)
-                    .appendingPathComponent(id + ".json")
+                guard let url = streamEndpoint(manifest: manifestURL, kind: kind, id: id) else { continue }
                 let response: Streams
                 do {
                     response = try await fetch(url)
@@ -295,6 +292,18 @@ struct AddonStreams: Sendable {
         // Stremio expects extras in a path segment before .json, with encoded values and literal delimiters.
         let tail = extra.map { "/\($0)" } ?? ""
         components.percentEncodedPath += "/\(encodedID)\(tail).json"
+        return components.url.flatMap(Self.httpsURL)
+    }
+
+    private func streamEndpoint(manifest: URL, kind: CinemetaKind, id: String) -> URL? {
+        let base = manifest.deletingLastPathComponent().appendingPathComponent("stream")
+            .appendingPathComponent(kind.rawValue)
+        // Keep `:` literal (tt123:1:2) but escape characters that would split or end the path segment.
+        var allowed = CharacterSet.urlPathAllowed
+        allowed.remove(charactersIn: "/?#%;")
+        guard var components = URLComponents(url: base, resolvingAgainstBaseURL: false), !id.isEmpty,
+              let encodedID = id.addingPercentEncoding(withAllowedCharacters: allowed) else { return nil }
+        components.percentEncodedPath += "/\(encodedID).json"
         return components.url.flatMap(Self.httpsURL)
     }
 

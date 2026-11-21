@@ -71,6 +71,38 @@ struct PlaybackTests {
         #expect(completions == [100_000])
     }
 
+    @Test func leavingDuringCreditsAfterLateResumeCompletes() {
+        let recorder = PlaybackProgressRecorder()
+        var completions: [Int64] = []
+        let write: (Int64, Int64, Bool) -> Void = { position, _, watched in
+            if watched { completions.append(position) }
+        }
+
+        for position in stride(from: 2_100, through: 2_360, by: 4) {
+            recorder.sample(Double(position), duration: 2_400, initialPosition: 2_100_000, checkpoint: .periodic,
+                            uptime: Double(position), using: write)
+        }
+        #expect(completions.isEmpty)
+        recorder.sample(2_360, duration: 2_400, initialPosition: 2_100_000, checkpoint: .flush, uptime: 2_361, using: write)
+
+        #expect(completions == [2_400_000])
+        #expect(recorder.resumePosition == 0)
+    }
+
+    @Test func leavingRightAfterSeekingIntoCreditsDoesNotComplete() {
+        let recorder = PlaybackProgressRecorder()
+        var completions: [Int64] = []
+        let write: (Int64, Int64, Bool) -> Void = { position, _, watched in
+            if watched { completions.append(position) }
+        }
+
+        recorder.sample(2_300, duration: 2_400, initialPosition: 600_000, checkpoint: .seek, uptime: 1, using: write)
+        recorder.sample(2_304, duration: 2_400, initialPosition: 600_000, checkpoint: .periodic, uptime: 5, using: write)
+        recorder.sample(2_304, duration: 2_400, initialPosition: 600_000, checkpoint: .flush, uptime: 6, using: write)
+
+        #expect(completions.isEmpty)
+    }
+
     @Test func committedPausedSeekCanPersistTheBeginning() {
         let recorder = PlaybackProgressRecorder()
         var writes: [Int64] = []

@@ -31,6 +31,28 @@ final class AccountTests: XCTestCase {
         XCTAssertEqual(history.first?.episode, 3)
     }
 
+    func testAuthErrorWithNumericCodeKeepsErrorCode() throws {
+        let data = Data(#"{"code":400,"error_code":"refresh_token_not_found","msg":"Invalid Refresh Token"}"#.utf8)
+        let failure = try JSONDecoder().decode(NuvioCloud.ErrorResponse.self, from: data)
+
+        XCTAssertEqual(failure.errorCode, "refresh_token_not_found")
+        XCTAssertNil(failure.code)
+    }
+
+    func testLossyRowsSkipBadRowsAndCountEverything() throws {
+        let data = Data("""
+        [
+          {"id":"a","content_id":"tt1","content_type":"movie","title":"One","watched_at":1},
+          {"id":"b","content_id":"tt2","content_type":"movie","title":null,"watched_at":2},
+          {"id":"c","content_id":"tt3","content_type":"movie","title":"Three","watched_at":3}
+        ]
+        """.utf8)
+        let rows = try JSONDecoder().decode(NuvioLossyRows<NuvioHistory>.self, from: data)
+
+        XCTAssertEqual(rows.rows.map(\.id), ["a", "c"])
+        XCTAssertEqual(rows.count, 3)
+    }
+
     private var session: NuvioSession {
         NuvioSession(accessToken: "fixture-token", refreshToken: "fixture-refresh", expiresAt: .distantFuture,
                      userId: nil, email: nil)

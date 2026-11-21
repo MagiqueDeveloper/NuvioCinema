@@ -761,10 +761,13 @@ final class PlaybackProgressRecorder {
 
         let playedThroughCredits = reachedEndingDuringPlayback
             && checkpoint == .periodic && duration >= 60 && fraction >= 0.90
+        // After a late resume (past 85%), leaving in the credits after sustained playback still counts as watched.
+        let leftDuringCredits = checkpoint == .flush && !reachedEndingDuringPlayback
+            && secondsPlayedNearEnd >= 30 && duration >= 60 && fraction >= 0.90
         let playedToNaturalEnd = checkpoint == .ended
             && (reachedEndingDuringPlayback || secondsPlayedNearEnd >= 5)
             && max(fraction, (previousPlaying?.position ?? 0) / duration) >= 0.85
-        if playedThroughCredits || playedToNaturalEnd {
+        if playedThroughCredits || leftDuringCredits || playedToNaturalEnd {
             completed = true
             write(length, length, true)
             return

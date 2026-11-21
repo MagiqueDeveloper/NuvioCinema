@@ -43,11 +43,12 @@ final class CinemaTitleNavigation {
 
     func dismiss(id: UUID) {
         guard let index = screens.firstIndex(where: { $0.id == id }) else { return }
-        let screen = screens[index]
+        let removed = screens[index...].reversed()
         screens.removeSubrange(index...)
         Task { @MainActor in
             await Task.yield()
-            screen.onDismiss()
+            // Screens stacked above the target are closed too and need their cleanup.
+            for screen in removed { screen.onDismiss() }
         }
     }
 }

@@ -709,7 +709,8 @@ final class NuvioAccount {
                     }
                     retries = 0
                 } catch {
-                    guard !Task.isCancelled else { return }
+                    // A profile switch stops this profile's push; its queue stays pending, not failed.
+                    guard !Task.isCancelled, !(error is CancellationError) else { return }
                     let status = (error as? NuvioCloudError)?.status
                     if error is URLError || status == 429 || (status ?? 0) >= 500, retries < 2 {
                         retries += 1
@@ -1032,7 +1033,13 @@ final class NuvioAccount {
         let session = self.session
         clearSession()
         message = nil
-        if let session { Task { try? await cloud.logout(session) } }
+        guard let session else { return }
+        let cloud = self.cloud
+        Task {
+            // An expired access token can't revoke anything, so refresh it first.
+            let current = session.expiresAt.timeIntervalSinceNow < 60 ? (try? await cloud.refresh(session)) ?? session : session
+            try? await cloud.logout(current)
+        }
     }
 
     private func clearSession() {
