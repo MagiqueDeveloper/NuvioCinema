@@ -36,11 +36,19 @@ actor CinemaImageCache {
         let freshness: CinemaHTTPFreshness
     }
 
-    init(session: URLSession = .shared, directory: URL? = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
-        .first?.appendingPathComponent("CinemaArtwork", isDirectory: true), diskLimit: Int = 160 * 1024 * 1024) {
+    init(session: URLSession = .shared, directory: URL? = CinemaCacheStorage.artworkDirectory,
+         diskLimit: Int = 160 * 1024 * 1024) {
         self.session = session
         self.directory = directory
         self.diskLimit = diskLimit
+    }
+
+    /// Empties the decoded images, the missing-image list and the disk folder. Requests in flight finish as they are.
+    func removeAll() {
+        Self.memory.removeAll()
+        missingUntil.removeAll()
+        writesSinceTrim = 0
+        if let directory { CinemaCacheStorage.removeContents(of: directory) }
     }
 
     nonisolated static func cached(_ url: URL) -> CGImage? {
@@ -263,6 +271,36 @@ actor CinemaImageCache {
         }
 
         func remove(_ url: URL) { cache.removeObject(forKey: url as NSURL) }
+
+        func removeAll() { cache.removeAllObjects() }
+    }
+}
+
+/// The app's own on-disk caches, for Settings to size and clear.
+enum CinemaCacheStorage {
+    static var artworkDirectory: URL? { cachesDirectory?.appendingPathComponent("CinemaArtwork", isDirectory: true) }
+    static var metadataDirectory: URL? { cachesDirectory?.appendingPathComponent("CinemaMetadata", isDirectory: true) }
+
+    private static var cachesDirectory: URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
+    }
+
+    /// The total size in bytes of the regular files under `directory`, or 0 if it doesn't exist.
+    static func size(of directory: URL) -> Int64 {
+        let keys: Set<URLResourceKey> = [.isRegularFileKey, .totalFileAllocatedSizeKey, .fileSizeKey]
+        guard let files = FileManager.default.enumerator(at: directory, includingPropertiesForKeys: Array(keys)) else { return 0 }
+        var total: Int64 = 0
+        for case let file as URL in files {
+            guard let values = try? file.resourceValues(forKeys: keys), values.isRegularFile == true else { continue }
+            total += Int64(values.totalFileAllocatedSize ?? values.fileSize ?? 0)
+        }
+        return total
+    }
+
+    static func removeContents(of directory: URL) {
+        let manager = FileManager.default
+        guard let files = try? manager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { return }
+        for file in files { try? manager.removeItem(at: file) }
     }
 }
 

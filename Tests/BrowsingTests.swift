@@ -124,6 +124,36 @@ final class BrowsingTests: XCTestCase {
         XCTAssertEqual(refreshed?.tmdbID, "tmdb:42")
     }
 
+    func testMetadataCacheRemoveAllEmptiesItsDirectory() async throws {
+        struct StoredTitle: Decodable {
+            let meta: CinemetaTitle
+        }
+
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let cache = CinemaMetadataCache(directory: directory)
+        var request = URLRequest(url: URL(string: "https://btttr.cc/meta/series/tmdb:42.json")!)
+        request.setValue("invalid", forHTTPHeaderField: "X-Browsing-Fixture")
+        _ = await cache.load(StoredTitle.self, request: request, session: session(), policy: .title)
+        XCTAssertGreaterThan(CinemaCacheStorage.size(of: directory), 0)
+
+        await cache.removeAll()
+        XCTAssertEqual(CinemaCacheStorage.size(of: directory), 0)
+    }
+
+    func testCacheStorageSizeSumsNestedFiles() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let nested = directory.appendingPathComponent("nested", isDirectory: true)
+        try FileManager.default.createDirectory(at: nested, withIntermediateDirectories: true)
+        try Data(count: 10_000).write(to: directory.appendingPathComponent("a"))
+        try Data(count: 5_000).write(to: nested.appendingPathComponent("b"))
+
+        XCTAssertGreaterThanOrEqual(CinemaCacheStorage.size(of: directory), 15_000)
+        CinemaCacheStorage.removeContents(of: directory)
+        XCTAssertEqual(CinemaCacheStorage.size(of: directory), 0)
+    }
+
     func testGenreHeroAlternatesKindsAndNeedsArtwork() throws {
         let movies = try (1...4).map { try entry("tt1\($0)", kind: .movie, artwork: $0 != 2) }
         let series = try (1...4).map { try entry("tt2\($0)", kind: .series, artwork: true) }

@@ -74,12 +74,18 @@ actor CinemaMetadataCache {
     private var flights: [Key: Flight] = [:]
     private var writesSinceTrim = 0
 
-    init(directory: URL? = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)
-        .first?.appendingPathComponent("CinemaMetadata", isDirectory: true), diskLimit: Int = 32 * 1024 * 1024) {
+    init(directory: URL? = CinemaCacheStorage.metadataDirectory, diskLimit: Int = 32 * 1024 * 1024) {
         self.directory = directory
         self.diskLimit = diskLimit
         memory.countLimit = 192
         memory.totalCostLimit = 12 * 1024 * 1024
+    }
+
+    /// Empties memory and the disk folder. Requests in flight finish and may store their result again.
+    func removeAll() {
+        memory.removeAllObjects()
+        writesSinceTrim = 0
+        if let directory { CinemaCacheStorage.removeContents(of: directory) }
     }
 
     func load<Value: Decodable & Sendable>(

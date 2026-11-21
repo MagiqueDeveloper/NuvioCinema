@@ -10,9 +10,43 @@ struct NuvioSettingsView: View {
     @State private var watchlistRouteID: UUID?
     @FocusState private var focusedWatchlistItem: NuvioLibraryItem.ID?
     @FocusState private var linkFocus: LinkAction?
+    @FocusState private var sidebarFocus: Category?
+    @State private var category: Category = .account
 
     private enum Page: Hashable {
-        case account, profiles, unlockProfile(Int), addons, watchlist, progress, history
+        case account, profiles, unlockProfile(Int), addons, watchlist, progress, history, acknowledgements
+    }
+
+    private enum Category: Hashable, CaseIterable {
+        case account, playback, storage, diagnostics, about
+
+        static var visible: [Category] {
+            #if NUVIO_UPSTREAM_PLAYER
+            allCases
+            #else
+            allCases.filter { $0 != .playback }
+            #endif
+        }
+
+        var title: LocalizedStringKey {
+            switch self {
+            case .account: "Account"
+            case .playback: "Playback"
+            case .storage: "Storage & Cache"
+            case .diagnostics: "Diagnostics"
+            case .about: "About"
+            }
+        }
+
+        var symbol: String {
+            switch self {
+            case .account: "person.crop.circle"
+            case .playback: "play.rectangle"
+            case .storage: "internaldrive"
+            case .diagnostics: "stethoscope"
+            case .about: "info.circle"
+            }
+        }
     }
 
     private enum LinkAction: Hashable {
@@ -25,41 +59,20 @@ struct NuvioSettingsView: View {
 
     var body: some View {
         NavigationStack(path: $path) {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 32) {
-                    Text("Settings")
-                        .font(.system(size: 56, weight: .semibold))
-                        .accessibilityAddTraits(.isHeader)
-
-                    if account.isSignedIn {
-                        connectedAccount
-                        accountMessages
-                        destinations
-                    } else {
-                        linkAccount
-                        accountMessages
-                    }
-
-                    #if NUVIO_UPSTREAM_PLAYER
-                    if let issue = TopShelfSigningCheck.installedIssue {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Label("Top Shelf Unavailable", systemImage: "exclamationmark.triangle")
-                                .font(.system(size: 26, weight: .semibold))
-                                .accessibilityAddTraits(.isHeader)
-                            Text(issue.message)
-                                .font(.system(size: 23))
-                                .foregroundStyle(.secondary)
-                        }
-                        .settingsPanel()
-                    }
-                    #endif
+            HStack(alignment: .top, spacing: 56) {
+                sidebar
+                ScrollView {
+                    detail
+                        .padding(.vertical, 36)
+                        .padding(.trailing, 34)
+                        .frame(maxWidth: 1180, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .padding(.vertical, 36)
-                .padding(.horizontal, 34)
-                .frame(maxWidth: 1460)
-                .frame(maxWidth: .infinity, alignment: .center)
+                .scrollIndicators(.hidden)
+                .focusSection()
+                .id(category)
             }
-            .scrollIndicators(.hidden)
+            .padding(.leading, 34)
             .navigationDestination(for: Page.self) { page in
                 switch page {
                 case .account: NuvioAccountSettings(account: account)
@@ -76,19 +89,237 @@ struct NuvioSettingsView: View {
                 case .watchlist: watchlist
                 case .progress: progress
                 case .history: history
+                case .acknowledgements: CinemaAcknowledgements()
                 }
+            }
+        }
+        .onChange(of: sidebarFocus) { previous, focused in
+            guard let focused else { return }
+            if previous == nil, focused != category {
+                // Entering from the page lands on the current category, not the nearest row.
+                sidebarFocus = category
+            } else {
+                // Like tvOS Settings, moving through the sidebar shows each category.
+                category = focused
             }
         }
         .onChange(of: account.isSignedIn) { _, signedIn in
             if !signedIn {
                 path.removeAll()
-                linkFocus = .link
+                if category == .account { linkFocus = .link }
             }
         }
         .onChange(of: account.profileID) { _, _ in
             if let watchlistRouteID { titles.dismiss(id: watchlistRouteID) }
             watchlistRouteID = nil
         }
+    }
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Settings")
+                .font(.system(size: 56, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
+                .padding(.bottom, 22)
+
+            ForEach(Category.visible, id: \.self) { item in
+                let isFocused = sidebarFocus == item
+                Button {
+                    category = item
+                } label: {
+                    Label(item.title, systemImage: item.symbol)
+                        .font(.system(size: 27, weight: .semibold))
+                        .foregroundStyle(isFocused ? Color.black : Color.white)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.horizontal, 26)
+                        .frame(height: 70)
+                        .background(isFocused ? Color.white : (category == item ? Color.white.opacity(0.12) : .clear),
+                                    in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+                        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                }
+                .buttonStyle(SettingsSidebarButtonStyle())
+                .focusEffectDisabled()
+                .focused($sidebarFocus, equals: item)
+                .scaleEffect(isFocused ? 1.03 : 1)
+                .animation(.easeOut(duration: 0.14), value: isFocused)
+                .accessibilityAddTraits(category == item ? .isSelected : [])
+            }
+        }
+        .frame(width: 420, alignment: .leading)
+        .padding(.top, 36)
+        .focusSection()
+        // Coming back from the page, land on the current category rather than the nearest row.
+        .defaultFocus($sidebarFocus, category, priority: .userInitiated)
+    }
+
+    @ViewBuilder
+    private var detail: some View {
+        switch category {
+        case .account: accountSection
+        case .playback:
+            #if NUVIO_UPSTREAM_PLAYER
+            CinemaPlaybackSettings()
+            #else
+            EmptyView()
+            #endif
+        case .storage: CinemaStorageSettings()
+        case .diagnostics: diagnostics
+        case .about: about
+        }
+    }
+
+    private var accountSection: some View {
+        VStack(alignment: .leading, spacing: 32) {
+            sectionTitle("Account")
+            if account.isSignedIn {
+                connectedAccount
+                accountMessages
+                destinations
+            } else {
+                linkAccount
+                accountMessages
+            }
+        }
+    }
+
+    private func sectionTitle(_ title: LocalizedStringKey) -> some View {
+        Text(title)
+            .font(.system(size: 40, weight: .semibold))
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    // MARK: Diagnostics
+
+    @State private var homeRefreshRequested = false
+
+    private var diagnostics: some View {
+        VStack(alignment: .leading, spacing: 32) {
+            sectionTitle("Diagnostics")
+
+            VStack(alignment: .leading, spacing: 18) {
+                Label("Nuvio Sync", systemImage: "arrow.triangle.2.circlepath")
+                    .font(.system(size: 28, weight: .semibold))
+                if account.isSignedIn {
+                    infoRow("Status") { syncStatus }
+                    infoRow("Profiles") { Text(account.profiles.count.formatted()) }
+                    infoRow("Add-ons") { Text(account.addons.count.formatted()) }
+                    infoRow("Pending Playback Updates") {
+                        if account.playbackUploadFailed {
+                            Text("\(account.pendingPlaybackCount.formatted()) · Couldn’t sync")
+                        } else {
+                            Text(account.pendingPlaybackCount.formatted())
+                        }
+                    }
+                    if !account.failedSyncSections.isEmpty {
+                        infoRow("Couldn’t Update") {
+                            Text(account.failedSyncSections.map(\.name).formatted(.list(type: .and)))
+                        }
+                    }
+                    Button(action: account.sync) {
+                        Label("Sync Now", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(account.isSyncing)
+                    .padding(.top, 6)
+                } else {
+                    infoRow("Status") { Text("Not linked") }
+                }
+            }
+            .settingsPanel()
+            .focusSection()
+
+            VStack(alignment: .leading, spacing: 18) {
+                Label("Catalogs", systemImage: "square.grid.2x2")
+                    .font(.system(size: 28, weight: .semibold))
+                Text("Reload Home’s rows now instead of waiting for the hourly refresh. Saved title details are cleared so everything is fetched fresh.")
+                    .font(.system(size: 22))
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 24) {
+                    Button {
+                        Task {
+                            await CinemaMetadataCache.shared.removeAll()
+                            NotificationCenter.default.post(name: .cinemaRefreshHome, object: nil)
+                            homeRefreshRequested = true
+                        }
+                    } label: {
+                        Label("Refresh Home", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    if homeRefreshRequested {
+                        Text("Home will refresh when you open it.")
+                            .font(.system(size: 21))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .settingsPanel()
+            .focusSection()
+        }
+    }
+
+    // MARK: About
+
+    private var about: some View {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "–"
+        let build = info["CFBundleVersion"] as? String ?? "–"
+
+        return VStack(alignment: .leading, spacing: 32) {
+            sectionTitle("About")
+
+            VStack(alignment: .leading, spacing: 18) {
+                Text("Nuvio Cinema")
+                    .font(.system(size: 30, weight: .semibold))
+                infoRow("Version") { Text("\(version) (\(build))") }
+                #if NUVIO_UPSTREAM_PLAYER
+                infoRow("Player") { Text("Nuvio Player") }
+                #else
+                infoRow("Player") { Text("Built-in Player (Legacy)") }
+                #endif
+                infoRow("tvOS") { Text(UIDevice.current.systemVersion) }
+                infoRow("Device") { Text(UIDevice.current.model) }
+                #if NUVIO_UPSTREAM_PLAYER
+                infoRow("Top Shelf") {
+                    Text(TopShelfSigningCheck.installedIssue == nil ? "Available" : "Unavailable")
+                }
+                #endif
+            }
+            .settingsPanel()
+
+            #if NUVIO_UPSTREAM_PLAYER
+            if let issue = TopShelfSigningCheck.installedIssue {
+                VStack(alignment: .leading, spacing: 10) {
+                    Label("Top Shelf Unavailable", systemImage: "exclamationmark.triangle")
+                        .font(.system(size: 26, weight: .semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    Text(issue.message)
+                        .font(.system(size: 23))
+                        .foregroundStyle(.secondary)
+                }
+                .settingsPanel()
+            }
+            #endif
+
+            if !CinemaAcknowledgements.notices.isEmpty {
+                NavigationLink(value: Page.acknowledgements) {
+                    Label("Acknowledgements", systemImage: "doc.text")
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+        .focusSection()
+    }
+
+    private func infoRow<Value: View>(_ title: LocalizedStringKey, @ViewBuilder value: () -> Value) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 24) {
+            Text(title)
+            Spacer(minLength: 24)
+            value()
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.trailing)
+        }
+        .font(.system(size: 23))
+        .accessibilityElement(children: .combine)
     }
 
     @ViewBuilder
@@ -624,3 +855,258 @@ private struct NuvioPairingInstructions: View {
         return Self.context.createCGImage(output, from: output.extent)
     }
 }
+
+/// Draws only the label, so the sidebar rows show their own white-fill focus instead of the system platter.
+private struct SettingsSidebarButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .opacity(configuration.isPressed ? 0.85 : 1)
+    }
+}
+
+private struct CinemaStorageSettings: View {
+    @State private var artworkBytes: Int64?
+    @State private var metadataBytes: Int64?
+    @State private var confirmsClear = false
+    @State private var isClearing = false
+    @State private var measurement = 0
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 32) {
+            Text("Storage & Cache")
+                .font(.system(size: 40, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
+
+            VStack(alignment: .leading, spacing: 18) {
+                row("Artwork", bytes: artworkBytes)
+                row("Titles & Details", bytes: metadataBytes)
+                Divider()
+                row("Total", bytes: total)
+                    .fontWeight(.semibold)
+            }
+            .settingsPanel()
+
+            VStack(alignment: .leading, spacing: 18) {
+                Text("Clearing the cache frees space and fixes stale artwork or details. Everything downloads again as you browse. Your account, watch history, and settings aren’t affected.")
+                    .font(.system(size: 22))
+                    .foregroundStyle(.secondary)
+                Button(role: .destructive) {
+                    confirmsClear = true
+                } label: {
+                    if isClearing {
+                        Label("Clearing…", systemImage: "trash")
+                    } else {
+                        Label("Clear Cache", systemImage: "trash")
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isClearing)
+            }
+            .settingsPanel()
+        }
+        .focusSection()
+        .task(id: measurement) { await measure() }
+        .alert("Clear the cache?", isPresented: $confirmsClear) {
+            Button("Cancel", role: .cancel) {}
+            Button("Clear Cache", role: .destructive) { clear() }
+        } message: {
+            Text("Saved artwork and title details are removed and download again as you browse.")
+        }
+    }
+
+    private var total: Int64? {
+        guard let artworkBytes, let metadataBytes else { return nil }
+        return artworkBytes + metadataBytes
+    }
+
+    private func row(_ title: LocalizedStringKey, bytes: Int64?) -> some View {
+        HStack(spacing: 24) {
+            Text(title)
+            Spacer(minLength: 24)
+            if let bytes {
+                Text(bytes.formatted(.byteCount(style: .file)))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            } else {
+                ProgressView()
+            }
+        }
+        .font(.system(size: 23))
+        .accessibilityElement(children: .combine)
+    }
+
+    private func measure() async {
+        let sizes = await Task.detached(priority: .utility) {
+            (CinemaCacheStorage.artworkDirectory.map(CinemaCacheStorage.size(of:)) ?? 0,
+             CinemaCacheStorage.metadataDirectory.map(CinemaCacheStorage.size(of:)) ?? 0)
+        }.value
+        guard !Task.isCancelled else { return }
+        artworkBytes = sizes.0
+        metadataBytes = sizes.1
+    }
+
+    private func clear() {
+        guard !isClearing else { return }
+        isClearing = true
+        Task {
+            await CinemaImageCache.shared.removeAll()
+            await CinemaMetadataCache.shared.removeAll()
+            await CastPortraits.shared.removeAll()
+            URLCache.shared.removeAllCachedResponses()
+            artworkBytes = nil
+            metadataBytes = nil
+            isClearing = false
+            measurement += 1
+        }
+    }
+}
+
+private struct CinemaAcknowledgements: View {
+    struct Notice: Identifiable, Hashable {
+        let url: URL
+        var id: URL { url }
+        var name: String {
+            url.deletingPathExtension().lastPathComponent.replacingOccurrences(of: "-", with: " ")
+        }
+    }
+
+    /// Third-party license and notice files bundled with the app, sorted by name.
+    static let notices: [Notice] = {
+        guard let resources = Bundle.main.resourceURL else { return [] }
+        var files: [URL] = []
+        if let folder = Bundle.main.url(forResource: "ThirdPartyNotices", withExtension: nil),
+           let enumerator = FileManager.default.enumerator(at: folder, includingPropertiesForKeys: nil) {
+            for case let file as URL in enumerator where file.pathExtension == "txt" { files.append(file) }
+        }
+        let topLevel = (try? FileManager.default.contentsOfDirectory(at: resources, includingPropertiesForKeys: nil)) ?? []
+        files += topLevel.filter { file in
+            let name = file.lastPathComponent.uppercased()
+            return file.pathExtension == "txt" && (name.contains("LICENSE") || name.contains("NOTICE"))
+        }
+        return files.map(Notice.init).sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+    }()
+
+    var body: some View {
+        List(Self.notices) { notice in
+            NavigationLink {
+                NoticeText(notice: notice)
+            } label: {
+                Label(notice.name, systemImage: "doc.text")
+            }
+        }
+        .navigationTitle("Acknowledgements")
+    }
+
+    private struct NoticeText: View {
+        let notice: Notice
+        @State private var paragraphs: [String] = []
+
+        var body: some View {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    ForEach(Array(paragraphs.enumerated()), id: \.offset) { _, paragraph in
+                        // Each paragraph is focusable so the remote can scroll long licenses.
+                        Text(paragraph)
+                            .font(.system(size: 22, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .focusable()
+                    }
+                }
+                .padding(48)
+            }
+            .navigationTitle(notice.name)
+            .task {
+                let url = notice.url
+                let text = await Task.detached(priority: .utility) {
+                    (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                }.value
+                paragraphs = text.components(separatedBy: "\n\n")
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+            }
+        }
+    }
+}
+
+#if NUVIO_UPSTREAM_PLAYER
+/// Player preferences, stored in the player's own per-profile settings so it picks them up directly.
+private struct CinemaPlaybackSettings: View {
+    @AppStorage(SettingsKey.autoPlayNext, store: ProfileSettings.current) private var autoPlayNext = true
+    @AppStorage(SettingsKey.autoPlayNextCountdown, store: ProfileSettings.current) private var countdown = 10
+    @AppStorage(SettingsKey.autoSkipIntro, store: ProfileSettings.current) private var skipIntro = false
+    @AppStorage(SettingsKey.autoSkipRecap, store: ProfileSettings.current) private var skipRecap = false
+    @AppStorage(SettingsKey.autoSkipOutro, store: ProfileSettings.current) private var skipCredits = false
+    @AppStorage(SettingsKey.audioLanguage, store: ProfileSettings.current) private var audioLanguage = "System"
+    @AppStorage(SettingsKey.forcedSubtitles, store: ProfileSettings.current) private var forcedSubtitles = true
+    @State private var subtitleLanguage = SubtitleLanguagePreferences.orderedFromDefaults().first ?? "System"
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 32) {
+            Text("Playback")
+                .font(.system(size: 40, weight: .semibold))
+                .accessibilityAddTraits(.isHeader)
+
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Episodes")
+                    .font(.system(size: 28, weight: .semibold))
+                Toggle("Auto-Play Next Episode", isOn: $autoPlayNext)
+                if autoPlayNext {
+                    Picker("Countdown", selection: $countdown) {
+                        ForEach([5, 10, 15, 30], id: \.self) { seconds in
+                            Text("\(seconds) seconds").tag(seconds)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                }
+            }
+            .settingsPanel()
+
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Skip Automatically")
+                    .font(.system(size: 28, weight: .semibold))
+                Toggle("Intro", isOn: $skipIntro)
+                Toggle("Recap", isOn: $skipRecap)
+                Toggle("Credits", isOn: $skipCredits)
+            }
+            .settingsPanel()
+
+            VStack(alignment: .leading, spacing: 14) {
+                Text("Languages")
+                    .font(.system(size: 28, weight: .semibold))
+                Picker("Audio", selection: $audioLanguage) {
+                    ForEach(SubtitleLanguagePreferences.audioSettingsOptions, id: \.self) { language in
+                        Text(language).tag(language)
+                    }
+                }
+                .pickerStyle(.menu)
+                Picker("Subtitles", selection: subtitleSelection) {
+                    ForEach(SubtitleLanguagePreferences.settingsOptions, id: \.self) { language in
+                        Text(language).tag(language)
+                    }
+                }
+                .pickerStyle(.menu)
+                Toggle("Forced Subtitles", isOn: $forcedSubtitles)
+            }
+            .settingsPanel()
+        }
+        .focusSection()
+    }
+
+    /// Writes a single subtitle language the same way the player's own settings do.
+    private var subtitleSelection: Binding<String> {
+        Binding(
+            get: { subtitleLanguage },
+            set: { language in
+                subtitleLanguage = language
+                let defaults = ProfileSettings.current
+                let ordered = language == "System" ? [] : [language]
+                defaults.set(SubtitleLanguagePreferences.encode(ordered), forKey: SettingsKey.subtitleLanguages)
+                defaults.set(ordered.first ?? "System", forKey: SettingsKey.subtitleLanguage)
+                defaults.set("None", forKey: SettingsKey.subtitleLanguageSecondary)
+                defaults.set("None", forKey: SettingsKey.subtitleLanguageTertiary)
+            }
+        )
+    }
+}
+#endif

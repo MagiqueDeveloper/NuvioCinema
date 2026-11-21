@@ -28,6 +28,11 @@ actor CastPortraits {
         cache.countLimit = 256
     }
 
+    func removeAll() {
+        cache.removeAllObjects()
+        misses.removeAll()
+    }
+
     func load(for names: [String]) async -> [String: CastPortrait] {
         var results: [String: CastPortrait] = [:]
         var pending: [String] = []

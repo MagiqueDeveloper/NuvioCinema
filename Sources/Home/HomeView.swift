@@ -1,6 +1,11 @@
 import SwiftUI
 import UIKit
 
+extension Notification.Name {
+    /// Posted by Settings to reload Home's catalogs without waiting for the hourly refresh.
+    static let cinemaRefreshHome = Notification.Name("com.nuviocinema.refreshHome")
+}
+
 enum CinemaStyle {
     static let background = Color(white: 0.105)
 }
@@ -261,6 +266,10 @@ struct HomeView: View {
         }
         .task(id: request) {
             await refreshCatalog(for: request)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .cinemaRefreshHome)) { _ in
+            // Settings asked for fresh catalogs; reload now, or when Home is next shown.
+            retryCount += 1
         }
         .onChange(of: isAvailable) { _, _ in reconcilePendingCatalog() }
         .onChange(of: focusedItem) { _, _ in reconcilePendingCatalog() }
