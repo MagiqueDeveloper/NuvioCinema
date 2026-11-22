@@ -123,7 +123,10 @@ struct CinemaTabs: View {
             }
             Tab("Search", systemImage: "magnifyingglass", value: .search) {
                 TabPage(isSelected: selection == .search) {
+                    // UIKit's search screen applies its own full-screen insets. Inset again by SwiftUI's
+                    // safe area, the search bar laid out wider than its bounds and clipped the dictation hint.
                     CinemetaSearchView(isActive: selection == .search, titles: titles)
+                        .ignoresSafeArea(edges: .horizontal)
                 }
             }
             Tab("Settings", systemImage: "gearshape", value: .settings) {

@@ -35,7 +35,7 @@ final class SearchViewController: UIViewController, UISearchResultsUpdating {
     }()
 
     /// tvOS lays out its search screen expecting the container inside a navigation controller, as Apple's
-    /// own search tabs do. Hosted bare, the search field ran past the trailing edge of the keyboard.
+    /// own search tabs do. The host also ignores SwiftUI's safe area so the container can apply its own insets.
     private lazy var searchNavigation: UINavigationController = {
         let navigation = UINavigationController(rootViewController: searchContainer)
         navigation.setNavigationBarHidden(true, animated: false)

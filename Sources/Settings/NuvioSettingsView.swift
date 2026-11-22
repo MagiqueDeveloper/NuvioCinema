@@ -6,9 +6,11 @@ struct NuvioSettingsView: View {
     let account: NuvioAccount
 
     @Environment(CinemaTitleNavigation.self) private var titles
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var path: [Page] = []
-    @State private var watchlistRouteID: UUID?
-    @FocusState private var focusedWatchlistItem: NuvioLibraryItem.ID?
+    @State private var libraryRouteID: UUID?
+    @State private var switchingProfileID: Int?
+    @FocusState private var focusedLibraryItem: String?
     @FocusState private var linkFocus: LinkAction?
     @FocusState private var sidebarFocus: Category?
     @State private var category: Category = .account
@@ -63,15 +65,20 @@ struct NuvioSettingsView: View {
                 sidebar
                 ScrollView {
                     detail
-                        .padding(.vertical, 36)
+                        // The extra top inset lines the section title up with the sidebar's larger title.
+                        .padding(.top, 50)
+                        .padding(.bottom, 36)
                         .padding(.trailing, 34)
                         .frame(maxWidth: 1180, alignment: .leading)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 }
                 .scrollIndicators(.hidden)
                 .focusSection()
+                // A fresh scroll view per category starts each page at the top.
                 .id(category)
+                .transition(.opacity)
             }
+            .animation(reduceMotion ? nil : .easeOut(duration: 0.18), value: category)
             .padding(.leading, 34)
             .navigationDestination(for: Page.self) { page in
                 switch page {
@@ -106,12 +113,21 @@ struct NuvioSettingsView: View {
         .onChange(of: account.isSignedIn) { _, signedIn in
             if !signedIn {
                 path.removeAll()
-                if category == .account { linkFocus = .link }
+                category = .account
+                linkFocus = .link
             }
         }
         .onChange(of: account.profileID) { _, _ in
-            if let watchlistRouteID { titles.dismiss(id: watchlistRouteID) }
-            watchlistRouteID = nil
+            if let libraryRouteID { titles.dismiss(id: libraryRouteID) }
+            libraryRouteID = nil
+        }
+        .onChange(of: account.isSyncing) { _, syncing in
+            // A profile switch finishes with its sync. On success, return to the Settings page.
+            guard !syncing, let switched = switchingProfileID else { return }
+            switchingProfileID = nil
+            if account.profileID == switched, account.message == nil, path.last == .profiles {
+                path.removeAll()
+            }
         }
     }
 
@@ -144,6 +160,14 @@ struct NuvioSettingsView: View {
                 .animation(.easeOut(duration: 0.14), value: isFocused)
                 .accessibilityAddTraits(category == item ? .isSelected : [])
             }
+
+            Spacer(minLength: 24)
+
+            Text("Nuvio Cinema \(AppVersion.display)")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundStyle(.tertiary)
+                .padding(.horizontal, 26)
+                .padding(.bottom, 44)
         }
         .frame(width: 420, alignment: .leading)
         .padding(.top, 36)
@@ -162,7 +186,9 @@ struct NuvioSettingsView: View {
         case .account: accountSection
         case .playback:
             #if NUVIO_UPSTREAM_PLAYER
+            // Each profile keeps its own player settings, so rebuild against the current profile's store.
             CinemaPlaybackSettings()
+                .id(account.profileID)
             #else
             EmptyView()
             #endif
@@ -173,15 +199,15 @@ struct NuvioSettingsView: View {
     }
 
     private var accountSection: some View {
-        VStack(alignment: .leading, spacing: 32) {
+        VStack(alignment: .leading, spacing: 28) {
             sectionTitle("Account")
             if account.isSignedIn {
                 connectedAccount
-                accountMessages
+                accountNoticeBanner
                 destinations
             } else {
                 linkAccount
-                accountMessages
+                accountNoticeBanner
             }
         }
     }
@@ -195,6 +221,10 @@ struct NuvioSettingsView: View {
     // MARK: Diagnostics
 
     @State private var homeRefreshRequested = false
+
+    private var hasSyncFailure: Bool {
+        !account.failedSyncSections.isEmpty || account.playbackUploadFailed
+    }
 
     private var diagnostics: some View {
         VStack(alignment: .leading, spacing: 32) {
@@ -219,12 +249,10 @@ struct NuvioSettingsView: View {
                             Text(account.failedSyncSections.map(\.name).formatted(.list(type: .and)))
                         }
                     }
-                    Button(action: account.sync) {
-                        Label("Sync Now", systemImage: "arrow.clockwise")
+                    if hasSyncFailure {
+                        syncButton(idleTitle: "Retry Sync", symbol: "exclamationmark.arrow.circlepath")
+                            .padding(.top, 6)
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(account.isSyncing)
-                    .padding(.top, 6)
                 } else {
                     infoRow("Status") { Text("Not linked") }
                 }
@@ -250,31 +278,35 @@ struct NuvioSettingsView: View {
                     }
                     .buttonStyle(.bordered)
                     if homeRefreshRequested {
-                        Text("Home will refresh when you open it.")
-                            .font(.system(size: 21))
-                            .foregroundStyle(.secondary)
+                        Label {
+                            Text("Home will refresh when you open it.")
+                        } icon: {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        }
+                        .font(.system(size: 21))
+                        .foregroundStyle(.secondary)
+                        .transition(.opacity)
                     }
                 }
+                .animation(.easeOut(duration: 0.2), value: homeRefreshRequested)
             }
             .settingsPanel()
             .focusSection()
         }
+        .onAppear { homeRefreshRequested = false }
     }
 
     // MARK: About
 
     private var about: some View {
-        let info = Bundle.main.infoDictionary ?? [:]
-        let version = info["CFBundleShortVersionString"] as? String ?? "–"
-        let build = info["CFBundleVersion"] as? String ?? "–"
-
-        return VStack(alignment: .leading, spacing: 32) {
+        VStack(alignment: .leading, spacing: 32) {
             sectionTitle("About")
 
             VStack(alignment: .leading, spacing: 18) {
                 Text("Nuvio Cinema")
                     .font(.system(size: 30, weight: .semibold))
-                infoRow("Version") { Text("\(version) (\(build))") }
+                infoRow("Version") { Text(AppVersion.display) }
                 #if NUVIO_UPSTREAM_PLAYER
                 infoRow("Player") { Text("Nuvio Player") }
                 #else
@@ -326,32 +358,50 @@ struct NuvioSettingsView: View {
         .accessibilityElement(children: .combine)
     }
 
-    @ViewBuilder
-    private var accountMessages: some View {
-        if let message = account.message {
-            Text(message)
-                .font(.system(size: 23))
-                .foregroundStyle(.secondary)
-        }
-        if let message = account.sessionStorageMessage {
-            Text(message)
-                .font(.system(size: 23))
-                .foregroundStyle(.secondary)
-        }
-        if !account.failedSyncSections.isEmpty {
+    // MARK: Account
+
+    /// Problems and pending work to surface under the account header, most important first.
+    private var accountNotices: [String] {
+        var notices: [String] = []
+        if let message = account.message { notices.append(message) }
+        if let message = account.sessionStorageMessage { notices.append(message) }
+        if account.isSignedIn, !account.failedSyncSections.isEmpty {
             let names = account.failedSyncSections.map(\.name).formatted(.list(type: .and))
-            Text("Couldn’t update \(names). Select Sync Now to retry.")
-                .font(.system(size: 23))
-                .foregroundStyle(.secondary)
+            notices.append(String(localized: "Couldn’t update \(names). Select Sync Now to retry."))
         }
         if account.playbackUploadFailed {
-            Text("Playback updates couldn’t sync. Select Sync Now to retry.")
-                .font(.system(size: 23))
-                .foregroundStyle(.secondary)
+            notices.append(String(localized: "Playback updates couldn’t sync. Select Sync Now to retry."))
         } else if account.pendingPlaybackCount > 0 {
-            Text("Playback updates pending.")
-                .font(.system(size: 23))
-                .foregroundStyle(.secondary)
+            notices.append(String(localized: "Playback updates pending."))
+        }
+        return notices
+    }
+
+    @ViewBuilder
+    private var accountNoticeBanner: some View {
+        let notices = accountNotices
+        if !notices.isEmpty {
+            // Only pending playback is informational; everything else needs attention.
+            let isWarning = account.message != nil || account.sessionStorageMessage != nil || hasSyncFailure
+            let tint: Color = isWarning ? .yellow : .white
+            HStack(alignment: .firstTextBaseline, spacing: 18) {
+                Image(systemName: isWarning ? "exclamationmark.triangle.fill" : "arrow.triangle.2.circlepath")
+                    .foregroundStyle(tint)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(notices, id: \.self) { Text($0) }
+                }
+            }
+            .font(.system(size: 23, weight: .medium))
+            .padding(.horizontal, 28)
+            .padding(.vertical, 20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(tint.opacity(isWarning ? 0.13 : 0.07), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .strokeBorder(tint.opacity(isWarning ? 0.3 : 0.12))
+            }
+            .accessibilityElement(children: .combine)
         }
     }
 
@@ -400,109 +450,163 @@ struct NuvioSettingsView: View {
     }
 
     private var connectedAccount: some View {
-        HStack(alignment: .center, spacing: 24) {
-            Image(systemName: "person.crop.circle.fill")
-                .font(.system(size: 48, weight: .regular))
-                .foregroundStyle(.secondary)
-                .accessibilityHidden(true)
+        let profileName = currentProfile?.name ?? account.profileAwaitingPIN?.name ?? String(localized: "Nuvio Account")
+        return HStack(alignment: .center, spacing: 24) {
+            // The whole profile card opens the account page, where you can also sign out.
+            NavigationLink(value: Page.account) {
+                HStack(alignment: .center, spacing: 26) {
+                    ProfileMonogram(name: profileName, id: currentProfile?.id ?? account.profileAwaitingPIN?.id, size: 88)
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text(currentProfile?.name ?? account.profileAwaitingPIN?.name ?? String(localized: "Nuvio Account"))
-                    .font(.system(size: 32, weight: .semibold))
-                    .accessibilityAddTraits(.isHeader)
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(profileName)
+                            .font(.system(size: 32, weight: .semibold))
+                            .lineLimit(1)
+                        if let email = account.email {
+                            Text(email)
+                                .font(.system(size: 22))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        syncStatus
+                            .font(.system(size: 21))
+                            .foregroundStyle(.secondary)
+                    }
 
-                if let email = account.email {
-                    Text(email)
-                        .font(.system(size: 22))
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                    Spacer(minLength: 24)
+
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 26, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                        .accessibilityHidden(true)
                 }
-                syncStatus
-                    .font(.system(size: 21))
-                    .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 28)
+                .padding(.vertical, 24)
             }
+            .buttonStyle(.card)
+            .accessibilityHint("Shows account details and Sign Out.")
 
-            Spacer(minLength: 24)
-
-            if let profile = account.profileAwaitingPIN {
-                NavigationLink(value: Page.unlockProfile(profile.id)) {
-                    Label("Unlock Profile", systemImage: "lock")
+            VStack(alignment: .leading, spacing: 18) {
+                if let profile = account.profileAwaitingPIN {
+                    NavigationLink(value: Page.unlockProfile(profile.id)) {
+                        Label("Unlock Profile", systemImage: "lock")
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
+                syncButton(idleTitle: "Sync Now", symbol: "arrow.clockwise")
             }
-            Button(action: account.sync) {
-                Label("Sync Now", systemImage: "arrow.clockwise")
-            }
-            .buttonStyle(.bordered)
-            .disabled(account.isSyncing)
         }
-        .settingsPanel()
         .focusSection()
     }
 
-    @ViewBuilder
+    /// Stays focusable while syncing so focus doesn't jump away; `sync()` ignores repeat presses.
+    private func syncButton(idleTitle: LocalizedStringKey, symbol: String) -> some View {
+        Button(action: account.sync) {
+            if account.isSyncing {
+                HStack(spacing: 14) {
+                    ProgressView()
+                    Text("Syncing…")
+                }
+            } else {
+                Label(idleTitle, systemImage: symbol)
+            }
+        }
+        .buttonStyle(.bordered)
+        .accessibilityValue(account.isSyncing ? Text("Syncing") : Text(""))
+    }
+
     private var syncStatus: some View {
-        if account.isSyncing {
-            Text("Updating Nuvio data…")
-        } else if account.profileAwaitingPIN != nil {
-            Text("Unlock your profile or choose another in Profiles.")
-        } else if let date = account.lastSync {
-            Text("Last synced \(date, format: .dateTime.month(.abbreviated).day().hour().minute())")
-        } else {
-            Text("Connected to Nuvio")
+        // Refresh periodically so "just now" ages into minutes without another sync.
+        TimelineView(.periodic(from: .now, by: 30)) { context in
+            if account.isSyncing {
+                Text("Updating Nuvio data…")
+            } else if account.profileAwaitingPIN != nil {
+                Text("Unlock your profile or choose another in Profiles.")
+            } else if let date = account.lastSync {
+                let age = context.date.timeIntervalSince(date)
+                if age < 60 {
+                    Text("Synced just now")
+                } else if age < 3_600 {
+                    Text("Synced \(date, format: .relative(presentation: .named))")
+                } else {
+                    Text("Last synced \(date, format: .dateTime.month(.abbreviated).day().hour().minute())")
+                }
+            } else {
+                Text("Connected to Nuvio")
+            }
         }
     }
 
     private var destinations: some View {
         let columns = Array(repeating: GridItem(.flexible(), spacing: 22), count: 3)
+        let enabledAddons = account.addons.filter(\.enabled).count
+        let latestWatch = account.history.map(\.watchedAt).max()
         return LazyVGrid(columns: columns, spacing: 22) {
-            destination("Profiles", symbol: "person.2", page: .profiles)
-            destination("Add-ons", symbol: "puzzlepiece.extension", page: .addons, count: account.addons.count)
-            destination("Watchlist", symbol: "bookmark", page: .watchlist, count: account.watchlist.count)
-            destination("Continue Watching", symbol: "play.rectangle", page: .progress, count: account.inProgress.count)
-            destination("Watch History", symbol: "clock.arrow.circlepath", page: .history, count: account.history.count)
-            destination("Account", symbol: "person.crop.circle", page: .account)
+            destination("Profiles", symbol: "person.2", page: .profiles) {
+                if let currentProfile {
+                    Text(currentProfile.name)
+                } else if account.profileAwaitingPIN != nil {
+                    Text("Locked")
+                } else {
+                    Text("^[\(account.profiles.count) profile](inflect: true)")
+                }
+            }
+            destination("Add-ons", symbol: "puzzlepiece.extension", page: .addons) {
+                Text("\(enabledAddons) of \(account.addons.count) enabled")
+            }
+            destination("Watchlist", symbol: "bookmark", page: .watchlist) {
+                Text("^[\(account.watchlist.count) title](inflect: true)")
+            }
+            destination("Continue Watching", symbol: "play.rectangle", page: .progress) {
+                Text("\(account.inProgress.count) in progress")
+            }
+            destination("Watch History", symbol: "clock.arrow.circlepath", page: .history) {
+                if let latestWatch {
+                    Text("\(account.history.count) watched · \(latestWatch, format: .dateTime.month(.abbreviated).day())")
+                } else {
+                    Text("Nothing watched yet")
+                }
+            }
         }
         .focusSection()
     }
 
-    private func destination(
+    private func destination<Detail: View>(
         _ title: LocalizedStringKey,
         symbol: String,
         page: Page,
-        count: Int? = nil
+        @ViewBuilder detail: () -> Detail
     ) -> some View {
         NavigationLink(value: page) {
-            VStack(alignment: .leading, spacing: 13) {
-                HStack {
-                    Image(systemName: symbol)
-                        .font(.system(size: 29, weight: .medium))
-                        .accessibilityHidden(true)
-                    Spacer()
-                    if let count {
-                        Text(count.formatted())
-                            .font(.system(size: 20, weight: .medium).monospacedDigit())
-                            .foregroundStyle(.secondary)
-                    }
-                }
+            VStack(alignment: .leading, spacing: 10) {
+                Image(systemName: symbol)
+                    .font(.system(size: 29, weight: .medium))
+                    .accessibilityHidden(true)
+                    .padding(.bottom, 4)
                 Text(title)
                     .font(.system(size: 25, weight: .semibold))
+                    .lineLimit(1)
+                detail()
+                    .font(.system(size: 20, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 22)
-            .padding(.vertical, 17)
+            .padding(.vertical, 18)
         }
         .buttonStyle(.card)
     }
 
-    private var profiles: some View {
-        List {
-            if account.profiles.isEmpty {
-                Text("No Nuvio profiles available.")
-                    .foregroundStyle(.secondary)
-            }
+    // MARK: Library pages
 
+    private var profiles: some View {
+        SettingsListPage(
+            title: "Profiles",
+            isEmpty: account.profiles.isEmpty,
+            empty: SettingsEmptyState(symbol: "person.2", title: "No Profiles",
+                                      message: "Profiles you create in Nuvio appear here.")
+        ) {
             ForEach(account.profiles, id: \.id) { profile in
                 if profile.isLocked && profile.id != account.profileID {
                     NavigationLink(value: Page.unlockProfile(profile.id)) {
@@ -510,7 +614,10 @@ struct NuvioSettingsView: View {
                     }
                 } else {
                     Button {
+                        guard profile.id != account.profileID else { return }
+                        switchingProfileID = profile.id
                         account.selectProfile(profile.id)
+                        if account.profileID != profile.id { switchingProfileID = nil }
                     } label: {
                         profileRow(profile)
                     }
@@ -518,149 +625,199 @@ struct NuvioSettingsView: View {
                 }
             }
         }
-        .navigationTitle("Profiles")
     }
 
     private func profileRow(_ profile: NuvioProfile) -> some View {
-        settingsRow("Profile", symbol: "person.crop.circle", name: profile.name) {
-            if profile.id == account.profileID {
-                Label("Current", systemImage: "checkmark")
-            } else if profile.isLocked {
-                Label("Locked", systemImage: "lock")
-            }
-        }
-    }
-
-    private var addons: some View {
-        List {
-            if account.addons.isEmpty {
-                Text("No synced add-ons.")
-                    .foregroundStyle(.secondary)
-            }
-
-            ForEach(account.addons, id: \.id) { addon in
-                settingsRow("Add-on", symbol: "puzzlepiece.extension", name: addon.name) {
-                    Text(addon.enabled ? "Enabled" : "Disabled")
-                }
-                .accessibilityElement(children: .combine)
-                .focusable()
-            }
-        }
-        .navigationTitle("Add-ons")
-    }
-
-    private var watchlist: some View {
-        List {
-            if account.watchlist.isEmpty {
-                Text("No synced watchlist items.")
-                    .foregroundStyle(.secondary)
-            }
-
-            ForEach(account.watchlist, id: \.id) { entry in
-                if let kind = CinemetaKind(rawValue: entry.contentType) {
-                    Button {
-                        openWatchlistTitle(entry, kind: kind)
-                    } label: {
-                        watchlistRow(entry)
+        HStack(spacing: 22) {
+            ProfileMonogram(name: profile.name, id: profile.id, size: 52)
+            Text(profile.name)
+            Spacer(minLength: 20)
+            Group {
+                if profile.id == switchingProfileID, account.isSyncing {
+                    HStack(spacing: 12) {
+                        ProgressView()
+                        Text("Switching…")
                     }
-                    .focused($focusedWatchlistItem, equals: entry.id)
-                } else {
-                    watchlistRow(entry)
-                        .focusable()
+                } else if profile.id == account.profileID {
+                    Label("Current", systemImage: "checkmark")
+                } else if profile.isLocked {
+                    Label("Locked", systemImage: "lock")
                 }
             }
-        }
-        .navigationTitle("Watchlist")
-    }
-
-    private func openWatchlistTitle(_ entry: NuvioLibraryItem, kind: CinemetaKind) {
-        guard titles.screens.isEmpty else { return }
-        let profileID = account.profileID
-        watchlistRouteID = titles.show(onDismiss: {
-            watchlistRouteID = nil
-            if account.profileID == profileID { focusedWatchlistItem = entry.id }
-        }) { close in
-            NuvioWatchlistTitle(entry: entry, kind: kind, onDismiss: close)
-        }
-    }
-
-    private func watchlistRow(_ entry: NuvioLibraryItem) -> some View {
-        settingsRow("Title", symbol: "bookmark", name: entry.title) {
-            Text(entry.addedAt, format: .dateTime.month(.abbreviated).day().year())
+            .foregroundStyle(.secondary)
         }
         .accessibilityElement(children: .combine)
     }
 
-    private var progress: some View {
-        List {
-            if account.inProgress.isEmpty {
-                Text("No synced titles in progress.")
-                    .foregroundStyle(.secondary)
-            }
-
-            ForEach(account.inProgress, id: \.id) { entry in
-                VStack(alignment: .leading, spacing: 10) {
-                    settingsRow("Title", symbol: "play.rectangle", name: account.title(for: entry)) {
-                        if entry.duration > 0 {
-                            Text(entry.fraction.formatted(.percent.precision(.fractionLength(0))))
-                        } else {
-                            Text("In Progress")
+    private var addons: some View {
+        SettingsListPage(
+            title: "Add-ons",
+            isEmpty: account.addons.isEmpty,
+            empty: SettingsEmptyState(symbol: "puzzlepiece.extension", title: "No Add-ons",
+                                      message: "Add-ons you install in Nuvio appear here.")
+        ) {
+            ForEach(account.addons.sorted { $0.sortOrder < $1.sortOrder }, id: \.id) { addon in
+                HStack(spacing: 20) {
+                    Image(systemName: "puzzlepiece.extension")
+                        .accessibilityHidden(true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(addon.name.flatMap { $0.isEmpty ? nil : $0 } ?? String(localized: "Add-on"))
+                        if let host = URL(string: addon.url)?.host {
+                            Text(host)
+                                .font(.system(size: 20))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
                         }
-                        Text(entry.updatedAt, format: .dateTime.month(.abbreviated).day().year())
                     }
-                    if let season = entry.season, let episode = entry.episode {
-                        Text("Season \(season), Episode \(episode)")
-                            .foregroundStyle(.secondary)
-                    }
-                    if entry.duration > 0 {
-                        ProgressView(value: entry.fraction)
+                    Spacer(minLength: 20)
+                    HStack(spacing: 10) {
+                        Circle()
+                            .fill(addon.enabled ? Color.green : Color.secondary)
+                            .frame(width: 12, height: 12)
                             .accessibilityHidden(true)
+                        Text(addon.enabled ? "Enabled" : "Disabled")
                     }
+                    .foregroundStyle(.secondary)
                 }
                 .accessibilityElement(children: .combine)
                 .focusable()
             }
         }
-        .navigationTitle("Continue Watching")
+    }
+
+    private var watchlist: some View {
+        SettingsListPage(
+            title: "Watchlist",
+            isEmpty: account.watchlist.isEmpty,
+            empty: SettingsEmptyState(symbol: "bookmark", title: "Your Watchlist Is Empty",
+                                      message: "Titles you save in Nuvio appear here.")
+        ) {
+            ForEach(account.watchlist, id: \.id) { entry in
+                libraryButton(id: entry.id, contentID: entry.contentID, name: entry.title, contentType: entry.contentType) {
+                    libraryRow(symbol: "bookmark", name: entry.title) {
+                        Text(entry.addedAt, format: .dateTime.month(.abbreviated).day().year())
+                    }
+                }
+            }
+        }
+    }
+
+    private var progress: some View {
+        SettingsListPage(
+            title: "Continue Watching",
+            isEmpty: account.inProgress.isEmpty,
+            empty: SettingsEmptyState(symbol: "play.rectangle", title: "Nothing in Progress",
+                                      message: "Movies and episodes you start appear here.")
+        ) {
+            ForEach(account.inProgress, id: \.id) { entry in
+                let name = account.title(for: entry)
+                libraryButton(id: entry.id, contentID: entry.contentID, name: name, contentType: entry.contentType) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        libraryRow(symbol: "play.rectangle", name: name) {
+                            if entry.duration > 0 {
+                                Text(entry.fraction.formatted(.percent.precision(.fractionLength(0))))
+                            } else {
+                                Text("In Progress")
+                            }
+                            Text(entry.updatedAt, format: .dateTime.month(.abbreviated).day().year())
+                        }
+                        if let season = entry.season, let episode = entry.episode {
+                            Text("Season \(season), Episode \(episode)")
+                                .foregroundStyle(.secondary)
+                        }
+                        if entry.duration > 0 {
+                            ProgressView(value: entry.fraction)
+                                .accessibilityHidden(true)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// History grouped by calendar month, newest first.
+    private var historyByMonth: [(month: Date, entries: [NuvioHistory])] {
+        let calendar = Calendar.current
+        let groups = Dictionary(grouping: account.history) { entry in
+            calendar.dateInterval(of: .month, for: entry.watchedAt)?.start ?? entry.watchedAt
+        }
+        return groups
+            .map { (month: $0.key, entries: $0.value.sorted { $0.watchedAt > $1.watchedAt }) }
+            .sorted { $0.month > $1.month }
     }
 
     private var history: some View {
-        List {
-            if account.history.isEmpty {
-                Text("No synced watch history.")
-                    .foregroundStyle(.secondary)
-            }
-
-            ForEach(account.history, id: \.id) { entry in
-                VStack(alignment: .leading, spacing: 10) {
-                    settingsRow("Title", symbol: "clock.arrow.circlepath", name: entry.title) {
-                        Text(entry.watchedAt, format: .dateTime.month(.abbreviated).day().year())
+        SettingsListPage(
+            title: "Watch History",
+            isEmpty: account.history.isEmpty,
+            empty: SettingsEmptyState(symbol: "clock.arrow.circlepath", title: "No Watch History",
+                                      message: "Movies and episodes you finish appear here.")
+        ) {
+            ForEach(historyByMonth, id: \.month) { group in
+                Section {
+                    ForEach(group.entries, id: \.id) { entry in
+                        libraryButton(id: entry.id, contentID: entry.contentID, name: entry.title, contentType: entry.contentType) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                libraryRow(symbol: "clock.arrow.circlepath", name: entry.title) {
+                                    Text(entry.watchedAt, format: .dateTime.month(.abbreviated).day().year())
+                                }
+                                if let season = entry.season, let episode = entry.episode {
+                                    Text("Season \(season), Episode \(episode)")
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        }
                     }
-                    if let season = entry.season, let episode = entry.episode {
-                        Text("Season \(season), Episode \(episode)")
-                            .foregroundStyle(.secondary)
-                    }
+                } header: {
+                    Text(group.month, format: .dateTime.month(.wide).year())
                 }
-                .accessibilityElement(children: .combine)
-                .focusable()
             }
         }
-        .navigationTitle("Watch History")
     }
 
-    private func settingsRow<Status: View>(
-        _ title: LocalizedStringKey,
+    /// A library row that opens its title, or a plain focusable row when the content type isn't browsable.
+    @ViewBuilder
+    private func libraryButton<Label: View>(
+        id: String,
+        contentID: String,
+        name: String,
+        contentType: String,
+        @ViewBuilder label: () -> Label
+    ) -> some View {
+        if let kind = CinemetaKind(rawValue: contentType) {
+            Button {
+                openTitle(contentID: contentID, name: name, kind: kind, focusID: id)
+            } label: {
+                label()
+            }
+            .focused($focusedLibraryItem, equals: id)
+            .accessibilityElement(children: .combine)
+        } else {
+            label()
+                .accessibilityElement(children: .combine)
+                .focusable()
+        }
+    }
+
+    private func openTitle(contentID: String, name: String, kind: CinemetaKind, focusID: String) {
+        guard titles.screens.isEmpty else { return }
+        let profileID = account.profileID
+        libraryRouteID = titles.show(onDismiss: {
+            libraryRouteID = nil
+            if account.profileID == profileID { focusedLibraryItem = focusID }
+        }) { close in
+            NuvioLibraryTitle(contentID: contentID, name: name, kind: kind, onDismiss: close)
+        }
+    }
+
+    private func libraryRow<Status: View>(
         symbol: String,
-        name: String? = nil,
+        name: String,
         @ViewBuilder status: () -> Status
     ) -> some View {
         HStack(spacing: 20) {
             Label {
-                if let name, !name.isEmpty {
-                    Text(name)
-                } else {
-                    Text(title)
-                }
+                Text(name.isEmpty ? String(localized: "Title") : name)
             } icon: {
                 Image(systemName: symbol)
             }
@@ -671,8 +828,93 @@ struct NuvioSettingsView: View {
     }
 }
 
-private struct NuvioWatchlistTitle: View {
-    let entry: NuvioLibraryItem
+private enum AppVersion {
+    static var display: String {
+        let info = Bundle.main.infoDictionary ?? [:]
+        let version = info["CFBundleShortVersionString"] as? String ?? "–"
+        let build = info["CFBundleVersion"] as? String ?? "–"
+        return "\(version) (\(build))"
+    }
+}
+
+/// A circular initial on a color picked from the profile id, so each profile is recognizable at a glance.
+private struct ProfileMonogram: View {
+    let name: String
+    let id: Int?
+    var size: CGFloat = 76
+
+    private static let palette: [Color] = [
+        Color(red: 0.31, green: 0.47, blue: 0.95), Color(red: 0.62, green: 0.38, blue: 0.92),
+        Color(red: 0.91, green: 0.36, blue: 0.55), Color(red: 0.95, green: 0.55, blue: 0.24),
+        Color(red: 0.18, green: 0.68, blue: 0.66), Color(red: 0.36, green: 0.69, blue: 0.33),
+    ]
+
+    var body: some View {
+        Text(initial)
+            .font(.system(size: size * 0.44, weight: .semibold, design: .rounded))
+            .foregroundStyle(.white)
+            .frame(width: size, height: size)
+            .background(color.gradient, in: Circle())
+            .accessibilityHidden(true)
+    }
+
+    private var initial: String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines).first.map { String($0).uppercased() } ?? "?"
+    }
+
+    private var color: Color {
+        guard let id else { return .gray }
+        return Self.palette[((id % Self.palette.count) + Self.palette.count) % Self.palette.count]
+    }
+}
+
+/// A pushed Settings list with a consistent empty state.
+private struct SettingsListPage<Content: View>: View {
+    let title: LocalizedStringKey
+    let isEmpty: Bool
+    let empty: SettingsEmptyState
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        Group {
+            if isEmpty {
+                empty
+            } else {
+                List { content }
+            }
+        }
+        .navigationTitle(title)
+    }
+}
+
+private struct SettingsEmptyState: View {
+    let symbol: String
+    let title: LocalizedStringKey
+    let message: LocalizedStringKey
+
+    var body: some View {
+        VStack(spacing: 18) {
+            Image(systemName: symbol)
+                .font(.system(size: 72, weight: .light))
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 8)
+                .accessibilityHidden(true)
+            Text(title)
+                .font(.system(size: 36, weight: .semibold))
+            Text(message)
+                .font(.system(size: 24))
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+        }
+        .frame(maxWidth: 760)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+private struct NuvioLibraryTitle: View {
+    let contentID: String
+    let name: String
     let kind: CinemetaKind
     let onDismiss: () -> Void
 
@@ -685,7 +927,7 @@ private struct NuvioWatchlistTitle: View {
             TitleDetailsView(title: title, kind: kind, onDismiss: onDismiss)
         } else {
             VStack(spacing: 24) {
-                Text(entry.title)
+                Text(name)
                     .font(.title)
                     .accessibilityAddTraits(.isHeader)
                 if loadFailed {
@@ -706,7 +948,7 @@ private struct NuvioWatchlistTitle: View {
             .background { CinemaStyle.background.ignoresSafeArea() }
             .onExitCommand(perform: onDismiss)
             .task(id: loadAttempt) {
-                let loaded = await CinemetaClient().details(contentID: entry.contentID, kind: kind)
+                let loaded = await CinemetaClient().details(contentID: contentID, kind: kind)
                 guard !Task.isCancelled else { return }
                 title = loaded
                 loadFailed = loaded == nil
@@ -775,6 +1017,9 @@ private struct NuvioAccountSettings: View {
             Section("Account") {
                 Label(account.email ?? "Connected", systemImage: "person.crop.circle")
 
+                if let profile = account.profiles.first(where: { $0.id == account.profileID }) {
+                    LabeledContent("Profile", value: profile.name)
+                }
                 if let date = account.lastSync {
                     LabeledContent("Last Sync") {
                         Text(date, format: .dateTime.month(.abbreviated).day().hour().minute())
@@ -790,8 +1035,12 @@ private struct NuvioAccountSettings: View {
                 }
             }
 
-            Button("Sign Out", role: .destructive) {
-                confirmsSignOut = true
+            Section {
+                Button("Sign Out", role: .destructive) {
+                    confirmsSignOut = true
+                }
+            } footer: {
+                Text("Signing out removes your Nuvio data from this Apple TV. You can link it again at any time.")
             }
         }
         .navigationTitle("Nuvio Account")
@@ -874,6 +1123,7 @@ private struct CinemaStorageSettings: View {
     @State private var confirmsClear = false
     @State private var isClearing = false
     @State private var measurement = 0
+    @State private var didClear = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 32) {
@@ -894,17 +1144,32 @@ private struct CinemaStorageSettings: View {
                 Text("Clearing the cache frees space and fixes stale artwork or details. Everything downloads again as you browse. Your account, watch history, and settings aren’t affected.")
                     .font(.system(size: 22))
                     .foregroundStyle(.secondary)
-                Button(role: .destructive) {
-                    confirmsClear = true
-                } label: {
-                    if isClearing {
-                        Label("Clearing…", systemImage: "trash")
-                    } else {
-                        Label("Clear Cache", systemImage: "trash")
+                HStack(spacing: 24) {
+                    Button(role: .destructive) {
+                        confirmsClear = true
+                    } label: {
+                        if isClearing {
+                            Label("Clearing…", systemImage: "trash")
+                        } else {
+                            Label("Clear Cache", systemImage: "trash")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    // Nothing to clear once the cache is empty.
+                    .disabled(isClearing || total == 0)
+                    if didClear {
+                        Label {
+                            Text("Cache cleared")
+                        } icon: {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        }
+                        .font(.system(size: 21))
+                        .foregroundStyle(.secondary)
+                        .transition(.opacity)
                     }
                 }
-                .buttonStyle(.bordered)
-                .disabled(isClearing)
+                .animation(.easeOut(duration: 0.2), value: didClear)
             }
             .settingsPanel()
         }
@@ -960,6 +1225,7 @@ private struct CinemaStorageSettings: View {
             artworkBytes = nil
             metadataBytes = nil
             isClearing = false
+            didClear = true
             measurement += 1
         }
     }
