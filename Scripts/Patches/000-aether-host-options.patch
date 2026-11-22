@@ -1,0 +1,26 @@
+Turn on the AetherEngine 7.70 load options the upstream host ships with
+
+Confirm Atmos for VOD loads, and serve VOD loopback segments while they are
+written. Both follow the upstream host after its AetherEngine updates:
+https://github.com/bobsupra/NuvioTVOS/commit/0b5a2b38
+
+diff --git a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
+index b8b9edca35dfa48c3681c81b609190d88a0103e9..a09f5139b718d1c3f137e7f1fd4687408ab542ac 100644
+--- a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
+@@ -5283,6 +5283,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
+             preserveASSMarkup: true,
+             prepareNativeSubtitles: false,
+             generatesBackgroundScrubPreviews: generatesBackgroundScrubPreviews,
++            confirmAtmos: !isLive,
+             sequentialOrigin: forceSequentialOrigin || request.forceSequentialOrigin,
+             maxConcurrentSourceRequests: isRemote || isUsenetStream ? 1 : nil,
+             heldSourceConnection: isLocalPlaybackCache || isRemote || isUsenetStream,
+@@ -5296,6 +5297,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
+             preferredSubtitleLanguages: request.preferredSubtitleLanguages,
+             externalSubtitles: externalRegistration.tracks,
+             forwardBufferSegments: request.cacheProfile.aetherForwardBufferSegments(isBackedByHybridDiskCache: isLocalPlaybackCache),
++            progressiveSegmentDelivery: !isLive && !isRemoteHLS,
+             autoplay: request.autoplay,
+             audioDelaySeconds: request.audioDelaySeconds,
+             nativeVideoFrameRecovery: true

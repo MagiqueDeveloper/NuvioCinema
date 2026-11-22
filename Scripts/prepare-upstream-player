@@ -2,6 +2,8 @@
 set -eu
 
 revision=735adf8859462b5beb47dbc96a51c75ded15c685
+# AetherEngine (7.70.0) comes from a newer NuvioTVOS commit than the rest of the player.
+aether_revision=ca2a249b423f241714ef3d0b9d065451b72f4f34
 repository=https://github.com/bobsupra/NuvioTVOS.git
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 destination="$root/.upstream-player"
@@ -54,13 +56,14 @@ if [ -n "$seed" ]; then
     [ "$(git -C "$seed" rev-parse HEAD)" = "$revision" ] || die "Seed must be at $revision."
 fi
 
-fingerprint=$(python3 - "$revision" "$root/Scripts/Patches" <<'PY'
+fingerprint=$(python3 - "$revision" "$aether_revision" "$root/Scripts/Patches" <<'PY'
 import hashlib
 import pathlib
 import sys
 
-revision, directory = sys.argv[1:]
+revision, aether_revision, directory = sys.argv[1:]
 digest = hashlib.sha256(revision.encode())
+digest.update(b"\0aether\0" + aether_revision.encode())
 for patch in sorted(pathlib.Path(directory).glob("*.patch")):
     digest.update(b"\0" + patch.name.encode() + b"\0")
     digest.update(hashlib.sha256(patch.read_bytes()).digest())
@@ -103,6 +106,11 @@ if [ "$(cat "$destination/.git/nuviocinema-patches" 2>/dev/null || true)" != "$f
         git -C "$checkout" fetch --quiet --depth=1 --no-tags origin "$revision"
     fi
     git -C "$checkout" checkout --quiet --detach "$revision"
+    if ! git -C "$checkout" cat-file -e "$aether_revision^{commit}" 2>/dev/null; then
+        git -C "$checkout" fetch --quiet --depth=1 --no-tags origin "$aether_revision"
+    fi
+    # Restore also removes files the newer AetherEngine no longer has.
+    git -C "$checkout" restore --source="$aether_revision" --staged --worktree -- Vendor/AetherEngine
 
     if [ -f "$destination/tvosApp/Configurations/Signing.local.xcconfig" ]; then
         cp "$destination/tvosApp/Configurations/Signing.local.xcconfig" "$checkout/tvosApp/Configurations/"
@@ -121,7 +129,7 @@ if [ -n "$staging" ]; then
     done
 fi
 
-python3 - "$root" "$checkout" "$revision" <<'PY'
+python3 - "$root" "$checkout" "$revision" "$aether_revision" <<'PY'
 import pathlib
 import plistlib
 import re
@@ -131,6 +139,7 @@ import sys
 
 root, checkout = map(pathlib.Path, sys.argv[1:3])
 revision = sys.argv[3]
+aether_revision = sys.argv[4]
 app = checkout / "tvosApp/NuvioTV"
 
 
@@ -199,6 +208,8 @@ info["CFBundleURLTypes"] = [{"CFBundleURLName": "com.nuviocinema.app.TopShelf", 
 info["CFBundleDisplayName"] = "Nuvio Cinema"
 info["UIBackgroundModes"] = ["audio"]
 info["NSAppTransportSecurity"] = {"NSAllowsLocalNetworking": True}
+# Lets the player fill the screen when Apple TV uses a wide aspect ratio (280-player-wide-aspect-fullscreen).
+info["AVSupportsExtendedAspectRatiosForContentPlayback"] = True
 
 source_overlay = app / "CinemaSources"
 resource_overlay = app / "CinemaResources"
@@ -383,7 +394,7 @@ notices.mkdir()
 for name in ("Anime4K-MIT.txt", "LibDovi-MIT.txt", "dovi_tool-MIT.txt"):
     shutil.copy2(root / "Resources/ThirdPartyNotices" / name, notices / name)
 (notices / "NuvioTVOS-GPL-3.0.txt").write_bytes(upstream("LICENSE"))
-(notices / "AetherEngine-LICENSE.txt").write_bytes(upstream("Vendor/AetherEngine/LICENSE"))
+(notices / "AetherEngine-LICENSE.txt").write_bytes((checkout / "Vendor/AetherEngine/LICENSE").read_bytes())
 (notices / "MPVKit-LICENSE.txt").write_bytes(upstream("MPVKit/LICENSE"))
 ffmpeg = checkout / "Vendor/FFmpegBuild"
 shutil.copytree(ffmpeg / "LICENSES", notices / "FFmpegBuild")
@@ -394,8 +405,8 @@ shutil.copy2(ffmpeg / "BUILD-INFO.txt", notices / "FFmpegBuild" / "BUILD-INFO.tx
     f"Upstream source: https://github.com/bobsupra/NuvioTVOS/tree/{revision}\n"
     "The Cinema integration and project-generation script form part of the combined source.\n"
     "Include them and the required notices when distributing this build.\n\n"
-    "AetherEngine 7.61.0, vendored by NuvioTVOS:\n"
-    f"https://github.com/bobsupra/NuvioTVOS/tree/{revision}/Vendor/AetherEngine\n"
+    "AetherEngine 7.70.0, vendored by NuvioTVOS:\n"
+    f"https://github.com/bobsupra/NuvioTVOS/tree/{aether_revision}/Vendor/AetherEngine\n"
     "The accompanying FFmpegBuild notice directory includes its exact build record and license texts.\n"
     f"https://github.com/bobsupra/NuvioTVOS/tree/{revision}/Vendor/FFmpegBuild\n\n"
     "MPVKit (LGPL product), using the 0.41.0-n8.1.2 binary release:\n"

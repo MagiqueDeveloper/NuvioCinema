@@ -1,0 +1,19 @@
+Keep MPV playing while Control Center or Siri is open
+
+https://github.com/bobsupra/NuvioTVOS/commit/83120da6
+
+diff --git a/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift b/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift
+index 3a3740d470cc7c09253c476574b3ba3c44373ef5..ac01af25cc445f0c1bdaf9d2e7f2ec062242618a 100644
+--- a/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/MPVPlaybackController.swift
+@@ -1502,7 +1502,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
+ 
+     @objc private func appWillResignActive() {
+         screensaverDebugLog("[ScreensaverDebug][MPVController] appWillResignActive")
+-        suspendPlaybackForBackgroundOrInactive()
++        // Control Center, Siri and system alerts make the app inactive without
++        // leaving it. Keep playing, as the Aether path and the Apple TV app do;
++        // only didEnterBackground (Home, another app, sleep) suspends playback.
+     }
+ 
+     @objc private func enterBackground() {

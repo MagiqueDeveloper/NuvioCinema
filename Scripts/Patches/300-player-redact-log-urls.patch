@@ -1,0 +1,43 @@
+Stop printing full playback and subtitle URLs in logs
+
+https://github.com/bobsupra/NuvioTVOS/commit/e5f0e8ad
+
+diff --git a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
+index 48af8df4db764325979709a38d1a22ead99e185b..12ce1b5b0f53d02610e70668d96cea66bdd43beb 100644
+--- a/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift
+@@ -5573,7 +5573,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
+ 
+     func addAudioUrl(_ url: String) {
+         // Not supported — dual-URL sessions must use MPV.
+-        print("[Aether] addAudioUrl ignored (use MPV for separate audio URL): \(url.prefix(80))")
++        print("[Aether] addAudioUrl ignored (use MPV for separate audio URL): \(URL(string: url).map { AddonTransportUrls.diagnosticDescription(for: $0) } ?? "?")")
+     }
+ 
+     func applySubtitleStyle() {
+diff --git a/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift b/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift
+index ff38d2674988576e9b6083b72f76db5f4ab0e9f3..87c510af6d89af7dacbe1c917ded9fef22836fe8 100644
+--- a/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift
+@@ -421,7 +421,7 @@ final class PlaybackSessionCoordinator: ObservableObject {
+             return
+         }
+         guard !didFallbackForCurrentURL else {
+-            print("[PlaybackCoordinator] fallback already used for \(currentURLString ?? "?")")
++            print("[PlaybackCoordinator] fallback already used for \(currentURLString.flatMap(URL.init(string:)).map { AddonTransportUrls.diagnosticDescription(for: $0) } ?? "?")")
+             return
+         }
+ 
+diff --git a/tvosApp/NuvioTV/Sources/Core/Scene/SceneSubtitleTimelineScraper.swift b/tvosApp/NuvioTV/Sources/Core/Scene/SceneSubtitleTimelineScraper.swift
+index a6e258e2b8432648a0318a167366036410225d55..ea3e5a1a44f2fd1acbb99d1c4efbadb0c143ced9 100644
+--- a/tvosApp/NuvioTV/Sources/Core/Scene/SceneSubtitleTimelineScraper.swift
++++ b/tvosApp/NuvioTV/Sources/Core/Scene/SceneSubtitleTimelineScraper.swift
+@@ -80,7 +80,7 @@ actor SceneSubtitleTimelineScraper {
+                     break
+                 }
+             } catch {
+-                print("[SceneScraper] Subtitle fetch failed for \(sub.url): \(error.localizedDescription)")
++                print("[SceneScraper] Subtitle fetch failed for \(AddonTransportUrls.diagnosticDescription(for: url)): \(error.localizedDescription)")
+             }
+         }
+         

@@ -1,7 +1,7 @@
 Keep software seek preroll and rebuffer holds from canceling one another
 
 diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Audio/AudioOutput.swift b/Vendor/AetherEngine/Sources/AetherEngine/Audio/AudioOutput.swift
-index d15adb5..68175bc 100644
+index d15adb5dd1dd9114e3da8cb23e6f94eb5bb823c5..68175bcdd782f8d90a2d3c3a8a73736cea830592 100644
 --- a/Vendor/AetherEngine/Sources/AetherEngine/Audio/AudioOutput.swift
 +++ b/Vendor/AetherEngine/Sources/AetherEngine/Audio/AudioOutput.swift
 @@ -297,7 +297,23 @@ final class AudioOutput: @unchecked Sendable {
@@ -37,10 +37,10 @@ index d15adb5..68175bc 100644
  
      /// Pause the master clock, at `latest` if it has already run past it. A park deferred to the last
 diff --git a/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift b/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
-index 59bc8a3..d86173a 100644
+index deb17b98aea1dba0a88912ef5a0cdcb496ca0ea2..71ac58eec0d2c47b1ae0e42b4c9a39408ba67cad 100644
 --- a/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
 +++ b/Vendor/AetherEngine/Sources/AetherEngine/Native/SoftwarePlaybackHost.swift
-@@ -2163,8 +2163,7 @@ final class SoftwarePlaybackHost {
+@@ -2234,8 +2234,7 @@ final class SoftwarePlaybackHost {
      func enterBackgroundAudioOnly() {
          guard !backgroundAudioOnly else { return }
          backgroundAudioOnly = true
@@ -50,7 +50,7 @@ index 59bc8a3..d86173a 100644
              if isPlaying {
                  audioOutput?.setRate(lastRate)
              } else {
-@@ -2429,11 +2428,11 @@ final class SoftwarePlaybackHost {
+@@ -2503,11 +2502,11 @@ final class SoftwarePlaybackHost {
          audioOutput?.seekClock(to: CMTime(seconds: seconds, preferredTimescale: 90000), rate: 0)
      }
      func setAudioFedUntilForTesting(_ pts: Double) {
@@ -64,7 +64,7 @@ index 59bc8a3..d86173a 100644
      }
      var audioFedUntilForTesting: Double { demuxDiag.snapshot.lastAudioPts }
      /// Reads the consumer's published queue depth without accessing its thread-owned packets.
-@@ -3410,8 +3409,7 @@ final class SoftwarePlaybackHost {
+@@ -3500,8 +3499,7 @@ final class SoftwarePlaybackHost {
                  subtitleTapSink: getSubtitleTapSink,
                  recordingTap: recordingTap,
                  playedMedia: playedMediaLedger,
@@ -74,7 +74,7 @@ index 59bc8a3..d86173a 100644
              )
          }
      }
-@@ -4147,7 +4145,7 @@ final class SoftwarePlaybackHost {
+@@ -4222,7 +4220,7 @@ final class SoftwarePlaybackHost {
          condition: NSCondition,
          initialClockTime: CMTime,
          currentRate: @Sendable () -> Float,
@@ -83,7 +83,7 @@ index 59bc8a3..d86173a 100644
          ring: PacketRingBuffer?,
          videoTimeBaseSeconds: Double,
          audioTimeBaseSeconds: Double,
-@@ -4175,8 +4173,7 @@ final class SoftwarePlaybackHost {
+@@ -4251,8 +4249,7 @@ final class SoftwarePlaybackHost {
          subtitleTapSink: @Sendable () -> ((@Sendable (Int32, UnsafeMutablePointer<AVPacket>, AVRational, Bool) -> Void)?) = { nil },
          recordingTap: @escaping @Sendable (UnsafeMutablePointer<AVPacket>) -> Void = { _ in },
          playedMedia: PlayedMediaLedger? = nil,
@@ -93,15 +93,15 @@ index 59bc8a3..d86173a 100644
      ) {
          // The video packet's time on the clock's axis and whether it is a keyframe, for `keyframeLedger`.
          func keyframeTime(of packet: UnsafeMutablePointer<AVPacket>) -> (pts: Double, isKey: Bool)? {
-@@ -4257,7 +4254,6 @@ final class SoftwarePlaybackHost {
+@@ -4331,7 +4328,6 @@ final class SoftwarePlaybackHost {
          var parkedVideoBytes = 0
          var terminalGeneration = SoftwareTerminalGeneration()
          var lastEnqueuedAudioPtsSec = Double.nan
 -        var rebuffering = false
          // The pause/rebuffer arm stays off until the source has proven it can deliver a real
-         // lead once: an exactly-realtime origin whose lead never leaves the start offset must
-         // not eat a rebuffer pause at every session start.
-@@ -4335,25 +4331,15 @@ final class SoftwarePlaybackHost {
+         // lead once, or that it cannot keep up at all (AE#1025): an exactly-realtime origin whose
+         // lead never leaves the start offset must not eat a rebuffer pause at every session start.
+@@ -4429,25 +4425,15 @@ final class SoftwarePlaybackHost {
              }
          }
  
@@ -135,7 +135,7 @@ index 59bc8a3..d86173a 100644
              }
          }
  
-@@ -4427,9 +4413,8 @@ final class SoftwarePlaybackHost {
+@@ -4522,9 +4508,8 @@ final class SoftwarePlaybackHost {
                  releaseRebufferHold("the renderer needs a running clock to take parked video")
                  armFromParkedVideoIfStuck()
                  drainParkedVideoNonblocking()
@@ -147,7 +147,7 @@ index 59bc8a3..d86173a 100644
                  if stillWaiting() {
                      let wait = Self.parkedRendererWaitSeconds(
                          clockArmed: clockArmed(), lastAudioPts: lastEnqueuedAudioPtsSec,
-@@ -4450,7 +4435,9 @@ final class SoftwarePlaybackHost {
+@@ -4546,7 +4531,9 @@ final class SoftwarePlaybackHost {
          // a lead to lose.
          func applyAudioClockAction() {
              guard !isLive, decoupleAudio, !backgroundAudioOnly(), clockArmed(), let aOut = audioOutput else { return }
@@ -157,8 +157,8 @@ index 59bc8a3..d86173a 100644
 +            let rebuffering = diag.snapshot.rebuffering
              let lead = lastEnqueuedAudioPtsSec.isFinite
                  ? lastEnqueuedAudioPtsSec - aOut.currentTimeSeconds : 0
-             if lead >= AudioLookaheadPolicy.rebufferResumeLeadSeconds { everHadLead = true }
-@@ -4466,21 +4453,24 @@ final class SoftwarePlaybackHost {
+             pauseArmOpen = AudioLookaheadPolicy.pauseArmOpens(wasOpen: pauseArmOpen, lead: lead)
+@@ -4561,21 +4548,24 @@ final class SoftwarePlaybackHost {
                  sourceEnded: false
              ) {
              case .pauseForRebuffer:
@@ -192,7 +192,7 @@ index 59bc8a3..d86173a 100644
              case .none:
                  break
              }
-@@ -4539,10 +4529,8 @@ final class SoftwarePlaybackHost {
+@@ -4634,10 +4624,8 @@ final class SoftwarePlaybackHost {
                      parkedSeekGeneration = gen
                      freeParkedVideo()
                      lastEnqueuedAudioPtsSec = .nan
@@ -203,8 +203,8 @@ index 59bc8a3..d86173a 100644
 -                    rebuffering = false
                      // The lead is zero again after a seek, so the latch has to earn itself back:
                      // keeping it set pauses the clock for a rebuffer on the first post-seek check.
-                     everHadLead = false
-@@ -4588,8 +4576,8 @@ diagAudioPtsSec = .nan
+                     pauseArmOpen = false
+@@ -4684,8 +4672,8 @@ diagAudioPtsSec = .nan
                      if directLiveSource != nil {
                          // The empty-source wait may last indefinitely; publish the final drain
                          // before sleeping so SWDiag does not retain an already-consumed packet.
@@ -213,20 +213,29 @@ index 59bc8a3..d86173a 100644
 +                        diag.update(lastAudioPts: diagAudioPtsSec, parked: parkedVideo.count,
 +                                     generation: diagAudioPtsGeneration)
                      }
+                     let maximumWait: TimeInterval?
+                     if parkedVideo.isEmpty {
+@@ -4693,7 +4681,7 @@ diagAudioPtsSec = .nan
+                     } else if directLiveSource != nil {
+                         maximumWait = readyVideo ? 0 : 0.01
+                     } else {
+-                        maximumWait = rebuffering ? nil : Self.parkedVideoReadWaitSeconds
++                        maximumWait = diag.snapshot.rebuffering ? nil : Self.parkedVideoReadWaitSeconds
+                     }
                      packet = try readAhead.read(
                          isCurrent: { admitsRead(genBeforeRead) },
-@@ -4616,8 +4604,8 @@ diagAudioPtsSec = .nan
+@@ -4719,8 +4707,8 @@ diagAudioPtsSec = .nan
                  guard admitsRead(genBeforeRead) else { return !stopRequested() }
                  if case SoftwarePacketReadAhead.ReadError.interrupted = error { return true }
                  if case SoftwarePacketReadAhead.ReadError.idle = error {
 -                    diag?.update(lastAudioPts: diagAudioPtsSec, parked: parkedVideo.count,
--                                 rebuffering: false, generation: diagAudioPtsGeneration)
+-                                 rebuffering: rebuffering, generation: diagAudioPtsGeneration)
 +                    diag.update(lastAudioPts: diagAudioPtsSec, parked: parkedVideo.count,
-+                                 generation: diagAudioPtsGeneration)
++                                generation: diagAudioPtsGeneration)
                      return true
                  }
                  EngineLog.emit("[SWHost] demux read failed: \(error)", category: .swPlayback)
-@@ -5017,7 +5005,7 @@ diagAudioPtsSec = .nan
+@@ -5106,7 +5094,7 @@ diagAudioPtsSec = .nan
                      }
                  }
                  if !buffers.isEmpty {
@@ -235,7 +244,7 @@ index 59bc8a3..d86173a 100644
                  }
                  if let last = buffers.last {
                      let pts = CMSampleBufferGetPresentationTimeStamp(last)
-@@ -5057,10 +5045,8 @@ diagAudioPtsSec = .nan
+@@ -5146,10 +5134,8 @@ diagAudioPtsSec = .nan
              let keepGoing: Bool = autoreleasepool {
                  demuxIteration()
              }
@@ -248,7 +257,7 @@ index 59bc8a3..d86173a 100644
              if !keepGoing { break }
          }
          freeParkedVideo()
-@@ -5113,6 +5099,10 @@ rebuffering: rebuffering,
+@@ -5202,6 +5188,10 @@ rebuffering: rebuffering,
                  guard !self.seekInFlight, self.failure == nil else { return }
                  let raw = aOut.currentTimeSeconds
                  self.updateSoftwareClockStarvation(clock: raw)
@@ -259,7 +268,7 @@ index 59bc8a3..d86173a 100644
                  self.emitDiagIfDue(clock: raw)
                  // AE#724: until the first sample arms it, the synchronizer still reads 0, and a paused
                  // resume would publish that over the anchor load() set.
-@@ -5150,12 +5140,14 @@ rebuffering: rebuffering,
+@@ -5239,12 +5229,14 @@ rebuffering: rebuffering,
          guard !isLive, audioDecoder != nil, !backgroundAudioOnly,
                clockArmed, isPlaying, !didReachEnd,
                clock.isFinite, let aOut = audioOutput else { return }
@@ -274,7 +283,7 @@ index 59bc8a3..d86173a 100644
              sourceExhausted: diag.sourceExhausted,
              hasAudio: audioDecoder != nil,
              rebuffering: diag.rebuffering,
-@@ -5167,19 +5159,21 @@ rebuffering: rebuffering,
+@@ -5256,19 +5248,21 @@ rebuffering: rebuffering,
          )
          switch action {
          case .pauseForRebuffer:
@@ -304,7 +313,7 @@ index 59bc8a3..d86173a 100644
          case .none:
              break
          }
-@@ -5348,6 +5342,7 @@ func av_packet_free_safe(_ packet: UnsafeMutablePointer<AVPacket>) {
+@@ -5437,6 +5431,7 @@ func av_packet_free_safe(_ packet: UnsafeMutablePointer<AVPacket>) {
  /// clock leaps and layer-drop bursts a stuttering session is made of. Lock-guarded.
  final class SWPlaybackDiagState: @unchecked Sendable {
      private let lock = NSLock()
@@ -312,7 +321,7 @@ index 59bc8a3..d86173a 100644
      private var _lastAudioPts = Double.nan
      private var _audioFlushGeneration: UInt64 = 0
      /// The newest PTS that described a queue a recovery has since emptied; a write that does not go
-@@ -5365,16 +5360,16 @@ final class SWPlaybackDiagState: @unchecked Sendable {
+@@ -5454,16 +5449,16 @@ final class SWPlaybackDiagState: @unchecked Sendable {
      /// generation, so its next write (one more after a playing seek, none at all while a paused
      /// landing parks it until `play()`) republished a PTS the queue no longer held, and the line read
      /// `aLead` as old PTS minus re-anchored clock (475 s in the field). The write carries the
@@ -335,7 +344,7 @@ index 59bc8a3..d86173a 100644
      }
  
      /// Audio samples and decoded video frames are usable post-seek progress. The generation check
-@@ -5396,16 +5391,39 @@ final class SWPlaybackDiagState: @unchecked Sendable {
+@@ -5485,16 +5480,39 @@ final class SWPlaybackDiagState: @unchecked Sendable {
          lock.unlock()
      }
  
@@ -382,7 +391,7 @@ index 59bc8a3..d86173a 100644
          return true
      }
  
-@@ -5418,6 +5436,7 @@ final class SWPlaybackDiagState: @unchecked Sendable {
+@@ -5507,6 +5525,7 @@ final class SWPlaybackDiagState: @unchecked Sendable {
              _lastAudioPts = .nan
              _emptiedAudioPts = -.infinity
              _lastMediaProgressAt = ProcessInfo.processInfo.systemUptime
@@ -390,7 +399,7 @@ index 59bc8a3..d86173a 100644
              _rebuffering = false
              _rebufferVideoFrameGeneration = _videoFrameGeneration
              _sourceExhausted = false
-@@ -5464,6 +5483,7 @@ enum SWSoftwareClockStarvationPolicy {
+@@ -5553,6 +5572,7 @@ enum SWSoftwareClockStarvationPolicy {
          clockArmed: Bool,
          isPlaying: Bool,
          seekInFlight: Bool,
@@ -398,7 +407,7 @@ index 59bc8a3..d86173a 100644
          sourceExhausted: Bool,
          hasAudio: Bool,
          rebuffering: Bool,
-@@ -5473,7 +5493,9 @@ enum SWSoftwareClockStarvationPolicy {
+@@ -5562,7 +5582,9 @@ enum SWSoftwareClockStarvationPolicy {
          rebufferVideoFrameGeneration: UInt64,
          audioLead: Double
      ) -> AudioLookaheadPolicy.ClockAction {
@@ -410,7 +419,7 @@ index 59bc8a3..d86173a 100644
              guard isPlaying else { return .none }
              let audioRecovered = audioLead.isFinite
 diff --git a/Vendor/AetherEngine/Tests/AetherEngineTests/SWPlaybackDiagStateTests.swift b/Vendor/AetherEngine/Tests/AetherEngineTests/SWPlaybackDiagStateTests.swift
-index 21d4b78..a5e61b8 100644
+index 21d4b782cd21e03708abf8006c3165d614fcd9b8..a5e61b8a706c3a01f4ca410601e21d1269a87fb9 100644
 --- a/Vendor/AetherEngine/Tests/AetherEngineTests/SWPlaybackDiagStateTests.swift
 +++ b/Vendor/AetherEngine/Tests/AetherEngineTests/SWPlaybackDiagStateTests.swift
 @@ -16,32 +16,61 @@ struct SWPlaybackDiagStateTests {

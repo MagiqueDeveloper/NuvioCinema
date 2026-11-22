@@ -1,0 +1,21 @@
+Keep a skip from seeking past the end of the file
+
+https://github.com/bobsupra/NuvioTVOS/commit/380a91ad
+
+diff --git a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+index a3dcafd22fe2536cb461f527067536db2afbdc45..5f59d05fdce0e7379936e06921b4bac6ac53960d 100644
+--- a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+@@ -5293,7 +5293,11 @@ class PlayerViewModel: ObservableObject {
+             postPlayController.showImmediately()
+         }
+         let targetTime = postCredits?.startTime ?? interval.endTime
+-        seek(to: min(targetTime + 0.25, max(time.duration - 0.5, targetTime)), exact: true)
++        // Stay half a second inside the file: a segment can end on the last
++        // frame or a hair past it, and a seek beyond the end restarts some
++        // engines from the beginning.
++        let lastSafePosition = time.duration > 1 ? time.duration - 0.5 : Double.infinity
++        seek(to: min(targetTime + 0.25, lastSafePosition), exact: true)
+         showControls = false
+         scheduleControlsHide()
+     }

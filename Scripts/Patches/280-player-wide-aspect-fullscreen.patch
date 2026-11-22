@@ -1,0 +1,100 @@
+Fill the screen on wide-aspect Apple TV setups
+
+https://github.com/bobsupra/NuvioTVOS/commit/5ebfec73
+
+The Info.plist key is set by prepare-upstream-player.
+
+diff --git a/tvosApp/NuvioTV/Sources/UI/Player/PlayerSurfaces.swift b/tvosApp/NuvioTV/Sources/UI/Player/PlayerSurfaces.swift
+index 804b40ffc59652effdad3151f6a5a85b411ba7d5..0f6dbf4f133f78b64ac92d59351a036d25e50a11 100644
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerSurfaces.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerSurfaces.swift
+@@ -59,6 +59,72 @@ struct AetherPlayerSurface: UIViewControllerRepresentable {
+     }
+ }
+ 
++/// Reports full-screen playback to tvOS while the player is in a window, so the
++/// system can give the app the whole screen when Apple TV is set to a wide
++/// aspect ratio (Settings > Video and Audio > Aspect Ratio).
++///
++/// `AVSupportsExtendedAspectRatiosForContentPlayback` in Info.plist only lets an
++/// app past the centred 16:9 area while its scene is in full-screen playback.
++/// AVPlayerViewController sets that state through UIKit's playback-controls
++/// state manager on the window scene. Nuvio draws video in its own views, so
++/// this makes the same calls. They are private UIKit API, called by selector
++/// and checked at runtime, so they do nothing where the API is missing.
++struct FullscreenPlaybackSceneMarker: UIViewRepresentable {
++    func makeUIView(context: Context) -> FullscreenPlaybackSceneMarkerView {
++        FullscreenPlaybackSceneMarkerView()
++    }
++
++    func updateUIView(_ uiView: FullscreenPlaybackSceneMarkerView, context: Context) {}
++
++    static func dismantleUIView(_ uiView: FullscreenPlaybackSceneMarkerView, coordinator: ()) {
++        uiView.endSession()
++    }
++}
++
++final class FullscreenPlaybackSceneMarkerView: UIView {
++    private var sessionAssertion: NSObject?
++    private weak var sessionScene: UIWindowScene?
++
++    override func didMoveToWindow() {
++        super.didMoveToWindow()
++        let scene = window?.windowScene
++        // Re-parenting inside the same scene must not end and restart the
++        // session, or tvOS would resize the app back to 16:9 and out again.
++        if scene === sessionScene, sessionAssertion != nil { return }
++        endSession()
++        guard let scene else { return }
++        sessionAssertion = Self.beginFullscreenPlaybackSession(on: scene)
++        sessionScene = scene
++    }
++
++    func endSession() {
++        sessionScene = nil
++        guard let assertion = sessionAssertion else { return }
++        sessionAssertion = nil
++        let invalidate = NSSelectorFromString("invalidate")
++        if assertion.responds(to: invalidate) {
++            assertion.perform(invalidate)
++        }
++    }
++
++    private static func beginFullscreenPlaybackSession(on scene: UIWindowScene) -> NSObject? {
++        #if os(tvOS)
++        let managerSelector = NSSelectorFromString("_playbackControlsStateManager")
++        let beginSelector = NSSelectorFromString("_beginFullscreenPlaybackSession")
++        guard scene.responds(to: managerSelector),
++              let manager = scene.perform(managerSelector)?.takeUnretainedValue() as? NSObject,
++              manager.responds(to: beginSelector),
++              let assertion = manager.perform(beginSelector)?.takeUnretainedValue() as? NSObject
++        else {
++            return nil
++        }
++        return assertion
++        #else
++        return nil
++        #endif
++    }
++}
++
+ 
+ struct RemoteSeekPressCatcher: UIViewRepresentable {
+     let isActive: Bool
+diff --git a/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+Layers.swift b/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+Layers.swift
+index 701a0282815955007ffeb75fa721e80697ea6d50..a68b2b99362ad87825c919d677508a9b47b229b7 100644
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+Layers.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+Layers.swift
+@@ -34,6 +34,12 @@ extension PlayerView {
+         ZStack {
+             Color.black.ignoresSafeArea()
+ 
++            // Lets tvOS widen the app past 16:9 while the player is up.
++            FullscreenPlaybackSceneMarker()
++                .frame(width: 0, height: 0)
++                .allowsHitTesting(false)
++                .accessibilityHidden(true)
++
+             videoSurfaceLayer
+             playerBottomFadeLayer
+             postPlayRecommendationLayer

@@ -1,9 +1,9 @@
 Nuvio Cinema third-party playback notices
 
-Nuvio Cinema uses AetherEngine 7.65.0, copyright 2026 Vincent Herbst,
+Nuvio Cinema uses AetherEngine 7.70.0, copyright 2026 Vincent Herbst,
 under the GNU Lesser General Public License version 3 with the Apple Store
 and DRM exception. See AetherEngine-LGPL-3.0.txt and GPL-3.0.txt.
-Corresponding source: https://github.com/superuser404notfound/AetherEngine/tree/7.65.0
+Corresponding source: https://github.com/superuser404notfound/AetherEngine/tree/7.70.0
 
 Nuvio Cinema dynamically links FFmpegBuild 3.15.0. The tagged source
 includes the build scripts and patches for the distributed libraries.

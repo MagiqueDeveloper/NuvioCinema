@@ -1,0 +1,58 @@
+Handle remote Back during held seeks and scrubs
+
+The Back debounce, seek cancellation, and scrub move suppression from:
+https://github.com/bobsupra/NuvioTVOS/commit/79a76793
+
+Cinema keeps its own controls exit handling and Dolby Vision defaults.
+
+diff --git a/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+RemoteCommands.swift b/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+RemoteCommands.swift
+index b3fb17a0b4ddf404a79472895f531459c6ad5ff9..b138a6541c9448d4fc0045cec188e43fe1f9c0a3 100644
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+RemoteCommands.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerView+RemoteCommands.swift
+@@ -22,6 +22,10 @@ extension PlayerView {
+ 
+     /// Back / Menu during playback (also from the remote-gesture layer, which takes the remote).
+     func handleRemoteBack() {
++        let now = CACurrentMediaTime()
++        guard now - viewModel.lastRemoteBackHandledAt > 0.35 else { return }
++        viewModel.lastRemoteBackHandledAt = now
++
+         PlaybackTimelineRecorder.record(.backPressed, engine: viewModel.activeEngineKind)
+         if viewModel.isSceneDetailVisible {
+             withAnimation(.easeInOut(duration: 0.2)) {
+@@ -52,6 +56,14 @@ extension PlayerView {
+             viewModel.cancelScrub()
+             return
+         }
++        if viewModel.isHoldingSeek {
++            viewModel.stopRepeatingSkip()
++            return
++        }
++        if viewModel.pendingSeekDelta != 0 {
++            viewModel.pendingSeekDelta = 0
++            return
++        }
+         if viewModel.showPauseOverlay {
+             viewModel.dismissPauseOverlay()
+             viewModel.revealControls()
+diff --git a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+index 5f59d05fdce0e7379936e06921b4bac6ac53960d..87d6af12cd3c1ca721dbd7f6f21b5106afe8379f 100644
+--- a/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
++++ b/tvosApp/NuvioTV/Sources/ViewModels/PlayerViewModel.swift
+@@ -287,6 +287,8 @@ class PlayerViewModel: ObservableObject {
+     @Published var isTimelineFocused: Bool = false
+     /// Infuse-style scrub mode (touchpad drag / D-pad jump / wheel fine-tune).
+     @Published private(set) var isScrubbing = false
++    /// Cooldown timestamp to prevent duplicate / cascading exit commands from multiple views in the same gesture.
++    var lastRemoteBackHandledAt: CFTimeInterval = 0
+     /// Cache-backed Aether still for the current scrub target. Nil means the
+     /// time-only HUD remains visible while a still is unavailable.
+     @Published private(set) var scrubThumbnail: CGImage?
+@@ -6013,6 +6015,7 @@ class PlayerViewModel: ObservableObject {
+     }
+ 
+     func cancelScrub() {
++        suppressMoveBriefly(0.35)
+         resetScrubSession()
+         showControls = true
+         if status == .paused,

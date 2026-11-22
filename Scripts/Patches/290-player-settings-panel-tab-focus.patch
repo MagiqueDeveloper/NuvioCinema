@@ -1,0 +1,24 @@
+Open the player settings panel on its tab row
+
+https://github.com/bobsupra/NuvioTVOS/commit/ac5ee5a0
+
+diff --git a/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift b/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift
+index cbca0556cfcfc28e0ad21622f30423ead387b715..a1317800722ddf246783811b77082d4e326f1d40 100644
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift
+@@ -2051,12 +2051,12 @@ struct PlayerSettingsPanel: View {
+             style = SubtitleStyle.current
+             viewModel.setControlsAutoHideSuspended(true)
+             DispatchQueue.main.async {
++                // Open on the tab row, at the top of the panel, instead of jumping down to the
++                // current subtitle language; that language stays selected in the list.
+                 if let language = effectiveLanguage {
+                     selectedLanguage = language
+-                    focus = .language(language)
+-                } else {
+-                    focus = .noneRow
+                 }
++                focus = .tab(tab)
+             }
+         }
+         .onDisappear {
