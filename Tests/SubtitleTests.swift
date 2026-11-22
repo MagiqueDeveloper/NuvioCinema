@@ -18,6 +18,19 @@ final class SubtitleTests: XCTestCase {
         XCTAssertEqual(SubtitleOCRCleanup.cleaned("[sighs|"), "[SIGHS]")
     }
 
+    func testDialogueDashesGetASpaceInTextSubtitles() {
+        XCTAssertEqual(
+            SubtitleDialogueSpacing.spaced("-Uh, yeah, I guess so.\n-Oh, shit."),
+            "- Uh, yeah, I guess so.\n- Oh, shit."
+        )
+        XCTAssertEqual(SubtitleDialogueSpacing.spaced("\u{2010}Uh.\n\u{2011}Oh."), "\u{2010} Uh.\n\u{2011} Oh.")
+        XCTAssertEqual(SubtitleDialogueSpacing.spaced("Yeah? -No."), "Yeah? - No.")
+        XCTAssertEqual(SubtitleDialogueSpacing.spaced("[sighs] -What?"), "[sighs] - What?")
+        XCTAssertEqual(SubtitleDialogueSpacing.spaced("- Already spaced."), "- Already spaced.")
+        XCTAssertEqual(SubtitleDialogueSpacing.spaced("-5 degrees"), "-5 degrees")
+        XCTAssertEqual(SubtitleDialogueSpacing.spaced("A well-known place."), "A well-known place.")
+    }
+
     func testOCRJoinsFragmentsInTheTrackReadingDirection() {
         let fragments = [
             (text: "right", box: CGRect(x: 0.65, y: 0.78, width: 0.2, height: 0.06)),

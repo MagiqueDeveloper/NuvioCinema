@@ -1,16 +1,35 @@
 import Foundation
 
-private enum SubtitleCaptionFormatting {
-    private static let annotationPattern = #"\[[^\[\]\v]*\]"#
-    private static let annotation = try! NSRegularExpression(pattern: annotationPattern)
-    private static let doubleDash = try! NSRegularExpression(pattern: #"(?<!-)--(?!-)"#)
+/// Puts a space after a speaker dash that has none ("-Uh" → "- Uh"). Safe for text
+/// subtitles as well as recognized bitmap ones, and a no-op on text already spaced.
+enum SubtitleDialogueSpacing {
+    /// Hyphen-minus, en and em dashes, plus the Unicode hyphen, non-breaking hyphen and
+    /// minus sign some subtitle files use for the speaker dash.
+    private static let dashes = "\\-–—‐‑−"
     /// A speaker dash with no space after it: at the start of a line (after any leading
     /// annotations), or after a sentence ends mid-line ("-Yeah? -No."). A dash before a
     /// digit is left alone, as it is more likely a minus sign.
     private static let unspacedDialogueDash = try! NSRegularExpression(
-        pattern: #"(?:^(\h*(?:\#(annotationPattern)\h*)*)|(?<=[.!?…])(\h+))([-–—])(?=[^\s\-–—\d])"#,
+        pattern: #"(?:^(\h*(?:\#(SubtitleCaptionFormatting.annotationPattern)\h*)*)|(?<=[.!?…])(\h+))([\#(dashes)])(?=[^\s\#(dashes)\d])"#,
         options: [.anchorsMatchLines]
     )
+
+    static func spaced(_ text: String) -> String {
+        guard text.contains(where: { "-–—‐‑−".contains($0) }) else { return text }
+        return SubtitleCaptionFormatting.replacingMatches(of: unspacedDialogueDash, in: text) { source, match in
+            let leading = [1, 2].compactMap { index -> String? in
+                let range = match.range(at: index)
+                return range.location == NSNotFound ? nil : source.substring(with: range)
+            }.joined()
+            return leading + source.substring(with: match.range(at: 3)) + " "
+        }
+    }
+}
+
+enum SubtitleCaptionFormatting {
+    static let annotationPattern = #"\[[^\[\]\v]*\]"#
+    private static let annotation = try! NSRegularExpression(pattern: annotationPattern)
+    private static let doubleDash = try! NSRegularExpression(pattern: #"(?<!-)--(?!-)"#)
     /// A lone lowercase "i" used as the English pronoun, including "i'm" and "i'll".
     private static let lowercasePronoun = try! NSRegularExpression(
         pattern: #"(?<![\p{L}\p{M}\p{N}'’\-])i(?![\p{L}\p{M}\p{N}\-])(?!\.\p{L})"#
@@ -40,15 +59,7 @@ private enum SubtitleCaptionFormatting {
                 source.substring(with: match.range).uppercased()
             }
         }
-        if displayText.contains("-") || displayText.contains("–") || displayText.contains("—") {
-            displayText = replacingMatches(of: unspacedDialogueDash, in: displayText) { source, match in
-                let leading = [1, 2].compactMap { index -> String? in
-                    let range = match.range(at: index)
-                    return range.location == NSNotFound ? nil : source.substring(with: range)
-                }.joined()
-                return leading + source.substring(with: match.range(at: 3)) + " "
-            }
-        }
+        displayText = SubtitleDialogueSpacing.spaced(displayText)
         displayText = capitalizingSentences(displayText)
         return capitalizingPronoun(displayText)
     }
@@ -90,7 +101,7 @@ private enum SubtitleCaptionFormatting {
                     atLineStart = true
                 } else if character.isWhitespace {
                     // Keeps whatever the previous sentence left.
-                } else if "-–—".contains(character), atLineStart {
+                } else if "-–—‐‑−".contains(character), atLineStart {
                     capitalizeNext = true
                     atLineStart = false
                 } else if character == "…" {
@@ -138,7 +149,7 @@ private enum SubtitleCaptionFormatting {
         return lowercasePronoun.stringByReplacingMatches(in: text, range: range, withTemplate: "I")
     }
 
-    private static func replacingMatches(
+    static func replacingMatches(
         of expression: NSRegularExpression,
         in text: String,
         with replacement: (NSString, NSTextCheckingResult) -> String

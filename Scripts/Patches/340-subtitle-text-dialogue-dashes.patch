@@ -1,0 +1,26 @@
+diff --git a/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift b/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift
+--- a/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift
++++ b/tvosApp/NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift
+@@ -106,7 +106,9 @@ struct PlayerSubtitleOverlay: View {
+     private func caption(_ text: String) -> some View {
+         if !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+             let appearance = textAppearance(alignment: .center)
+-            OutlinedSubtitleText(SubtitleAttributedText.make(plain: text, appearance: appearance), appearance: appearance)
++            // Text tracks get the same speaker-dash spacing as recognized bitmap cues.
++            let displayed = SubtitleDialogueSpacing.spaced(text)
++            OutlinedSubtitleText(SubtitleAttributedText.make(plain: displayed, appearance: appearance), appearance: appearance)
+                 .subtitleBackground()
+         }
+     }
+@@ -204,7 +206,10 @@ struct MPVSubtitleOverlay: View {
+                     style: style, textSize: textSize, alignment: .center
+                 )
+                 VStack(spacing: 8) {
+-                    OutlinedSubtitleText(SubtitleAttributedText.make(plain: text, appearance: appearance), appearance: appearance)
++                    OutlinedSubtitleText(
++                        SubtitleAttributedText.make(plain: SubtitleDialogueSpacing.spaced(text), appearance: appearance),
++                        appearance: appearance
++                    )
+                         .subtitleBackground()
+                     if translation.isTranslating {
+                         HStack(spacing: 5) {
