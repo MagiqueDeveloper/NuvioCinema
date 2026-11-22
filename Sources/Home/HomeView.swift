@@ -76,6 +76,8 @@ struct HeroCarousel {
     }
 
     struct BackdropSlice: Equatable {
+        /// The unwrapped carousel position this artwork occupies, stable while it slides across.
+        let track: Int
         let index: Int
         let coverage: Range<Double>
         let horizontalOffset: Double
@@ -86,65 +88,73 @@ struct HeroCarousel {
         let opacity: Double
     }
 
+    /// A move along an unwrapped track of titles: the artwork slides across, then the destination's
+    /// logo and synopsis fade in. New moves wait for it to finish.
     struct Slide: Identifiable {
-
         private static let revealCurve = UnitCurve.bezier(
             startControlPoint: UnitPoint(x: 0.24, y: 0),
             endControlPoint: UnitPoint(x: 0.26, y: 1)
         )
         private static let slideCurve = UnitCurve.bezier(
-            startControlPoint: UnitPoint(x: 0.32, y: 0),
-            endControlPoint: UnitPoint(x: 0.48, y: 1)
+            startControlPoint: UnitPoint(x: 0.55, y: 0),
+            endControlPoint: UnitPoint(x: 0.15, y: 1)
         )
-        private static let artworkTravel = 0.05
+        /// How far the artwork moves with its edge: 1 is a full push, less leaves some parallax depth.
+        static let parallax = 0.72
+        static let slideDuration: Duration = .milliseconds(950)
+        private static let fadeOutDuration: Duration = .milliseconds(180)
+        private static let fadeInDuration: Duration = .milliseconds(300)
 
         let id = UUID()
-        let outgoingArtwork: [BackdropSlice]
-        let outgoingBanner: Banner
-        let step: Int
         let start: ContinuousClock.Instant
-        let isInterruption: Bool
+        let origin: Double
+        let target: Double
+        let count: Int
+        let outgoingBanner: Banner
 
-        private var wipeDelay: Duration { isInterruption ? .zero : .milliseconds(75) }
-        private var fadeOutDuration: Duration { isInterruption ? .milliseconds(45) : wipeDelay }
-        private var wipeDuration: Duration { isInterruption ? .milliseconds(340) : .milliseconds(600) }
-        private var fadeInDuration: Duration { isInterruption ? .milliseconds(95) : .milliseconds(175) }
-        private var wipeEnd: Duration { wipeDelay + wipeDuration }
-        var duration: Duration { wipeEnd + fadeInDuration }
+        var duration: Duration { Self.slideDuration + Self.fadeInDuration }
 
-        func banner(at now: ContinuousClock.Instant, entering index: Int) -> Banner {
-            let elapsed = max(.zero, start.duration(to: now))
-            if elapsed < wipeEnd {
-                let fadeOut = Self.fraction(elapsed, of: fadeOutDuration)
-                let opacity = outgoingBanner.opacity * (1 - UnitCurve.easeInOut.value(at: fadeOut))
-                return Banner(index: outgoingBanner.index, opacity: opacity)
-            }
-            let fadeIn = Self.fraction(elapsed - wipeEnd, of: fadeInDuration)
-            return Banner(index: index, opacity: Self.revealCurve.value(at: fadeIn))
+        /// Whether the artwork has arrived, leaving only the title's fade-in.
+        func hasArrived(at now: ContinuousClock.Instant) -> Bool {
+            start.duration(to: now) >= Self.slideDuration
         }
 
-        func backdrop(at now: ContinuousClock.Instant, entering index: Int) -> [BackdropSlice] {
-            let elapsed = start.duration(to: now) - wipeDelay
-            let progress = Self.slideCurve.value(at: Self.fraction(elapsed, of: wipeDuration))
-            let visible = step < 0 ? progress..<1 : 0..<(1 - progress)
-            let travel = step < 0 ? -Self.artworkTravel : Self.artworkTravel
-            let remaining = outgoingArtwork.compactMap { slice -> BackdropSlice? in
-                let lower = max(slice.coverage.lowerBound, visible.lowerBound)
-                let upper = min(slice.coverage.upperBound, visible.upperBound)
-                guard lower < upper else { return nil }
-                let offset = slice.horizontalOffset * (1 - progress) - travel * progress
-                // The wipe hides the displaced edges, including when a slide is interrupted.
-                return BackdropSlice(index: slice.index, coverage: lower..<upper,
-                                     horizontalOffset: min(lower, max(upper - 1, offset)))
+        func position(at now: ContinuousClock.Instant) -> Double {
+            let progress = Self.slideCurve.value(at: Self.fraction(start.duration(to: now), of: Self.slideDuration))
+            return origin + (target - origin) * progress
+        }
+
+        func banner(at now: ContinuousClock.Instant, entering index: Int) -> Banner {
+            let elapsed = start.duration(to: now)
+            if elapsed < Self.slideDuration {
+                let fadeOut = Self.fraction(elapsed, of: Self.fadeOutDuration)
+                return Banner(index: outgoingBanner.index,
+                              opacity: outgoingBanner.opacity * (1 - UnitCurve.easeInOut.value(at: fadeOut)))
             }
-            let incoming = step < 0 ? 0..<visible.lowerBound : visible.upperBound..<1
-            guard !incoming.isEmpty else { return remaining }
-            let slice = BackdropSlice(index: index, coverage: incoming, horizontalOffset: travel * (1 - progress))
-            return step < 0 ? [slice] + remaining : remaining + [slice]
+            let fadeIn = Self.fraction(elapsed - Self.slideDuration, of: Self.fadeInDuration)
+            return Banner(index: index, opacity: Self.revealCurve.value(at: fadeIn))
         }
 
         private static func fraction(_ elapsed: Duration, of duration: Duration) -> Double {
             min(1, max(0, elapsed / duration))
+        }
+
+        func backdrop(at now: ContinuousClock.Instant, entering index: Int) -> [BackdropSlice] {
+            let position = position(at: now)
+            let first = Int(position.rounded(.down))
+            let targetTrack = Int(target.rounded())
+            return [first, first + 1].compactMap { track -> BackdropSlice? in
+                let relative = Double(track) - position
+                let coverage = relative <= 0 ? 0..<(1 + relative) : relative..<1
+                guard coverage.upperBound - coverage.lowerBound > 0.0001 else { return nil }
+                let offset = abs(relative) < 0.0001 ? 0 : relative * Self.parallax
+                return BackdropSlice(track: track, index: wrap(index + track - targetTrack),
+                                     coverage: coverage, horizontalOffset: offset)
+            }
+        }
+
+        private func wrap(_ index: Int) -> Int {
+            count > 0 ? (index % count + count) % count : index
         }
     }
 
@@ -165,9 +175,11 @@ struct HeroCarousel {
         var next = self
         next.index = destination
         next.slide = if animated {
-            Slide(outgoingArtwork: slide?.backdrop(at: now, entering: index)
-                    ?? [BackdropSlice(index: index, coverage: 0..<1, horizontalOffset: 0)],
-                  outgoingBanner: banner(at: now), step: step, start: now, isInterruption: slide != nil)
+            Slide(start: now,
+                  origin: slide.map { $0.position(at: now) } ?? Double(index),
+                  target: (slide?.target ?? Double(index)) + Double(step),
+                  count: entries.count,
+                  outgoingBanner: banner(at: now))
         } else {
             nil
         }
@@ -692,10 +704,13 @@ struct FeaturedHero: View {
     }
 
     private func move(_ step: Int) {
+        // Let each slide finish before the next one, so held or repeated presses can't pile up.
         guard isActive, entries.count > 1 else { return }
+        let now = clock.now
+        if let slide = carousel.slide, now < slide.start.advanced(by: slide.duration) { return }
         let nextIndex = (carousel.index + step + entries.count) % entries.count
         startedAt = nil
-        carousel = carousel.transition(to: nextIndex, step: step, at: clock.now, animated: !reduceMotion)
+        carousel = carousel.transition(to: nextIndex, step: step, at: now, animated: !reduceMotion)
     }
 
     private func indicators(activeIndex: Int, rotates: Bool) -> some View {
@@ -730,7 +745,10 @@ struct FeaturedHero: View {
             let entry = entries[index]
             HStack(spacing: 14) {
                 Button {
-                    if carousel.slide == nil { onSelect(entry) }
+                    // Ignore Select mid-slide, but not while the arrived title fades in.
+                    if carousel.slide?.hasArrived(at: clock.now) ?? true {
+                        onSelect(entry)
+                    }
                 } label: {
                     Label("View Details", systemImage: "info.circle")
                 }
@@ -888,7 +906,7 @@ struct HomeHeroBackdrop: View {
 
     private func slidingArtwork(_ slices: [HeroCarousel.BackdropSlice], size: CGSize) -> some View {
         ZStack {
-            ForEach(Array(slices.enumerated()), id: \.offset) { _, slice in
+            ForEach(slices, id: \.track) { slice in
                 if carousel.entries.indices.contains(slice.index) {
                     let left = size.width * slice.coverage.lowerBound
                     let right = size.width * slice.coverage.upperBound

@@ -50,46 +50,44 @@ final class BrowsingTests: XCTestCase {
         XCTAssertEqual(next.shelfOrder, [.watching, .newReleases, .genres, .newSeries, .popularMovies])
     }
 
-    func testFeaturedArtworkSlidesGentlyInBothDirectionsAndSettles() throws {
+    func testFeaturedArtworkSlidesAcrossInBothDirectionsAndSettles() throws {
         let start = ContinuousClock.now
-        let midpoint = start + .milliseconds(375)
-        let late = start + .milliseconds(500)
-        let finished = start + .milliseconds(675)
+        let midway = start + .milliseconds(475)
         let home = HeroCarousel()
 
         for step in [-1, 1] {
             let carousel = home.transition(to: 1, step: step, at: start, animated: true)
             let slide = try XCTUnwrap(carousel.slide)
-            let slices = slide.backdrop(at: midpoint, entering: 1)
+            let slices = slide.backdrop(at: midway, entering: 1)
+            XCTAssertEqual(slices.count, 2)
+            XCTAssertEqual(slices.first?.coverage.lowerBound ?? -1, 0, accuracy: 0.0001)
+            XCTAssertEqual(slices.last?.coverage.upperBound ?? -1, 1, accuracy: 0.0001)
             let incoming = try XCTUnwrap(slices.first { $0.index == 1 })
-            let outgoing = try XCTUnwrap(slices.first { $0.index == 0 })
-            XCTAssertGreaterThan(incoming.horizontalOffset * Double(step), 0)
-            XCTAssertLessThan(outgoing.horizontalOffset * Double(step), 0)
-            XCTAssertLessThan(abs(incoming.horizontalOffset), 0.05)
-            XCTAssertEqual(slide.backdrop(at: late, entering: 1).count, 2)
-            XCTAssertEqual(slide.backdrop(at: finished, entering: 1), [
-                HeroCarousel.BackdropSlice(index: 1, coverage: 0..<1, horizontalOffset: 0)
-            ])
+            let outgoing = try XCTUnwrap(slices.first { $0.index != 1 })
+            // The artwork travels most of the way with the edge rather than drifting in place.
+            XCTAssertGreaterThan(incoming.horizontalOffset * Double(step), 0.2)
+            XCTAssertLessThan(outgoing.horizontalOffset * Double(step), -0.2)
+            for slice in slices {
+                XCTAssertLessThanOrEqual(slice.horizontalOffset, slice.coverage.lowerBound + 0.0001)
+                XCTAssertGreaterThanOrEqual(slice.horizontalOffset, slice.coverage.upperBound - 1 - 0.0001)
+            }
+            XCTAssertEqual(slide.backdrop(at: start + HeroCarousel.Slide.slideDuration, entering: 1),
+                           [HeroCarousel.BackdropSlice(track: step, index: 1, coverage: 0..<1, horizontalOffset: 0)])
         }
         XCTAssertNil(home.transition(to: 1, step: 1, at: start, animated: false).slide)
     }
 
-    func testFeaturedArtworkResumesFromItsVisiblePositionWhenInterrupted() throws {
+    func testFeaturedTitleWaitsForTheArtworkToArrive() throws {
         let start = ContinuousClock.now
-        let interruptedAt = start + .milliseconds(375)
-        let first = HeroCarousel().transition(to: 1, step: 1, at: start, animated: true)
-        let before = try XCTUnwrap(first.slide).backdrop(at: interruptedAt, entering: 1)
-        let interrupted = first.transition(to: 2, step: -1, at: interruptedAt, animated: true)
-        let slide = try XCTUnwrap(interrupted.slide)
-        XCTAssertEqual(slide.backdrop(at: interruptedAt, entering: 2), before)
+        let slide = try XCTUnwrap(HeroCarousel().transition(to: 1, step: 1, at: start, animated: true).slide)
+        let arrival = start + HeroCarousel.Slide.slideDuration
 
-        let continuing = slide.backdrop(at: interruptedAt + .milliseconds(170), entering: 2)
-        XCTAssertEqual(continuing.first?.coverage.lowerBound, 0)
-        XCTAssertEqual(continuing.last?.coverage.upperBound, 1)
-        for slice in continuing {
-            XCTAssertLessThanOrEqual(slice.horizontalOffset, slice.coverage.lowerBound)
-            XCTAssertGreaterThanOrEqual(slice.horizontalOffset, slice.coverage.upperBound - 1)
-        }
+        XCTAssertFalse(slide.hasArrived(at: arrival - .milliseconds(1)))
+        XCTAssertEqual(slide.banner(at: arrival - .milliseconds(1), entering: 1).opacity, 0)
+        XCTAssertEqual(slide.banner(at: arrival - .milliseconds(1), entering: 1).index, 0)
+        XCTAssertTrue(slide.hasArrived(at: arrival))
+        XCTAssertEqual(slide.banner(at: arrival, entering: 1).index, 1)
+        XCTAssertEqual(slide.banner(at: start + slide.duration, entering: 1).opacity, 1, accuracy: 0.001)
     }
 
     func testDetailsValidateDeliveryIncludingUncachedResponses() async {
